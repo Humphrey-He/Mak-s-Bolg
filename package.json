@@ -3,17 +3,20 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "tinacms dev -c \"next dev\"",
+    "dev": "next dev",
     "dev:no-tina": "next dev",
-    "build": "tinacms build && next build",
+    "build": "next build",
+    "build:local": "set NEXT_TURBOPACK=0 && next build",
     "start": "next start",
     "lint": "next lint"
   },
   "dependencies": {
+    "@mdx-js/mdx": "^3.1.1",
+    "@mdx-js/react": "^3.1.1",
     "framer-motion": "^11.0.0",
     "gray-matter": "^4.0.3",
-    "next": "latest",
-    "next-mdx-remote": "^6.0.0",
+    "next": "^15.5.18",
+    "next-mdx-remote": "^5.0.0",
     "react": "latest",
     "react-dom": "latest",
     "remark-gfm": "^4.0.1"
