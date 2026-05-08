@@ -103,10 +103,14 @@ Node 版本建议：
 
 `npm run tina:build` 会执行：
 
-1. `tinacms build`
-2. `next build`
+1. 检查 Tina 环境变量
+2. 如果环境变量齐全，执行 `tinacms build`
+3. 执行 `next build`
 
-这样 `out/` 里既有前台页面，也有 `/admin`
+这样有两种结果：
+
+- 环境变量齐全：`out/` 里既有前台页面，也有 `/admin`
+- 环境变量缺失：仍然会生成前台站点，避免 Cloudflare 构建失败
 
 ## 上线后的访问路径
 

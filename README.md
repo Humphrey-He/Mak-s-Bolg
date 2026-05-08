@@ -64,6 +64,11 @@ npm run build
 npm run tina:build
 ```
 
+说明：
+
+- 如果 Tina 环境变量齐全，会同时构建 `/admin`
+- 如果 Tina 环境变量缺失，会自动回退成普通静态构建，保证前台博客仍可部署
+
 构建完成后，静态产物会输出到：
 
 ```txt
@@ -167,10 +172,11 @@ tina/                 TinaCMS 配置
 - Build command: `npm run tina:build`
 - Output directory: `out`
 
-如果你暂时不需要线上 Tina 编辑后台，也可以只用：
+说明：
 
-- Build command: `npm run build`
-- Output directory: `out`
+- 这个命令现在是“兼容模式”
+- 有 Tina 环境变量时：构建前台 + Tina admin
+- 没有 Tina 环境变量时：只构建前台，不会让部署失败
 
 参考文档：
 

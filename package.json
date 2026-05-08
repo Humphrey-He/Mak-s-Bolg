@@ -6,7 +6,7 @@
     "dev": "next dev",
     "dev:no-tina": "next dev",
     "tina:dev": "tinacms dev -c \"next dev\"",
-    "tina:build": "node scripts/check-tina-env.mjs && tinacms build && next build",
+    "tina:build": "node scripts/tina-build.mjs",
     "build": "next build",
     "build:local": "set NEXT_TURBOPACK=0 && next build",
     "start": "next start",
