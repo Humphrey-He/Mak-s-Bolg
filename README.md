@@ -183,3 +183,23 @@ tina/                 TinaCMS 配置
 - [docs/cloudflare-pages-static-export.md](./docs/cloudflare-pages-static-export.md)
 - [docs/content-import-guide.md](./docs/content-import-guide.md)
 - [docs/tina-cloudflare-production.md](./docs/tina-cloudflare-production.md)
+
+## Cloudflare Workers 静态部署
+
+如果你的 Cloudflare 项目使用的是 `wrangler deploy`，而不是 Pages 的“仅上传构建目录”模式，这个仓库现在也已经兼容。
+
+- Wrangler 配置文件：`wrangler.jsonc`
+- 静态资源目录：`out`
+- 部署前先运行：
+
+```bash
+npm run tina:build
+```
+
+然后执行：
+
+```bash
+npx wrangler deploy
+```
+
+这个配置会把站点当作静态资源部署，不再触发 OpenNext 的 Next.js Workers 迁移流程。
