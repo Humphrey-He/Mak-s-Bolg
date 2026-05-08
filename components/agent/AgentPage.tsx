@@ -4,6 +4,8 @@ import { useState } from "react";
 import { copy } from "@/data/copy";
 import { Icon } from "@/components/shared/Icon";
 import { PixelButton } from "@/components/shared/PixelButton";
+import { AgentTimeline } from "./AgentTimeline";
+import { AgentMemoryCapsules } from "./AgentMemoryCapsules";
 
 export function AgentPage() {
   const t = copy.zh;
@@ -34,7 +36,7 @@ export function AgentPage() {
           <p className="mt-4 max-w-3xl text-sm leading-7 text-slate-400">{t.agentDesc}</p>
         </div>
 
-        <div className="grid grid-cols-1 gap-5 md:grid-cols-2 xl:grid-cols-3">
+        <div className="mb-10 grid grid-cols-1 gap-5 md:grid-cols-2 xl:grid-cols-3">
           {modules.map(([title, desc], index) => (
             <article key={title} className="rounded-3xl border border-white/10 bg-white/[0.045] p-6 backdrop-blur-xl hover:border-fuchsia-200/30">
               <div className="mb-4 flex h-11 w-11 items-center justify-center rounded-2xl bg-cyan-300/10 text-cyan-100"><Icon name="cpu" /></div>
@@ -43,6 +45,11 @@ export function AgentPage() {
               <div className="mt-5 font-mono text-xs text-fuchsia-100">agent.module.{String(index + 1).padStart(2, "0")}</div>
             </article>
           ))}
+        </div>
+
+        <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+          <AgentTimeline />
+          <AgentMemoryCapsules />
         </div>
       </section>
 
