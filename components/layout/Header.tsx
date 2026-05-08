@@ -42,12 +42,12 @@ export function Header({ t }: { t: Copy }) {
             </div>
           </Link>
 
-          <nav className="hidden items-center gap-1 rounded-2xl border border-white/10 bg-white/[0.035] p-1 md:flex">
+          <nav className="hidden items-center gap-1 rounded-2xl border border-white/10 bg-white/[0.035] p-1 lg:flex">
             {navItems}
           </nav>
 
           <a
-            className="hidden h-9 w-9 place-items-center rounded-lg border border-white/10 bg-white/5 text-slate-200 transition hover:-translate-y-0.5 hover:border-cyan-200/50 hover:text-cyan-100 sm:grid"
+            className="hidden h-9 w-9 place-items-center rounded-lg border border-white/10 bg-white/5 text-slate-200 transition hover:-translate-y-0.5 hover:border-cyan-200/50 hover:text-cyan-100 md:grid"
             href="https://github.com/Humphrey-He"
             target="_blank"
             rel="noreferrer"
@@ -57,7 +57,7 @@ export function Header({ t }: { t: Copy }) {
           </a>
         </div>
 
-        <nav className="mobile-nav-scroll mt-4 flex gap-2 overflow-x-auto pb-1 md:hidden">
+        <nav className="mobile-nav-scroll mt-4 flex gap-2 overflow-x-auto pb-1 lg:hidden">
           {navItems}
         </nav>
       </div>

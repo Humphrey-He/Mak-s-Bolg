@@ -103,6 +103,11 @@ export function BlogList() {
   const totalPages = Math.max(1, Math.ceil(filteredPosts.length / pageSize));
   const pagedPosts = filteredPosts.slice((page - 1) * pageSize, page * pageSize);
 
+  const getCarouselOffset = () => {
+    const cardWidth = typeof window !== 'undefined' && window.innerWidth >= 768 ? 484 : 544;
+    return -activeIndex * cardWidth;
+  };
+
   const handleWheel = (event: React.WheelEvent) => {
     event.preventDefault();
     if (wheelLock.current) return;
@@ -170,7 +175,7 @@ export function BlogList() {
           </div>
           <motion.div
             className="article-track-gpu flex items-center gap-6 px-[calc(50%-39vw)] md:px-[calc(50%-230px)]"
-            animate={{ x: `calc(${-activeIndex} * (min(78vw, 520px) + 24px))` }}
+            animate={{ x: getCarouselOffset() }}
             transition={{ type: "spring", stiffness: 220, damping: 32, mass: 0.8 }}
           >
             {topPosts.map((post, index) => (
