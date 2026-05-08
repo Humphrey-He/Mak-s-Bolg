@@ -7,6 +7,7 @@ export const copy = {
       { key: "blog", label: "文章", hint: "Blog", href: "/blog" },
       { key: "projects", label: "项目", hint: "Projects", href: "/projects" },
       { key: "agent", label: "Agent", hint: "AI Dev", href: "/agent" },
+      { key: "readings", label: "阅读", hint: "Readings", href: "/readings" },
       { key: "backend", label: "后端", hint: "Backend", href: "/backend" },
       { key: "about", label: "关于", hint: "About", href: "/about" },
       { key: "message", label: "留言", hint: "Message", href: "/message" }
@@ -41,6 +42,7 @@ export const copy = {
       { key: "blog", label: "Blog", hint: "文章", href: "/blog" },
       { key: "projects", label: "Projects", hint: "项目", href: "/projects" },
       { key: "agent", label: "Agent", hint: "AI Dev", href: "/agent" },
+      { key: "readings", label: "Readings", hint: "阅读", href: "/readings" },
       { key: "backend", label: "Backend", hint: "后端", href: "/backend" },
       { key: "about", label: "About", hint: "关于", href: "/about" },
       { key: "message", label: "Message", hint: "留言", href: "/message" }
