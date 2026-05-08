@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync } from "node:fs";
+﻿import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import matter from "gray-matter";
 
@@ -20,6 +20,7 @@ export type BlogPost = BlogPostSummary & {
 };
 
 type Frontmatter = {
+  slug?: string;
   title: string;
   description: string;
   date: string;
@@ -29,17 +30,18 @@ type Frontmatter = {
   featured?: boolean;
 };
 
-function getPostSlugs() {
+function getPostFileNames() {
   return readdirSync(postsDirectory)
     .filter((fileName) => fileName.endsWith(".mdx"))
     .sort();
 }
 
-function readPostFile(slug: string): BlogPost {
-  const filePath = join(postsDirectory, `${slug}.mdx`);
-  const source = readFileSync(filePath, "utf8");
+function readPostFile(fileName: string): BlogPost {
+  const source = readFileSync(join(postsDirectory, fileName), "utf8");
   const { data, content } = matter(source);
   const frontmatter = data as Frontmatter;
+  const fileSlug = fileName.replace(/\.mdx$/, "");
+  const slug = frontmatter.slug || fileSlug;
 
   return {
     slug,
@@ -58,9 +60,12 @@ function byDateDesc(a: { date: string }, b: { date: string }) {
   return new Date(b.date).getTime() - new Date(a.date).getTime();
 }
 
+function getAllPostFiles(): BlogPost[] {
+  return getPostFileNames().map((fileName) => readPostFile(fileName));
+}
+
 export function getAllPosts(): BlogPostSummary[] {
-  return getPostSlugs()
-    .map((fileName) => readPostFile(fileName.replace(/\.mdx$/, "")))
+  return getAllPostFiles()
     .sort(byDateDesc)
     .map(({ content, ...post }) => post);
 }
@@ -70,13 +75,8 @@ export function getAllPostSlugs(): string[] {
 }
 
 export function getPostBySlug(slug: string): BlogPost | null {
-  const filePath = join(postsDirectory, `${slug}.mdx`);
-
-  try {
-    return readPostFile(slug);
-  } catch {
-    return null;
-  }
+  const post = getAllPostFiles().find((item) => item.slug === slug);
+  return post || null;
 }
 
 export function getRelatedPosts(currentPost: BlogPost, count: number = 3): BlogPostSummary[] {

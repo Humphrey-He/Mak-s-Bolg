@@ -5,6 +5,8 @@
   "scripts": {
     "dev": "next dev",
     "dev:no-tina": "next dev",
+    "tina:dev": "tinacms dev -c \"next dev\"",
+    "tina:build": "node scripts/check-tina-env.mjs && tinacms build && next build",
     "build": "next build",
     "build:local": "set NEXT_TURBOPACK=0 && next build",
     "start": "next start",
@@ -17,11 +19,13 @@
     "@mdx-js/react": "^3.1.1",
     "framer-motion": "^11.0.0",
     "gray-matter": "^4.0.3",
+    "highlight.js": "^11.11.1",
     "katex": "^0.16.45",
     "next": "^15.5.18",
     "next-mdx-remote": "^5.0.0",
     "react": "latest",
     "react-dom": "latest",
+    "rehype-highlight": "^7.0.2",
     "rehype-katex": "^7.0.1",
     "remark-gfm": "^4.0.1",
     "remark-math": "^6.0.0"

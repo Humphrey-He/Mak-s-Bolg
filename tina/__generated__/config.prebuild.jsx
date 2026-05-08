@@ -22,7 +22,10 @@ var config_default = defineConfig({
         path: "content/posts",
         format: "mdx",
         ui: {
-          router: ({ document }) => `/blog/${document._sys.filename}`
+          router: ({ document }) => {
+            const doc = document;
+            return `/blog/${doc.slug || doc._sys.filename}`;
+          }
         },
         fields: [
           {
@@ -36,7 +39,8 @@ var config_default = defineConfig({
             type: "string",
             name: "slug",
             label: "URL Slug",
-            required: true
+            required: true,
+            description: "\u5EFA\u8BAE\u4E0E\u6587\u4EF6\u540D\u4FDD\u6301\u4E00\u81F4\uFF0C\u4F8B\u5982 high-concurrency-go-cache"
           },
           {
             type: "datetime",
@@ -86,7 +90,10 @@ var config_default = defineConfig({
         path: "content/projects",
         format: "mdx",
         ui: {
-          router: ({ document }) => `/projects/${document._sys.filename}`
+          router: ({ document }) => {
+            const doc = document;
+            return `/projects/${doc.slug || doc._sys.filename}`;
+          }
         },
         fields: [
           {

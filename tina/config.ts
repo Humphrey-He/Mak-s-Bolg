@@ -1,4 +1,4 @@
-import { defineConfig } from "tinacms";
+﻿import { defineConfig } from "tinacms";
 
 export default defineConfig({
   branch: process.env.NEXT_PUBLIC_TINA_BRANCH || "main",
@@ -22,7 +22,7 @@ export default defineConfig({
         path: "content/posts",
         format: "mdx",
         ui: {
-          router: ({ document }) => `/blog/${document._sys.filename}`,
+          router: ({ document }) => { const doc = document as { slug?: string; _sys: { filename: string } }; return `/blog/${doc.slug || doc._sys.filename}`; },
         },
         fields: [
           {
@@ -37,6 +37,7 @@ export default defineConfig({
             name: "slug",
             label: "URL Slug",
             required: true,
+            description: "建议与文件名保持一致，例如 high-concurrency-go-cache",
           },
           {
             type: "datetime",
@@ -86,7 +87,7 @@ export default defineConfig({
         path: "content/projects",
         format: "mdx",
         ui: {
-          router: ({ document }) => `/projects/${document._sys.filename}`,
+          router: ({ document }) => { const doc = document as { slug?: string; _sys: { filename: string } }; return `/projects/${doc.slug || doc._sys.filename}`; },
         },
         fields: [
           {
@@ -138,3 +139,4 @@ export default defineConfig({
     ],
   },
 });
+
