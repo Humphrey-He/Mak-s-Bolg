@@ -110,11 +110,16 @@ export default defineConfig({
           },
           {
             type: "string",
-            name: "description",
+            name: "desc",
             label: "描述",
             ui: {
               component: "textarea",
             },
+          },
+          {
+            type: "string",
+            name: "repoUrl",
+            label: "仓库地址",
           },
           {
             type: "string",

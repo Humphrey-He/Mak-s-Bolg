@@ -1,0 +1,35 @@
+---
+name: "APISIX Plugin"
+slug: "apisix-plugin"
+type: "Gateway Security"
+desc: "基于 APISIX Go Plugin Runner 的网关加解密插件，支持多策略路由、多版本密钥与响应解密。"
+techStack:
+  - APISIX
+  - Go Plugin Runner
+  - AES-256-GCM
+  - RSA
+highlights:
+  - 请求加解密
+  - 多策略路由
+  - 多版本密钥管理
+  - 在线热更新
+repoUrl: "https://github.com/Humphrey-He/apisix-diff"
+---
+
+## 项目背景
+
+这个项目聚焦在 API 网关层完成请求加密、响应解密和密钥演进，减少业务服务重复实现安全逻辑。
+
+## 核心设计
+
+### 插件运行机制
+
+基于 APISIX Go Plugin Runner 承接请求生命周期中的安全处理。
+
+### 策略选择
+
+支持按路由、租户或版本切换不同加密策略。
+
+### 密钥管理
+
+引入多版本密钥与热更新，兼顾安全性和线上可运维性。

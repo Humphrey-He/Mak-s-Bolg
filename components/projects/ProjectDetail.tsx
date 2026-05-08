@@ -4,7 +4,7 @@ import { useState, useEffect, useRef } from "react";
 import { motion } from "framer-motion";
 import { localize } from "@/lib/i18n";
 import { Icon } from "@/components/shared/Icon";
-import type { Project } from "@/data/projects";
+import type { Project } from "@/lib/projects";
 
 interface ProjectDetailProps {
   project: Project;

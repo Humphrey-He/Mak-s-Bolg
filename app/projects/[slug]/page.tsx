@@ -2,7 +2,7 @@ import { notFound } from "next/navigation";
 import type { Metadata } from "next";
 import { SiteShell } from "@/components/layout/SiteShell";
 import { ProjectDetail } from "@/components/projects/ProjectDetail";
-import { getProjectBySlug, projectCards } from "@/data/projects";
+import { getProjectBySlug, getAllProjectSlugs } from "@/lib/projects";
 import { localize } from "@/lib/i18n";
 
 interface PageProps {
@@ -10,8 +10,8 @@ interface PageProps {
 }
 
 export async function generateStaticParams() {
-  return projectCards.map((project) => ({
-    slug: project.slug,
+  return getAllProjectSlugs().map((slug) => ({
+    slug,
   }));
 }
 

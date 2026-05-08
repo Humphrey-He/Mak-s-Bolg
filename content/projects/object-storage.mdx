@@ -1,0 +1,35 @@
+---
+name: "Object Storage"
+slug: "object-storage"
+type: "COS/S3 Like Service"
+desc: "基于 go-zero 与 Tencent COS SDK 的对象存储网关，覆盖 Bucket、Object、ACL、Tagging 等能力。"
+techStack:
+  - Go
+  - go-zero
+  - COS SDK
+  - MinIO
+highlights:
+  - S3 兼容 API
+  - 多租户隔离
+  - ACL 权限控制
+  - Multipart 上传
+repoUrl: ""
+---
+
+## 项目背景
+
+项目目标是构建一套类 S3/COS 的对象存储网关，统一访问模型并支撑常见对象操作。
+
+## 核心设计
+
+### Bucket 能力
+
+覆盖创建、查询和列举等基础能力。
+
+### Object 能力
+
+支持上传、下载、删除与多段上传等关键路径。
+
+### 权限控制
+
+通过 ACL 与标签体系增强资源隔离和治理能力。

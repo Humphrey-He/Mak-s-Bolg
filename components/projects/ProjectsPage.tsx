@@ -1,9 +1,10 @@
-import { projectCards } from "@/data/projects";
+import { getAllProjects } from "@/lib/projects";
 import { copy } from "@/data/copy";
 import { localize } from "@/lib/i18n";
 
 export function ProjectsPage() {
   const t = copy.zh;
+  const projects = getAllProjects();
 
   return (
     <section className="mx-auto max-w-7xl px-5 py-16">
@@ -12,7 +13,7 @@ export function ProjectsPage() {
         <p className="mt-4 max-w-2xl text-sm leading-7 text-slate-400">{t.projectDesc}</p>
       </div>
       <div className="grid grid-cols-1 gap-5 md:grid-cols-2">
-        {projectCards.map((project) => (
+        {projects.map((project) => (
           <a
             key={project.name}
             href={`/projects/${project.slug}`}

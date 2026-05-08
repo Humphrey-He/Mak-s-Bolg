@@ -1,0 +1,35 @@
+---
+name: "HCache"
+slug: "hcache"
+type: "Go Cache Engine"
+desc: "面向高并发场景的 Go 本地缓存引擎，覆盖分片、LRU/LFU、W-TinyLFU 与内存水位控制。"
+techStack:
+  - Go
+  - Sync Pool
+  - Ring Buffer
+  - W-TinyLFU
+highlights:
+  - 分片并发设计
+  - W-TinyLFU 准入
+  - 内存水位控制
+  - 多核性能优化
+repoUrl: "https://github.com/Humphrey-He/hcache"
+---
+
+## 项目背景
+
+HCache 是一个面向高并发服务场景设计的 Go 本地缓存引擎，目标是在命中率、吞吐和内存可控之间取得平衡。
+
+## 核心设计
+
+### 分片并发
+
+通过分片减少锁竞争，让读写路径更适合多核环境。
+
+### 准入策略
+
+结合 W-TinyLFU 识别热点数据，避免低价值数据污染缓存。
+
+### 内存治理
+
+通过容量和水位策略限制缓存膨胀，让服务更稳定。
