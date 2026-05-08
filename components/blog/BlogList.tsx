@@ -69,13 +69,15 @@ function ArticleListItem({ post, index }: { post: typeof posts[number]; index: n
       transition={{ duration: 0.28, delay: index * 0.035 }}
       className="group relative overflow-hidden rounded-3xl border border-white/10 bg-white/[0.04] p-5 backdrop-blur-xl transition hover:border-cyan-200/30 hover:bg-white/[0.065]"
     >
-      <div className="mb-3 flex flex-wrap items-center gap-2">
-        <span className="rounded-full border border-cyan-300/20 bg-cyan-300/10 px-3 py-1 text-xs text-cyan-100">{post.tag}</span>
-        {post.top && <span className="rounded-full border border-fuchsia-300/20 bg-fuchsia-400/10 px-3 py-1 text-xs text-fuchsia-100">TOP</span>}
-        <span className="font-mono text-xs text-slate-500">{post.date}</span>
-      </div>
-      <h3 className="text-lg font-black text-white group-hover:text-cyan-100">{localize(post.title, "zh")}</h3>
-      <p className="mt-2 text-sm leading-6 text-slate-400">{localize(post.desc, "zh")}</p>
+      <a href={`/blog/${post.slug}`} className="block">
+        <div className="mb-3 flex flex-wrap items-center gap-2">
+          <span className="rounded-full border border-cyan-300/20 bg-cyan-300/10 px-3 py-1 text-xs text-cyan-100">{post.tag}</span>
+          {post.top && <span className="rounded-full border border-fuchsia-300/20 bg-fuchsia-400/10 px-3 py-1 text-xs text-fuchsia-100">TOP</span>}
+          <span className="font-mono text-xs text-slate-500">{post.date}</span>
+        </div>
+        <h3 className="text-lg font-black text-white group-hover:text-cyan-100">{localize(post.title, "zh")}</h3>
+        <p className="mt-2 text-sm leading-6 text-slate-400">{localize(post.desc, "zh")}</p>
+      </a>
     </motion.article>
   );
 }
