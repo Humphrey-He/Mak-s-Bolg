@@ -79,6 +79,21 @@ export function ProjectDetail({ project }: ProjectDetailProps) {
             {localize(project.desc, lang)}
           </p>
 
+          {project.repoUrl ? (
+            <div className="mt-6">
+              <a
+                href={project.repoUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-2 rounded-xl border border-cyan-300/40 bg-cyan-300/10 px-4 py-2 text-sm font-semibold text-cyan-100 shadow-[0_0_28px_rgba(34,211,238,.18)] transition hover:-translate-y-0.5 hover:bg-cyan-300/20"
+              >
+                <Icon name="github" className="h-4 w-4" />
+                Git 仓库
+                <Icon name="arrow" className="h-4 w-4" />
+              </a>
+            </div>
+          ) : null}
+
           <div className="mt-6">
             <h3 className="mb-3 text-sm font-bold uppercase tracking-widest text-cyan-200/70">技术栈</h3>
             <div className="flex flex-wrap gap-2">

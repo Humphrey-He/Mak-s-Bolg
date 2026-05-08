@@ -5,7 +5,7 @@ import { motion } from "framer-motion";
 import { Icon } from "@/components/shared/Icon";
 import { PixelButton } from "@/components/shared/PixelButton";
 import { copy } from "@/data/copy";
-import { projectNames } from "@/data/projects";
+import { heroFeaturedProjects } from "@/data/projects";
 
 export function Hero() {
   const t = copy.zh;
@@ -41,20 +41,47 @@ export function Hero() {
         <div className="relative h-full rounded-[1.45rem] border border-white/10 bg-black/30 p-5">
           <div className="mb-5 flex items-center justify-between">
             <div className="flex gap-2"><span className="h-3 w-3 rounded-full bg-red-400" /><span className="h-3 w-3 rounded-full bg-yellow-300" /><span className="h-3 w-3 rounded-full bg-green-300" /></div>
-            <span className="text-xs text-cyan-200/60">/blog/index.tsx</span>
+            <span className="text-xs text-cyan-200/60">/projects/featured.ts</span>
           </div>
           <div className="font-mono text-sm leading-7 text-slate-300">
             <p><span className="text-fuchsia-300">const</span> author = <span className="text-cyan-200">"书鸿 / Juno Mak"</span>;</p>
             <p><span className="text-fuchsia-300">const</span> role = <span className="text-cyan-200">"Backend & Cloud Native Developer"</span>;</p>
           </div>
-          <div className="mt-8 grid grid-cols-2 gap-3">
-            {projectNames.slice(0, 4).map((p, i) => (
-              <motion.div key={p} whileHover={{ y: -4, scale: 1.03 }} className="group rounded-2xl border border-white/10 bg-white/[0.04] p-4">
-                <div className="mb-3 flex h-9 w-9 items-center justify-center rounded-xl bg-cyan-300/10 text-cyan-100"><Icon name="cpu" /></div>
-                <div className="font-semibold text-white">{p}</div>
-                <div className="mt-1 text-xs text-slate-500">#{String(i + 1).padStart(2, "0")}</div>
-              </motion.div>
-            ))}
+          <div className="mt-8">
+            <div className="mb-4 flex items-center justify-between gap-3">
+              <div>
+                <p className="text-[11px] font-mono uppercase tracking-[0.3em] text-cyan-200/55">Featured Work</p>
+                <h2 className="mt-2 text-lg font-semibold text-white">代表作</h2>
+              </div>
+              <span className="rounded-full border border-cyan-300/20 bg-cyan-300/10 px-3 py-1 text-[11px] font-mono uppercase tracking-[0.24em] text-cyan-100">
+                Top 3
+              </span>
+            </div>
+            <div className="space-y-3">
+              {heroFeaturedProjects.map((project, index) => (
+                <Link key={project.slug} href={`/projects/${project.slug}`} className="block">
+                  <motion.div
+                    whileHover={{ y: -4, scale: 1.01 }}
+                    className="group rounded-2xl border border-white/10 bg-white/[0.04] p-4 transition-colors hover:border-cyan-300/30 hover:bg-cyan-300/[0.08]"
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <p className="text-[11px] font-mono uppercase tracking-[0.24em] text-fuchsia-200/75">{project.type}</p>
+                        <h3 className="mt-2 text-base font-semibold text-white">{project.name}</h3>
+                      </div>
+                      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-cyan-300/20 bg-cyan-300/10 text-cyan-100">
+                        <Icon name="arrow" className="h-4 w-4 transition-transform duration-300 group-hover:translate-x-0.5" />
+                      </div>
+                    </div>
+                    <p className="mt-3 text-sm leading-6 text-slate-300">{project.summary}</p>
+                    <div className="mt-3 flex items-center justify-between gap-3 border-t border-white/10 pt-3">
+                      <p className="text-xs leading-5 text-slate-400">{project.note}</p>
+                      <span className="shrink-0 text-xs font-medium text-cyan-200">#{String(index + 1).padStart(2, "0")}</span>
+                    </div>
+                  </motion.div>
+                </Link>
+              ))}
+            </div>
           </div>
         </div>
       </motion.div>

@@ -44,6 +44,51 @@ const checks = [
       const content = read("app/message/page.tsx");
       return content.includes('placeholder="你的称呼"') && content.includes('placeholder="邮箱或联系方式"');
     }
+  },
+  {
+    name: "home hero data exports the curated flagship projects",
+    pass: () => {
+      const content = read("data/projects.ts");
+      return (
+        content.includes("heroFeaturedProjects") &&
+        content.includes('slug: "hcache"') &&
+        content.includes('slug: "apisix-plugin"') &&
+        content.includes('slug: "agent-dev-studio"')
+      );
+    }
+  },
+  {
+    name: "home hero renders clickable flagship project cards",
+    pass: () => {
+      const content = read("components/home/Hero.tsx");
+      return (
+        content.includes("heroFeaturedProjects.map") &&
+        content.includes('href={`/projects/${project.slug}`}') &&
+        content.includes("代表作")
+      );
+    }
+  },
+  {
+    name: "project data stores repository urls for flagship projects",
+    pass: () => {
+      const content = read("data/projects.ts");
+      return (
+        content.includes('repoUrl: "https://github.com/Humphrey-He/hcache"') &&
+        content.includes('repoUrl: "https://github.com/Humphrey-He/apisix-diff"') &&
+        content.includes('repoUrl: "https://github.com/Humphrey-He/hermes_notes"')
+      );
+    }
+  },
+  {
+    name: "project detail renders a repository button when repoUrl exists",
+    pass: () => {
+      const content = read("components/projects/ProjectDetail.tsx");
+      return (
+        content.includes("project.repoUrl") &&
+        content.includes('target="_blank"') &&
+        content.includes("Git 仓库")
+      );
+    }
   }
 ];
 
