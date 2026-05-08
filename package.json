@@ -3,19 +3,24 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
+    "dev": "tinacms dev -c \"next dev\"",
+    "dev:no-tina": "next dev",
+    "build": "tinacms build && next build",
     "start": "next start",
     "lint": "next lint"
   },
   "dependencies": {
     "framer-motion": "^11.0.0",
+    "gray-matter": "^4.0.3",
     "next": "latest",
+    "next-mdx-remote": "^6.0.0",
     "react": "latest",
-    "react-dom": "latest"
+    "react-dom": "latest",
+    "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.2.4",
+    "@tinacms/cli": "^2.2.5",
     "@types/node": "latest",
     "@types/react": "latest",
     "@types/react-dom": "latest",
@@ -24,6 +29,7 @@
     "eslint-config-next": "latest",
     "postcss": "latest",
     "tailwindcss": "latest",
+    "tinacms": "^3.7.5",
     "typescript": "latest"
   }
 }
