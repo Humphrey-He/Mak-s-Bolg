@@ -12,6 +12,7 @@
     "start": "next start",
     "lint": "next lint",
     "verify:static-mdx": "node scripts/verify-static-mdx.mjs",
+    "verify:tina-admin": "node scripts/verify-tina-admin.mjs",
     "preview:static": "serve out -l 3010"
   },
   "dependencies": {

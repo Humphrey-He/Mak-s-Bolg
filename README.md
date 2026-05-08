@@ -1,11 +1,10 @@
-# 书鸿 · Juno Mak Blog
+﻿# Juno Mak Blog
 
 这是一个基于 Next.js App Router 的个人技术博客，当前采用：
-
 - Next.js 静态导出
-- Cloudflare Pages 友好部署
-- `content/posts/*.mdx` 作为文章源
-- TinaCMS 作为可视化内容编辑后台
+- Cloudflare 友好的静态资源部署
+- `content/posts/*.mdx` 管理文章
+- TinaCMS 管理可视化编辑后台
 
 ## 安装
 
@@ -21,24 +20,20 @@ npm install
 npm run dev
 ```
 
-适合：
-
-- 改页面样式
-- 调整组件结构
-- 编写和修改内容
+适合页面结构、样式和组件联调。
 
 ## 本地 Tina 编辑
 
-如果你要在本地使用 Tina 编辑器，请运行：
+如果你要在本地启用 Tina 编辑器：
 
 ```bash
 npm run tina:dev
 ```
 
-然后打开：
+然后访问：
 
 ```txt
-http://localhost:3000/admin
+http://localhost:3000/admin/
 ```
 
 建议本地 `.env.local` 至少包含：
@@ -52,27 +47,39 @@ NEXT_PUBLIC_SITE_URL=http://localhost:3000
 
 ## 生产构建
 
-纯静态导出：
+纯静态站构建：
 
 ```bash
 npm run build
 ```
 
-如果要把 Tina 管理后台一起编进产物，使用：
+带 Tina 管理后台的生产构建：
 
 ```bash
 npm run tina:build
 ```
 
-说明：
+这个命令会：
+- 先检查 Tina 环境变量
+- 环境齐全时构建 Tina `/admin`
+- 环境不齐全时保留 `/admin` fallback 说明页
+- 始终继续构建前台博客
+- 构建后自动校验 `/admin` 最终输出状态
 
-- 如果 Tina 环境变量齐全，会同时构建 `/admin`
-- 如果 Tina 环境变量缺失，会自动回退成普通静态构建，保证前台博客仍可部署
+## Tina 管理入口策略
 
-构建完成后，静态产物会输出到：
+现在 `/admin/` 已经不是 Next 页面了，而是：
+- 有完整 Tina 生产变量时：显示 TinaCloud 登录页
+- 缺少 Tina 生产变量时：显示 fallback 说明页
 
-```txt
-out/
+部署后可以直接通过两种方式判断是否启用成功：
+- 构建日志出现 `PASS: Tina admin built; /admin should open the TinaCloud login flow.`
+- 打开 `https://你的域名/admin/`，看到 TinaCloud 登录页而不是说明页
+
+也可以手动运行：
+
+```bash
+npm run verify:tina-admin
 ```
 
 ## 正确预览方式
@@ -83,7 +90,7 @@ out/
 output: "export"
 ```
 
-所以它是静态导出站点。预览导出结果时不要使用 `npm run start`，而是：
+所以不要用 `npm run start` 预览导出结果，而是：
 
 ```bash
 npm run build
@@ -93,32 +100,18 @@ npm run preview:static
 默认预览地址：
 
 ```txt
-http://127.0.0.1:3010
+http://127.0.0.1:3010/
 ```
-
-## 为什么不能用 `npm run start`
-
-因为 `next start` 适合 Next 服务端运行模式，不适用于：
-
-```txt
-output: "export"
-```
-
-继续使用 `npm run start` 很容易出现：
-
-- 页面样式异常
-- 资源路径和静态部署不一致
-- 看到的不是最终导出站点
 
 ## 内容目录
 
-### 文章
+文章：
 
 ```txt
 content/posts/*.mdx
 ```
 
-### 图片
+图片：
 
 ```txt
 public/uploads/posts/<slug>/
@@ -142,64 +135,21 @@ public/uploads/posts/high-concurrency-go-cache/overview.png
 
 ```bash
 npm run verify:static-mdx
-```
-
-然后再跑：
-
-```bash
 npm run build
 ```
 
-## 目录说明
+## Cloudflare 构建建议
 
-```txt
-app/                  App Router 页面
-components/           页面与 UI 组件
-content/posts/        博客文章 MDX 源文件
-data/                 静态文案与展示数据
-docs/                 项目文档
-lib/                  内容读取与工具函数
-public/uploads/       文章图片与静态资源
-scripts/              校验脚本
-styles/               全局样式
-tina/                 TinaCMS 配置
-```
-
-## Cloudflare Pages 部署
-
-推荐配置：
-
+Cloudflare Pages 推荐：
 - Build command: `npm run tina:build`
 - Output directory: `out`
 
-说明：
+Cloudflare Workers Static Assets 推荐：
+- Build command: `npm run tina:build`
+- Deploy command: `npx wrangler deploy`
 
-- 这个命令现在是“兼容模式”
-- 有 Tina 环境变量时：构建前台 + Tina admin
-- 没有 Tina 环境变量时：只构建前台，不会让部署失败
+## 参考文档
 
-参考文档：
-
-- [docs/cloudflare-pages-static-export.md](./docs/cloudflare-pages-static-export.md)
-- [docs/content-import-guide.md](./docs/content-import-guide.md)
-- [docs/tina-cloudflare-production.md](./docs/tina-cloudflare-production.md)
-
-## Cloudflare Workers 静态部署
-
-如果你的 Cloudflare 项目使用的是 `wrangler deploy`，而不是 Pages 的“仅上传构建目录”模式，这个仓库现在也已经兼容。
-
-- Wrangler 配置文件：`wrangler.jsonc`
-- 静态资源目录：`out`
-- 部署前先运行：
-
-```bash
-npm run tina:build
-```
-
-然后执行：
-
-```bash
-npx wrangler deploy
-```
-
-这个配置会把站点当作静态资源部署，不再触发 OpenNext 的 Next.js Workers 迁移流程。
+- `docs/content-import-guide.md`
+- `docs/tina-cloudflare-production.md`
+- `docs/cloudflare-workers-static-assets.md`

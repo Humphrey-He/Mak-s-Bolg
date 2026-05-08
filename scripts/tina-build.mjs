@@ -26,4 +26,9 @@ if (envStatus === 0) {
 }
 
 const nextStatus = run("npx", ["next", "build"]);
-process.exit(nextStatus);
+if (nextStatus !== 0) {
+  process.exit(nextStatus);
+}
+
+const verifyStatus = run("node", ["scripts/verify-tina-admin.mjs"]);
+process.exit(verifyStatus);
