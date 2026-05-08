@@ -87,6 +87,7 @@ export function BlogList() {
   const [activeIndex, setActiveIndex] = useState(0);
   const [page, setPage] = useState(1);
   const wheelLock = useRef(false);
+  const touchStartX = useRef<number | null>(null);
   const pageSize = 5;
 
   const topPosts = posts.filter((post) => post.top).slice(0, 5);
@@ -110,6 +111,24 @@ export function BlogList() {
     window.setTimeout(() => { wheelLock.current = false; }, 180);
   };
 
+  const stepCarousel = (direction: 1 | -1) => {
+    setActiveIndex((prev) => Math.max(0, Math.min(prev + direction, topPosts.length - 1)));
+  };
+
+  const handleTouchStart = (event: React.TouchEvent) => {
+    touchStartX.current = event.touches[0]?.clientX ?? null;
+  };
+
+  const handleTouchEnd = (event: React.TouchEvent) => {
+    if (touchStartX.current === null) return;
+    const touchEndX = event.changedTouches[0]?.clientX ?? touchStartX.current;
+    const deltaX = touchStartX.current - touchEndX;
+    touchStartX.current = null;
+
+    if (Math.abs(deltaX) < 48) return;
+    stepCarousel(deltaX > 0 ? 1 : -1);
+  };
+
   return (
     <section className="relative pb-24 pt-8">
       <div className="mx-auto mb-6 flex max-w-7xl flex-col justify-between gap-4 px-5 md:flex-row md:items-end">
@@ -123,7 +142,32 @@ export function BlogList() {
       </div>
 
       <div className="relative mx-auto mt-10 max-w-7xl px-5">
-        <div onWheel={handleWheel} className="article-focus-stage relative overflow-hidden rounded-[2.25rem] border border-white/10 bg-black/20 py-12 backdrop-blur-xl">
+        <div
+          onWheel={handleWheel}
+          onTouchStart={handleTouchStart}
+          onTouchEnd={handleTouchEnd}
+          className="article-focus-stage relative overflow-hidden rounded-[2.25rem] border border-white/10 bg-black/20 py-12 backdrop-blur-xl"
+        >
+          <div className="pointer-events-none absolute inset-x-0 top-5 z-10 flex justify-between px-5">
+            <button
+              type="button"
+              onClick={() => stepCarousel(-1)}
+              disabled={activeIndex === 0}
+              className="pointer-events-auto grid h-10 w-10 place-items-center rounded-full border border-white/10 bg-black/40 text-slate-200 transition hover:border-cyan-200/50 hover:text-cyan-100 disabled:opacity-35"
+              aria-label="上一张"
+            >
+              ←
+            </button>
+            <button
+              type="button"
+              onClick={() => stepCarousel(1)}
+              disabled={activeIndex === topPosts.length - 1}
+              className="pointer-events-auto grid h-10 w-10 place-items-center rounded-full border border-white/10 bg-black/40 text-slate-200 transition hover:border-cyan-200/50 hover:text-cyan-100 disabled:opacity-35"
+              aria-label="下一张"
+            >
+              →
+            </button>
+          </div>
           <motion.div
             className="article-track-gpu flex items-center gap-6 px-[calc(50%-39vw)] md:px-[calc(50%-230px)]"
             animate={{ x: `calc(${-activeIndex} * (min(78vw, 520px) + 24px))` }}
@@ -139,10 +183,10 @@ export function BlogList() {
       <div className="mx-auto mt-12 max-w-7xl px-5">
         <div className="mb-5 flex flex-col justify-between gap-4 md:flex-row md:items-end">
           <div>
-            <h3 className="text-2xl font-black text-white md:text-3xl">All Articles</h3>
+            <h3 className="text-2xl font-black text-white md:text-3xl">全部文章</h3>
             <p className="mt-2 text-sm text-slate-400">检索全部文章，Top 5 只是后台精选展示。</p>
           </div>
-          <div className="font-mono text-xs text-slate-500">{filteredPosts.length} articles · page {page}/{totalPages}</div>
+          <div className="font-mono text-xs text-slate-500">{filteredPosts.length} 篇文章 · 第 {page}/{totalPages} 页</div>
         </div>
       </div>
 
@@ -160,7 +204,7 @@ export function BlogList() {
         </motion.div>
 
         <div className="mt-7 flex flex-col items-center justify-between gap-4 rounded-3xl border border-white/10 bg-white/[0.035] p-4 backdrop-blur-xl md:flex-row">
-          <button onClick={() => setPage(Math.max(1, page - 1))} disabled={page === 1} className="rounded-2xl border border-white/10 bg-black/20 px-4 py-2 text-sm font-semibold text-slate-300 disabled:opacity-35">← Prev Page</button>
+          <button onClick={() => setPage(Math.max(1, page - 1))} disabled={page === 1} className="rounded-2xl border border-white/10 bg-black/20 px-4 py-2 text-sm font-semibold text-slate-300 disabled:opacity-35">← 上一页</button>
           <div className="flex flex-wrap items-center justify-center gap-2">
             {Array.from({ length: totalPages }).map((_, index) => {
               const pageNumber = index + 1;
@@ -171,7 +215,7 @@ export function BlogList() {
               );
             })}
           </div>
-          <button onClick={() => setPage(Math.min(totalPages, page + 1))} disabled={page === totalPages} className="rounded-2xl border border-white/10 bg-black/20 px-4 py-2 text-sm font-semibold text-slate-300 disabled:opacity-35">Next Page →</button>
+          <button onClick={() => setPage(Math.min(totalPages, page + 1))} disabled={page === totalPages} className="rounded-2xl border border-white/10 bg-black/20 px-4 py-2 text-sm font-semibold text-slate-300 disabled:opacity-35">下一页 →</button>
         </div>
       </div>
     </section>
