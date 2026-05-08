@@ -1,13 +1,10 @@
-﻿<!doctype html>
+<!doctype html>
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Tina Admin Setup</title>
-    <meta
-      name="robots"
-      content="noindex, nofollow"
-    />
+    <meta name="robots" content="noindex, nofollow" />
     <style>
       :root {
         color-scheme: dark;
@@ -150,16 +147,19 @@
     <main>
       <section class="panel">
         <div class="eyebrow">TinaCMS Admin</div>
-        <h1>/admin 杩樻病鏈夊垏鎹㈠埌 Tina 鐧诲綍椤?/h1>
+        <h1>/admin 还没有切换到 Tina 登录页面</h1>
         <p>
-          褰撳墠閮ㄧ讲缂哄皯 Tina 鐢熶骇鐜鍙橀噺锛屾墍浠ユ瀯寤虹郴缁熶繚鐣欎簡杩欎釜 fallback 椤甸潰锛?          绔欑偣鍓嶅彴鍙互缁х画涓婄嚎锛屼絾 Tina 鍙鍖栫紪杈戝悗鍙拌繕娌℃湁鐪熸鍚敤銆?        </p>
+          当前部署缺少 Tina 生产环境变量，所以构建系统保留了这个 fallback 页面。
+          站点前台可以继续上线，但 Tina 可视化编辑后台还没有真正启用。
+        </p>
         <p class="warning">
-          褰?Tina 閰嶇疆瀹屾暣鍚庯紝<code>/admin/</code> 浼氳 Tina 鐨勭湡瀹炲悗鍙拌鐩栵紝
-          浣犱細鐪嬪埌 TinaCloud 鐧诲綍椤碉紝鑰屼笉鏄繖寮犺鏄庨〉銆?        </p>
+          当 Tina 配置完整后，<code>/admin/</code> 会被 Tina 的真实后台覆盖，
+          你会看到 TinaCloud 登录页，而不是这张说明页。
+        </p>
 
         <div class="grid">
           <article class="card">
-            <h2>Cloudflare Pages 闇€瑕佺殑鍙橀噺</h2>
+            <h2>Cloudflare Pages 需要的变量</h2>
             <ul>
               <li><code>NEXT_PUBLIC_TINA_CLIENT_ID</code></li>
               <li><code>TINA_TOKEN</code></li>
@@ -168,21 +168,20 @@
             </ul>
           </article>
           <article class="card">
-            <h2>鍚敤鎴愬姛鍚庣殑棰勬湡</h2>
+            <h2>启用成功后的预期</h2>
             <ul>
-              <li>閮ㄧ讲鏃ュ織閲屽嚭鐜?鈥淧ASS: Tina admin built鈥?/li>
-              <li><code>/admin/</code> 鎵撳紑 TinaCloud 鐧诲綍椤?/li>
-              <li>鐧诲綍鍚庡彲浠ョ鐞?<code>content/posts</code> 鍜?<code>content/projects</code></li>
+              <li>部署日志里出现「PASS: Tina admin built」</li>
+              <li><code>/admin/</code> 打开 TinaCloud 登录页</li>
+              <li>登录后可编辑 <code>content/posts</code> 和 <code>content/projects</code></li>
             </ul>
           </article>
         </div>
 
         <div class="actions">
-          <a class="button" href="/">杩斿洖鍗氬棣栭〉</a>
-          <a class="button secondary" href="https://github.com/Humphrey-He/Mak-s-Bolg/blob/main/docs/tina-cloudflare-production.md">鏌ョ湅涓婄嚎璇存槑</a>
+          <a class="button" href="/">返回博客首页</a>
+          <a class="button secondary" href="https://github.com/Humphrey-He/Mak-s-Bolg/blob/main/docs/tina-cloudflare-production.md">查看上线说明</a>
         </div>
       </section>
     </main>
   </body>
 </html>
-
