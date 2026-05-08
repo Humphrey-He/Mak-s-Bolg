@@ -32,7 +32,7 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
   }
 
   return {
-    title: `${post.title} | 书鸦`,
+    title: `${post.title} | 书鸿`,
     description: post.description,
   };
 }

@@ -21,14 +21,14 @@ const checks = [
     name: "copy.ts contains repaired Chinese navigation",
     pass: () => {
       const content = read("data/copy.ts");
-      return content.includes('label: "首页"') && content.includes('label: "文章"') && content.includes('heroTitle: "书鸦"');
+      return content.includes('label: "首页"') && content.includes('label: "文章"') && content.includes('heroTitle: "书鸿"');
     }
   },
   {
     name: "header keeps mobile navigation and correct site name",
     pass: () => {
       const content = read("components/layout/Header.tsx");
-      return content.includes("mobile-nav-scroll") && content.includes("书鸦");
+      return content.includes("mobile-nav-scroll") && content.includes("书鸿");
     }
   },
   {

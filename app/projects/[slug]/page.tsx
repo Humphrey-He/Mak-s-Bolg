@@ -21,7 +21,7 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
   if (!project) return { title: "项目未找到" };
 
   return {
-    title: `${project.name} · 书鸦`,
+    title: `${project.name} · 书鸿`,
     description: localize(project.desc, "zh"),
   };
 }

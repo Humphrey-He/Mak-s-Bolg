@@ -13,7 +13,7 @@ export default function AdminPage() {
             </div>
             <div>
               <h1 className="font-serif text-3xl font-black tracking-tight text-white">管理后台</h1>
-              <p className="mt-1 text-sm text-slate-400">书鸦博客内容管理系统</p>
+              <p className="mt-1 text-sm text-slate-400">书鸿博客内容管理系统</p>
             </div>
           </div>
 

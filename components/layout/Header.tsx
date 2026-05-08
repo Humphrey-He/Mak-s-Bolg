@@ -37,7 +37,7 @@ export function Header({ t }: { t: Copy }) {
               <Icon name="terminal" className="h-5 w-5 text-cyan-200" />
             </div>
             <div>
-              <div className="font-serif text-2xl font-black tracking-[0.24em] text-white md:text-3xl">书鸦</div>
+              <div className="font-serif text-2xl font-black tracking-[0.24em] text-white md:text-3xl">书鸿</div>
               <div className="mt-0.5 font-mono text-[10px] uppercase tracking-[0.34em] text-cyan-200/75">Juno Mak</div>
             </div>
           </Link>

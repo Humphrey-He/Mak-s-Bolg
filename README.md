@@ -1,4 +1,4 @@
-# 书鸦 · Juno Mak Blog
+# 书鸿 · Juno Mak Blog
 
 这是一个基于 Next.js App Router 的个人技术博客，当前采用：
 

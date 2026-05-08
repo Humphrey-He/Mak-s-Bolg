@@ -44,7 +44,7 @@ export function Hero() {
             <span className="text-xs text-cyan-200/60">/blog/index.tsx</span>
           </div>
           <div className="font-mono text-sm leading-7 text-slate-300">
-            <p><span className="text-fuchsia-300">const</span> author = <span className="text-cyan-200">"书鸦 / Juno Mak"</span>;</p>
+            <p><span className="text-fuchsia-300">const</span> author = <span className="text-cyan-200">"书鸿 / Juno Mak"</span>;</p>
             <p><span className="text-fuchsia-300">const</span> role = <span className="text-cyan-200">"Backend & Cloud Native Developer"</span>;</p>
           </div>
           <div className="mt-8 grid grid-cols-2 gap-3">

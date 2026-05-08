@@ -12,8 +12,8 @@ export const copy = {
       { key: "about", label: "关于", hint: "About", href: "/about" },
       { key: "message", label: "留言", hint: "Message", href: "/message" }
     ],
-    badge: "书鸦的个人技术空间 · Juno Mak Digital Garden",
-    heroTitle: "书鸦",
+    badge: "书鸿的个人技术空间 · Juno Mak Digital Garden",
+    heroTitle: "书鸿",
     heroSubtitle: "在代码、架构与文字之间构建秩序",
     heroDesc: "这里记录后端工程、云原生、API 网关、缓存系统、对象存储与 AI Agent 的工程化实践。",
     readPosts: "阅读文章",
@@ -31,7 +31,7 @@ export const copy = {
     agentDesc: "模型接入、工具调用、记忆系统、RAG 检索、任务编排、评测观测与部署运维。",
     aboutTitle: "技术主线",
     aboutDesc: "后端与云原生方向开发者，关注高并发系统、网关插件、缓存架构、对象存储、Kubernetes 与 AI Agent 工程化。",
-    messageTitle: "给书鸦留言",
+    messageTitle: "给书鸿留言",
     messageDesc: "后续可接入评论系统、邮件通知、GitHub Issues 或自建留言 API。",
     langLabel: "中 / EN",
     backHome: "回到首页"
@@ -47,7 +47,7 @@ export const copy = {
       { key: "about", label: "About", hint: "关于", href: "/about" },
       { key: "message", label: "Message", hint: "留言", href: "/message" }
     ],
-    badge: "Juno Mak's Technical Space · 书鸦 Digital Garden",
+    badge: "Juno Mak's Technical Space · 书鸿 Digital Garden",
     heroTitle: "Juno Mak",
     heroSubtitle: "Building order across code, architecture, and words",
     heroDesc: "A personal engineering blog for backend systems, cloud native, API gateways, cache, object storage and AI Agent engineering.",
