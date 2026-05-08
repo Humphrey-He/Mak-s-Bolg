@@ -1,0 +1,180 @@
+---
+slug: "go-module-lookup-order"
+title: "第 5 章：Module 查找顺序与源码来源的正确理解"
+description: "深入理解 Go 第三方包的查找顺序，以及 replace、vendor、module cache、GOPROXY 的正确分层关系。"
+date: "2026-05-08"
+tag: "Go"
+readTime: "10 min"
+top: false
+featured: false
+---
+
+## 章节目标
+
+当你在开发的时候，有没有考虑过这样一个问题：
+
+> 当 Go 构建一个依赖包时，源码到底是从哪里来的？
+
+阅读完本章后，应该能建立下面这套正确认知：
+
+- Go 不是在几个目录里"盲找包"，而是在**模块上下文**里解析 import 并定位源码来源。
+- `replace`、`vendor`、module cache、`GOPROXY` 不属于同一层级，它们分别对应**来源重写、构建模式、本地缓存、远程获取策略**。
+- `$GOPATH/pkg/mod` 只是 `GOMODCACHE` 的默认值，不是唯一缓存位置。
+
+本章最重要的一句话是：
+
+> **Go 找第三方包，不是"按目录顺序撞运气"，而是"先确定 module，再决定这个 module 的内容从哪里来"。**
+
+---
+
+## 1. 先纠正一个常见误解：Go 真正在找的不是"包名"，而是"包所属模块的本地副本"
+
+在 module-aware mode 下，`go build`、`go test`、`go list` 这类命令会用 `go.mod` 来解释 import path；Go 官方明确说，模块是由 `go.mod` 定义的，main module 是 `go` 命令运行所在目录所属的模块，package path 则是 `module path + 子目录`。这意味着，Go 构建时的核心动作，不是直接在磁盘上暴力搜字符串，而是先在模块语义下解释 package，再把它映射到本地目录。
+
+因此，从工程视角，第三方包的"查找"其实要分成两步：
+
+第一步，确定这个 package 归属哪个 module。
+
+第二步，确定这个 module 的本地内容副本来自哪里。
+
+只有这两步都完成，编译器才有源码可读。
+
+---
+
+## 2. 更准确的"查找顺序"应该怎么理解
+
+如果一定要给团队一个可执行的心智模型，我更推荐下面这版，而不是简单背"Main Module → Replace → Vendor → Module Cache"。
+
+### 2.1 先确定当前构建上下文：main module 或 workspace
+
+Go 官方定义得很清楚：main module 是 `go` 命令运行目录所属的模块；而在有 `go.work` 的情况下，workspace 可以包含多个 main modules，并且整个工作区会一起参与版本选择。也就是说，"从哪里找依赖"这件事，首先要看当前是不是单模块上下文，还是多模块工作区。
+
+### 2.2 再看目标包是否由当前 main module / workspace 内模块提供
+
+如果一个 import path 能被当前 main module 的 module path 前缀解释成立，那么它就是当前模块中的包，源码直接来自工作目录。官方文档明确指出，module path 是模块内 package path 的前缀，package path 本质是 module path 加子目录。
+
+这一步很容易被误解。正确的说法不是"你目录里有个长得像 GitHub 的路径就行"，而是：
+
+> **该包必须属于当前 module path 前缀空间。**
+
+例如，`module example.com/myapp` 里的本地包应该长成 `example.com/myapp/xxx`，而不是任意一个伪造出来的外部路径。
+
+### 2.3 如果是外部模块，先应用 `replace` / workspace 覆盖
+
+当包不属于当前工作目录内模块时，Go 会按当前模块图来解析依赖。如果 main module 的 `go.mod` 里有 `replace`，官方规定会用替代内容来替换原模块版本；而且 `replace` 只在 main module 的 `go.mod` 中生效，依赖模块自己的 `replace` 会被忽略。`replace` 右侧既可以是本地路径，也可以是另一个 module path + version。
+
+所以从架构角度，`replace` 不是"查找顺序里的第二站"，而是：
+
+> **模块来源改写规则。**
+
+它改变的是"这个 module 的内容应该来自哪里"，而不是"先去某个目录看看"。
+
+### 2.4 如果启用了 vendoring，就优先使用 `vendor`
+
+官方文档写得非常明确：`-mod=vendor` 会让 `go` 命令使用 `vendor` 目录，并且在这种模式下**不会使用网络，也不会使用 module cache**；另外，如果 `go.mod` 中的 `go` 版本是 1.14 或更高，且主模块根目录下存在 `vendor` 目录，Go 默认就会像启用了 `-mod=vendor` 一样工作。`vendor/modules.txt` 还会被用作模块版本信息来源，并与 `go.mod` 做一致性校验。
+
+这意味着 vendor 不只是"替补席"，而是一个会**改变整个解析模式**的开关。
+
+一旦进入 vendor 模式，缓存和代理都退场了。
+
+### 2.5 非 vendor 模式下，优先使用 module cache；缺失时再下载
+
+官方文档说明，module cache 是 `go` 命令存放已下载模块文件的目录，默认在 `$GOPATH/pkg/mod`，也可以通过 `GOMODCACHE` 改掉。module-aware mode 下，Go 通常会从 module cache 加载包；如果缺少对应模块，再按 `GOPROXY` / `direct` 规则去下载，下载完成后写回 module cache。
+
+所以更准确的表述是：
+
+> **module cache 是已解析模块的本地副本池；不是每次构建都"去 GOPROXY 查一遍"，而是先尽量复用缓存。**
+
+---
+
+## 3. 远程获取不是"直接去 GitHub"，而是受 `GOPROXY` / `direct` / 私有模块策略控制
+
+官方文档明确写到，当 `go` 命令需要为一个 package path 查找新模块时，会检查 `GOPROXY`。`GOPROXY` 是一个代理 URL 或关键字 `direct` / `off` 组成的列表；默认值是 `https://proxy.golang.org,direct`。如果模块匹配 `GONOPROXY` 或 `GOPRIVATE`，则会绕过代理直接访问版本控制仓库。
+
+这件事在大厂里特别重要，因为"Go 到哪里找第三方包"从来不只是技术细节，它实际上还涉及：
+
+- 公司私有代理
+- 私有仓库访问控制
+- 许可证和漏洞策略
+- 公网访问隔离
+- 供应链校验策略
+
+官方还说明了 `GOPROXY` 列表的回退规则：逗号分隔时，只有遇到 404 或 410 才会回退；管道分隔时，任意错误都可以回退。这意味着企业私有代理完全可以充当"守门人"，对不合规模块返回 403，使 Go 不再继续回退到公共源。
+
+---
+
+## 4. 对原文几个关键说法的架构级修正
+
+### 4.1 "Main Module 优先"是对的，但前提是 import path 属于当前模块路径空间
+
+官方文档给出的规则是：module path 是包路径前缀，package path 是 module path 加子目录。于是，所谓"main module 优先"，准确含义应该是：
+
+> **如果包路径可以由当前 main module 的 module path + 相对子目录解释出来，就直接来自工作目录。**
+
+不是"只要本地目录里有个同名路径就能抢过远程仓库"。
+
+### 4.2 `replace` 的优先级很高，但它不是单纯的"顺位第二"
+
+`replace` 确实会覆盖原模块内容来源，而且只在 main module 生效；但它本质上是**模块图重写**，不是"Go 先查项目目录，再查 replace 目录"那种文件系统级顺序。对团队而言，应该把它理解成依赖来源重定向规则，而不是路径搜索顺序。
+
+### 4.3 `vendor` 不是普通一站，而是模式切换
+
+一旦 `-mod=vendor` 生效，Go 不使用网络，也不使用 module cache。官方措辞非常明确，所以把 vendor 放在"replace 后、cache 前"的线性清单里，会弱化它作为构建模式开关的本质。
+
+### 4.4 "Module Cache 在 `$GOPATH/pkg/mod`"这句话今天已经不够严谨
+
+应该改成：
+
+> **模块缓存目录是 `GOMODCACHE`，默认值才是 `$GOPATH/pkg/mod`。**
+
+这个区分在容器、CI、开发机磁盘规划和大仓缓存复用里都很重要。
+
+---
+
+## 5. 第三方包的查找流程与模型
+
+下面这个版本的说明，用来判断 GO 的第三方包可能更简洁：
+
+### 模型一：归属优先，目录其次
+
+先判断包属于哪个 module，再考虑该 module 的内容来自哪里。
+
+不要把问题简化成"Go 在哪些目录里找包"。
+
+### 模型二：`replace` 是来源改写，`vendor` 是模式改写
+
+`replace` 改的是模块内容来源；`vendor` 改的是整个依赖解析模式。
+
+二者都不是"普通目录顺位"。
+
+### 模型三：module cache 是复用层，`GOPROXY` / `direct` 是获取层
+
+缓存里有就复用，没有才下载；下载又受 `GOPROXY`、`GONOPROXY`、`GOPRIVATE`、`direct` 等策略控制。
+
+### 模型四：今天的 Go 不能只按"单主模块"思考
+
+在 workspace 存在时，多个 main modules 会共同组成构建上下文。
+
+这对本地联调、monorepo 和多模块协作是标准场景，不是例外。
+
+---
+
+## 6. 实践建议
+
+第一，团队文档里不要再把"Go 找第三方包"写成固定目录查找链。更适合的表达是"**模块归属 + 来源决策**"。这能显著提升大家排查 `replace`、vendor、私有代理、缓存路径问题时的准确率。
+
+第二，把 `replace` 视为高风险构建变化点，而不是临时调试小技巧。因为它只在 main module 生效，而且会改写模块实际内容来源，本地和 CI 不一致时它几乎总是高优先级怀疑对象。
+
+第三，若团队使用 vendor，要明确这是"模式选择"，不是"再加一层缓存"。进入 vendor 模式后，module cache 和网络都不会参与解析，所以升级依赖后若忘记刷新 vendor，很容易出现"明明升级了却没生效"的假象。
+
+第四，在企业环境中优先建设统一代理与私有源策略，而不是让开发者各自直连公网仓库。官方文档已经给出了私有代理、私有模块和 `GOPRIVATE` / `GONOSUMDB` 的标准模型，这正是大厂做依赖治理、审计和供应链控制的基础。
+
+---
+
+## 小结
+
+> **Go 查找第三方包，不是按"Main Module → Replace → Vendor → Cache → Proxy"线性搜目录，而是先确定包所属模块，再根据 `replace`、vendor 模式、module cache 和 `GOPROXY/direct` 规则拿到该模块的本地副本。**
+
+再压缩成一句便于记忆的话，就是：
+
+> **先定 module，后定来源；vendor 改模式，replace 改来源，cache 做复用，proxy 负责获取。**
