@@ -14,6 +14,7 @@ export interface Article {
   publishedAt: string | null;
   createdAt: string;
   updatedAt: string;
+  coverImageUrl?: string;
 }
 
 export interface ArticleListItem {
@@ -43,6 +44,7 @@ export interface CreateArticleRequest {
   description?: string;
   content?: string;
   tag?: string;
+  coverImageUrl?: string;
   isTop: boolean;
   isFeatured: boolean;
 }
@@ -52,6 +54,7 @@ export interface UpdateArticleRequest {
   description?: string;
   content?: string;
   tag?: string;
+  coverImageUrl?: string;
   isTop?: boolean;
   isFeatured?: boolean;
 }
@@ -82,4 +85,42 @@ export interface LoginResponse {
 
 export interface ApiError {
   message: string;
+}
+
+// Tag types
+export interface Tag {
+  id: number;
+  name: string;
+  slug: string;
+  articleCount: number;
+}
+
+export interface CreateTagRequest {
+  name: string;
+  slug: string;
+}
+
+export interface UpdateTagRequest {
+  name?: string;
+  slug?: string;
+}
+
+// Media types
+export interface MediaItem {
+  id: number;
+  fileName: string;
+  originalName: string;
+  url: string;
+  mimeType: string;
+  fileSize: number;
+  width: number;
+  height: number;
+  createdAt: string;
+}
+
+export interface MediaListResponse {
+  items: MediaItem[];
+  total: number;
+  page: number;
+  pageSize: number;
 }

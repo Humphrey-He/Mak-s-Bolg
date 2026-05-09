@@ -1,16 +1,18 @@
 import { useState, useEffect } from 'react';
-import { Outlet, useNavigate } from 'react-router-dom';
-import { Layout as AntLayout, Dropdown, Space, Avatar, Typography } from 'antd';
+import { Outlet, useNavigate, useLocation } from 'react-router-dom';
+import { Layout as AntLayout, Dropdown, Space, Avatar, Typography, Menu } from 'antd';
 import type { MenuProps } from 'antd';
-import { UserOutlined, LogoutOutlined } from '@ant-design/icons';
+import { UserOutlined, LogoutOutlined, TagOutlined, FileImageOutlined, ReadOutlined } from '@ant-design/icons';
 import { authApi, getStoredUser, clearAuthData } from '../services/api';
 
-const { Header, Content } = AntLayout;
+const { Header, Content, Sider } = AntLayout;
 const { Text } = Typography;
 
 const Layout = () => {
   const navigate = useNavigate();
+  const location = useLocation();
   const [user, setUser] = useState(getStoredUser());
+  const [collapsed, setCollapsed] = useState(false);
 
   useEffect(() => {
     const loadUser = async () => {
@@ -51,6 +53,28 @@ const Layout = () => {
     },
   ];
 
+  const navItems: MenuProps['items'] = [
+    {
+      key: '/articles',
+      icon: <ReadOutlined />,
+      label: 'Articles',
+    },
+    {
+      key: '/tags',
+      icon: <TagOutlined />,
+      label: 'Tags',
+    },
+    {
+      key: '/media',
+      icon: <FileImageOutlined />,
+      label: 'Media',
+    },
+  ];
+
+  const handleNavClick: MenuProps['onClick'] = (e) => {
+    navigate(e.key);
+  };
+
   return (
     <AntLayout style={{ minHeight: '100vh' }}>
       <Header
@@ -73,9 +97,26 @@ const Layout = () => {
           </Space>
         </Dropdown>
       </Header>
-      <Content style={{ padding: 24 }}>
-        <Outlet />
-      </Content>
+      <AntLayout>
+        <Sider
+          width={200}
+          collapsible
+          collapsed={collapsed}
+          onCollapse={setCollapsed}
+          style={{ background: '#fff', borderRight: '1px solid #f0f0f0' }}
+        >
+          <Menu
+            mode="inline"
+            selectedKeys={[location.pathname]}
+            items={navItems}
+            onClick={handleNavClick}
+            style={{ height: '100%', borderRight: 0 }}
+          />
+        </Sider>
+        <Content style={{ padding: 24, background: '#f5f5f5' }}>
+          <Outlet />
+        </Content>
+      </AntLayout>
     </AntLayout>
   );
 };

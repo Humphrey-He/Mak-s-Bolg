@@ -46,4 +46,7 @@ public class Article
     // Navigation
     public int? CoverImageId { get; set; }
     public Media? CoverImage { get; set; }
+
+    [MaxLength(500)]
+    public string? CoverImageUrl { get; set; }
 }

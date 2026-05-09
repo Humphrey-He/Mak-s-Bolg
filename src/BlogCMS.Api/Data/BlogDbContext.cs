@@ -13,6 +13,7 @@ public class BlogDbContext : DbContext
     public DbSet<Admin> Admins { get; set; }
     public DbSet<PublishJob> PublishJobs { get; set; }
     public DbSet<Media> Media { get; set; }
+    public DbSet<Tag> Tags { get; set; }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -41,6 +42,11 @@ public class BlogDbContext : DbContext
         modelBuilder.Entity<Media>(entity =>
         {
             entity.HasIndex(m => m.FileName);
+        });
+
+        modelBuilder.Entity<Tag>(entity =>
+        {
+            entity.HasIndex(t => t.Slug).IsUnique();
         });
     }
 }

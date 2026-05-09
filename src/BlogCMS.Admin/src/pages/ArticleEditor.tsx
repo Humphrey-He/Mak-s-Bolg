@@ -11,12 +11,15 @@ import {
   Row,
   Col,
   Switch,
+  AutoComplete,
+  Modal,
+  Image,
 } from 'antd';
-import { SaveOutlined, CloudUploadOutlined, ArrowLeftOutlined } from '@ant-design/icons';
-import { articlesApi, jobsApi } from '../services/api';
-import type { Article, CreateArticleRequest, PublishJob } from '../types';
+import { SaveOutlined, CloudUploadOutlined, ArrowLeftOutlined, PictureOutlined, PlusOutlined } from '@ant-design/icons';
+import { articlesApi, jobsApi, tagsApi, mediaApi } from '../services/api';
+import type { Article, CreateArticleRequest, PublishJob, Tag, MediaItem } from '../types';
 
-const { Title } = Typography;
+const { Title, Text } = Typography;
 const { TextArea } = Input;
 
 const ArticleEditor = () => {
@@ -27,6 +30,15 @@ const ArticleEditor = () => {
   const [saving, setSaving] = useState(false);
   const [publishing, setPublishing] = useState(false);
   const [form] = Form.useForm();
+  const [tags, setTags] = useState<Tag[]>([]);
+  const [mediaModalVisible, setMediaModalVisible] = useState(false);
+  const [coverImageModalVisible, setCoverImageModalVisible] = useState(false);
+  const [media, setMedia] = useState<MediaItem[]>([]);
+  const [selectedCoverImage, setSelectedCoverImage] = useState<string | undefined>();
+
+  useEffect(() => {
+    loadTags();
+  }, []);
 
   useEffect(() => {
     if (isEditing && id) {
@@ -34,10 +46,20 @@ const ArticleEditor = () => {
     }
   }, [id]);
 
+  const loadTags = async () => {
+    try {
+      const data = await tagsApi.getAll();
+      setTags(data);
+    } catch {
+      // Ignore errors
+    }
+  };
+
   const loadArticle = async (articleId: number) => {
     try {
       const data = await articlesApi.getBySlug(articleId.toString());
       setArticle(data);
+      setSelectedCoverImage(data.coverImageUrl);
       form.setFieldsValue({
         title: data.title,
         slug: data.slug,
@@ -46,10 +68,19 @@ const ArticleEditor = () => {
         content: data.content,
         isTop: data.isTop,
         isFeatured: data.isFeatured,
+        coverImageUrl: data.coverImageUrl,
       });
     } catch (error) {
       message.error('Failed to load article');
-    } finally {
+    }
+  };
+
+  const loadMedia = async () => {
+    try {
+      const data = await mediaApi.getAll(1, 50);
+      setMedia(data.items);
+    } catch {
+      message.error('Failed to load media');
     }
   };
 
@@ -58,28 +89,26 @@ const ArticleEditor = () => {
       const values = await form.validateFields();
       setSaving(true);
 
+      const request = {
+        title: values.title,
+        description: values.description || '',
+        tag: values.tag || '',
+        content: values.content || '',
+        coverImageUrl: selectedCoverImage || undefined,
+        isTop: values.isTop || false,
+        isFeatured: values.isFeatured || false,
+      };
+
       if (isEditing && article) {
-        await articlesApi.update(article.id, {
-          title: values.title,
-          description: values.description,
-          tag: values.tag,
-          content: values.content,
-          isTop: values.isTop,
-          isFeatured: values.isFeatured,
-        });
+        await articlesApi.update(article.id, request);
         message.success('Article saved');
       } else {
         const slug = values.slug || generateSlug(values.title);
-        const request: CreateArticleRequest = {
-          title: values.title,
+        const createRequest: CreateArticleRequest = {
+          ...request,
           slug,
-          description: values.description || '',
-          tag: values.tag || '',
-          content: values.content || '',
-          isTop: values.isTop || false,
-          isFeatured: values.isFeatured || false,
         };
-        const newArticle = await articlesApi.create(request);
+        const newArticle = await articlesApi.create(createRequest);
         message.success('Article created');
         navigate(`/articles/${newArticle.id}/edit`, { replace: true });
       }
@@ -129,6 +158,24 @@ const ArticleEditor = () => {
       .replace(/[^a-z0-9]+/g, '-')
       .replace(/^-+|-+$/g, '');
   };
+
+  const handleInsertImage = (url: string) => {
+    const content = form.getFieldValue('content') || '';
+    const imageMarkdown = `![Image](${url})`;
+    form.setFieldValue('content', content + '\n' + imageMarkdown + '\n');
+    setMediaModalVisible(false);
+  };
+
+  const handleSelectCoverImage = (url: string) => {
+    setSelectedCoverImage(url);
+    form.setFieldValue('coverImageUrl', url);
+    setCoverImageModalVisible(false);
+  };
+
+  const tagOptions = tags.map((tag) => ({
+    value: tag.name,
+    label: tag.name,
+  }));
 
   return (
     <div>
@@ -186,13 +233,70 @@ const ArticleEditor = () => {
                   style={{ fontFamily: 'monospace' }}
                 />
               </Form.Item>
+
+              <Button
+                icon={<PlusOutlined />}
+                onClick={() => {
+                  loadMedia();
+                  setMediaModalVisible(true);
+                }}
+              >
+                Insert Image
+              </Button>
             </Card>
           </Col>
 
           <Col span={8}>
             <Card style={{ marginBottom: 16 }}>
               <Form.Item name="tag" label="Tag">
-                <Input placeholder="Go / Cache" />
+                <AutoComplete
+                  options={tagOptions}
+                  placeholder="Select or type a tag"
+                  value={form.getFieldValue('tag')}
+                  onChange={(value) => form.setFieldValue('tag', value)}
+                  filterOption={(input, option) =>
+                    (option?.label ?? '').toLowerCase().includes(input.toLowerCase())
+                  }
+                />
+              </Form.Item>
+
+              <Form.Item name="coverImage" label="Cover Image">
+                <div>
+                  {selectedCoverImage ? (
+                    <div style={{ marginBottom: 8 }}>
+                      <Image
+                        src={selectedCoverImage}
+                        alt="Cover"
+                        style={{ width: '100%', maxHeight: 150, objectFit: 'cover' }}
+                      />
+                    </div>
+                  ) : (
+                    <div
+                      style={{
+                        width: '100%',
+                        height: 100,
+                        background: '#f5f5f5',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        marginBottom: 8,
+                        borderRadius: 4,
+                      }}
+                    >
+                      <Text type="secondary">No cover image</Text>
+                    </div>
+                  )}
+                  <Button
+                    icon={<PictureOutlined />}
+                    onClick={() => {
+                      loadMedia();
+                      setCoverImageModalVisible(true);
+                    }}
+                    block
+                  >
+                    {selectedCoverImage ? 'Change Cover' : 'Select Cover'}
+                  </Button>
+                </div>
               </Form.Item>
 
               <Form.Item name="isTop" label="Pin to top" valuePropName="checked">
@@ -228,6 +332,108 @@ const ArticleEditor = () => {
           </Col>
         </Row>
       </Form>
+
+      {/* Media Selection Modal for Insert Image */}
+      <Modal
+        title="Insert Image"
+        open={mediaModalVisible}
+        onCancel={() => setMediaModalVisible(false)}
+        footer={null}
+        width={800}
+      >
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(auto-fill, minmax(120px, 1fr))',
+            gap: 12,
+            marginTop: 16,
+            maxHeight: 400,
+            overflowY: 'auto',
+          }}
+        >
+          {media.map((item) => (
+            <div
+              key={item.id}
+              style={{
+                border: '1px solid #f0f0f0',
+                borderRadius: 4,
+                overflow: 'hidden',
+                cursor: 'pointer',
+              }}
+              onClick={() => handleInsertImage(item.url)}
+            >
+              <img
+                src={item.url}
+                alt={item.originalName}
+                style={{ width: '100%', height: 80, objectFit: 'cover' }}
+              />
+              <div
+                style={{
+                  padding: 4,
+                  fontSize: 10,
+                  color: '#666',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {item.originalName}
+              </div>
+            </div>
+          ))}
+        </div>
+      </Modal>
+
+      {/* Media Selection Modal for Cover Image */}
+      <Modal
+        title="Select Cover Image"
+        open={coverImageModalVisible}
+        onCancel={() => setCoverImageModalVisible(false)}
+        footer={null}
+        width={800}
+      >
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(auto-fill, minmax(120px, 1fr))',
+            gap: 12,
+            marginTop: 16,
+            maxHeight: 400,
+            overflowY: 'auto',
+          }}
+        >
+          {media.map((item) => (
+            <div
+              key={item.id}
+              style={{
+                border: selectedCoverImage === item.url ? '2px solid #1890ff' : '1px solid #f0f0f0',
+                borderRadius: 4,
+                overflow: 'hidden',
+                cursor: 'pointer',
+              }}
+              onClick={() => handleSelectCoverImage(item.url)}
+            >
+              <img
+                src={item.url}
+                alt={item.originalName}
+                style={{ width: '100%', height: 80, objectFit: 'cover' }}
+              />
+              <div
+                style={{
+                  padding: 4,
+                  fontSize: 10,
+                  color: '#666',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {item.originalName}
+              </div>
+            </div>
+          ))}
+        </div>
+      </Modal>
     </div>
   );
 };

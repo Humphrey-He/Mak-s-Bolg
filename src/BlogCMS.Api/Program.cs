@@ -70,6 +70,7 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
 // Services
 builder.Services.AddScoped<GitService>();
 builder.Services.AddScoped<MdxService>();
+builder.Services.AddScoped<SeoService>();
 
 // CORS
 builder.Services.AddCors(options =>

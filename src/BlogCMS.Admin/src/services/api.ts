@@ -7,7 +7,12 @@ import type {
   UpdateArticleRequest,
   LoginResponse,
   PublishJob,
-  User
+  User,
+  Tag,
+  CreateTagRequest,
+  UpdateTagRequest,
+  MediaItem,
+  MediaListResponse,
 } from '../types';
 
 const API_BASE = '/api';
@@ -97,6 +102,63 @@ export const articlesApi = {
 export const jobsApi = {
   get: async (id: number): Promise<PublishJob> => {
     const response = await api.get<PublishJob>(`/jobs/${id}`);
+    return response.data;
+  },
+};
+
+// Tags API
+export const tagsApi = {
+  getAll: async (): Promise<Tag[]> => {
+    const response = await api.get<Tag[]>('/tags');
+    return response.data;
+  },
+
+  getById: async (id: number): Promise<Tag> => {
+    const response = await api.get<Tag>(`/tags/${id}`);
+    return response.data;
+  },
+
+  create: async (data: CreateTagRequest): Promise<Tag> => {
+    const response = await api.post<Tag>('/tags', data);
+    return response.data;
+  },
+
+  update: async (id: number, data: UpdateTagRequest): Promise<Tag> => {
+    const response = await api.put<Tag>(`/tags/${id}`, data);
+    return response.data;
+  },
+
+  delete: async (id: number): Promise<void> => {
+    await api.delete(`/tags/${id}`);
+  },
+
+  updateCounts: async (): Promise<void> => {
+    await api.put('/tags/update-counts');
+  },
+};
+
+// Media API
+export const mediaApi = {
+  getAll: async (page = 1, pageSize = 20): Promise<MediaListResponse> => {
+    const response = await api.get<MediaListResponse>('/media', { params: { page, pageSize } });
+    return response.data;
+  },
+
+  upload: async (file: File): Promise<MediaItem> => {
+    const formData = new FormData();
+    formData.append('file', file);
+    const response = await api.post<MediaItem>('/media/upload', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    });
+    return response.data;
+  },
+
+  delete: async (id: number): Promise<void> => {
+    await api.delete(`/media/${id}`);
+  },
+
+  getByUrl: async (url: string): Promise<MediaItem> => {
+    const response = await api.get<MediaItem>('/media/by-url', { params: { url } });
     return response.data;
   },
 };

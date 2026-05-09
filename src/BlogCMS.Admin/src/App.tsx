@@ -3,6 +3,8 @@ import { ConfigProvider } from 'antd';
 import Login from './pages/Login';
 import ArticleList from './pages/ArticleList';
 import ArticleEditor from './pages/ArticleEditor';
+import TagManager from './pages/TagManager';
+import MediaLibrary from './pages/MediaLibrary';
 import Layout from './components/Layout';
 import { isAuthenticated } from './services/api';
 
@@ -34,6 +36,8 @@ function App() {
             <Route path="articles" element={<ArticleList />} />
             <Route path="articles/new" element={<ArticleEditor />} />
             <Route path="articles/:id/edit" element={<ArticleEditor />} />
+            <Route path="tags" element={<TagManager />} />
+            <Route path="media" element={<MediaLibrary />} />
           </Route>
         </Routes>
       </BrowserRouter>

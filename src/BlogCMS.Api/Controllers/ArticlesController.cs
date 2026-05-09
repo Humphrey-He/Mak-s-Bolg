@@ -106,6 +106,7 @@ public class ArticlesController : ControllerBase
             Description = request.Description ?? string.Empty,
             Content = request.Content ?? string.Empty,
             Tag = request.Tag ?? string.Empty,
+            CoverImageUrl = request.CoverImageUrl,
             ReadTimeMinutes = _mdxService.CalculateReadTime(request.Content ?? string.Empty),
             IsTop = request.IsTop,
             IsFeatured = request.IsFeatured,
@@ -134,6 +135,7 @@ public class ArticlesController : ControllerBase
         article.Description = request.Description ?? article.Description;
         article.Content = request.Content ?? article.Content;
         article.Tag = request.Tag ?? article.Tag;
+        article.CoverImageUrl = request.CoverImageUrl ?? article.CoverImageUrl;
 
         if (!string.IsNullOrEmpty(request.Content))
         {
@@ -321,7 +323,8 @@ public class ArticlesController : ControllerBase
             LastCommitSha = article.LastCommitSha,
             PublishedAt = article.PublishedAt,
             CreatedAt = article.CreatedAt,
-            UpdatedAt = article.UpdatedAt
+            UpdatedAt = article.UpdatedAt,
+            CoverImageUrl = article.CoverImageUrl
         };
     }
 }
@@ -347,6 +350,7 @@ public class ArticleDto : ArticleListDto
     public string Content { get; set; } = string.Empty;
     public string FilePath { get; set; } = string.Empty;
     public string? LastCommitSha { get; set; }
+    public string? CoverImageUrl { get; set; }
 }
 
 public class CreateArticleRequest
@@ -356,6 +360,7 @@ public class CreateArticleRequest
     public string? Description { get; set; }
     public string? Content { get; set; }
     public string? Tag { get; set; }
+    public string? CoverImageUrl { get; set; }
     public bool IsTop { get; set; }
     public bool IsFeatured { get; set; }
 }
@@ -366,6 +371,7 @@ public class UpdateArticleRequest
     public string? Description { get; set; }
     public string? Content { get; set; }
     public string? Tag { get; set; }
+    public string? CoverImageUrl { get; set; }
     public bool? IsTop { get; set; }
     public bool? IsFeatured { get; set; }
 }
