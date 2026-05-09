@@ -35,7 +35,9 @@ export interface ArticleListItem {
 export enum ArticleStatus {
   Draft = 0,
   Published = 1,
-  Archived = 2
+  Archived = 2,
+  Publishing = 3,
+  Failed = 4
 }
 
 export interface CreateArticleRequest {
@@ -57,6 +59,7 @@ export interface UpdateArticleRequest {
   coverImageUrl?: string;
   isTop?: boolean;
   isFeatured?: boolean;
+  status?: ArticleStatus;
 }
 
 export interface PublishJob {
@@ -69,6 +72,18 @@ export interface PublishJob {
   startedAt: string | null;
   finishedAt: string | null;
   retryCount: number;
+  publicUrl: string | null;
+}
+
+export interface PublishJobListItem {
+  id: number;
+  articleId: number;
+  articleTitle: string;
+  status: string;
+  errorMessage: string | null;
+  commitSha: string | null;
+  createdAt: string;
+  publicUrl: string | null;
 }
 
 export interface User {

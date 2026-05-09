@@ -75,11 +75,11 @@ public class ArticlesController : ControllerBase
 
         if (int.TryParse(slug, out var id))
         {
-            article = await _context.Articles.FindAsync(id);
+            article = await _context.Articles.AsNoTracking().FirstOrDefaultAsync(a => a.Id == id);
         }
         else
         {
-            article = await _context.Articles.FirstOrDefaultAsync(a => a.Slug == slug);
+            article = await _context.Articles.AsNoTracking().FirstOrDefaultAsync(a => a.Slug == slug);
         }
 
         if (article == null)
@@ -237,6 +237,7 @@ public class ArticlesController : ControllerBase
             job.Status = "Succeeded";
             job.CommitSha = commitSha;
             job.FinishedAt = DateTime.UtcNow;
+            job.PublicUrl = $"/posts/{article.Slug}";
             article.LastCommitSha = commitSha;
             await _context.SaveChangesAsync();
 
@@ -252,7 +253,8 @@ public class ArticlesController : ControllerBase
                 CreatedAt = job.CreatedAt,
                 StartedAt = job.StartedAt,
                 FinishedAt = job.FinishedAt,
-                RetryCount = job.RetryCount
+                RetryCount = job.RetryCount,
+                PublicUrl = job.PublicUrl
             });
         }
         catch (Exception ex)
@@ -274,7 +276,8 @@ public class ArticlesController : ControllerBase
                 CreatedAt = job.CreatedAt,
                 StartedAt = job.StartedAt,
                 FinishedAt = job.FinishedAt,
-                RetryCount = job.RetryCount
+                RetryCount = job.RetryCount,
+                PublicUrl = job.PublicUrl
             });
         }
     }
@@ -301,8 +304,35 @@ public class ArticlesController : ControllerBase
             CreatedAt = job.CreatedAt,
             StartedAt = job.StartedAt,
             FinishedAt = job.FinishedAt,
-            RetryCount = job.RetryCount
+            RetryCount = job.RetryCount,
+            PublicUrl = job.PublicUrl
         });
+    }
+
+    [HttpGet("/api/jobs")]
+    public async Task<ActionResult<IEnumerable<PublishJobListDto>>> GetJobs()
+    {
+        var jobs = await _context.PublishJobs
+            .Include(j => j.Article)
+            .OrderByDescending(j => j.CreatedAt)
+            .Take(50)
+            .Select(j => new PublishJobListDto
+            {
+                Id = j.Id,
+                ArticleId = j.ArticleId,
+                ArticleTitle = j.Article != null ? j.Article.Title : "Unknown",
+                Status = j.Status,
+                ErrorMessage = j.ErrorMessage,
+                CommitSha = j.CommitSha,
+                CreatedAt = j.CreatedAt,
+                StartedAt = j.StartedAt,
+                FinishedAt = j.FinishedAt,
+                RetryCount = j.RetryCount,
+                PublicUrl = j.PublicUrl
+            })
+            .ToListAsync();
+
+        return Ok(jobs);
     }
 
     private static ArticleDto MapToDto(Article article)
@@ -387,4 +417,20 @@ public class PublishJobDto
     public DateTime? StartedAt { get; set; }
     public DateTime? FinishedAt { get; set; }
     public int RetryCount { get; set; }
+    public string? PublicUrl { get; set; }
+}
+
+public class PublishJobListDto
+{
+    public int Id { get; set; }
+    public int ArticleId { get; set; }
+    public string ArticleTitle { get; set; } = string.Empty;
+    public string Status { get; set; } = string.Empty;
+    public string? ErrorMessage { get; set; }
+    public string? CommitSha { get; set; }
+    public DateTime CreatedAt { get; set; }
+    public DateTime? StartedAt { get; set; }
+    public DateTime? FinishedAt { get; set; }
+    public int RetryCount { get; set; }
+    public string? PublicUrl { get; set; }
 }

@@ -7,6 +7,7 @@ import type {
   UpdateArticleRequest,
   LoginResponse,
   PublishJob,
+  PublishJobListItem,
   User,
   Tag,
   CreateTagRequest,
@@ -102,6 +103,11 @@ export const articlesApi = {
 export const jobsApi = {
   get: async (id: number): Promise<PublishJob> => {
     const response = await api.get<PublishJob>(`/jobs/${id}`);
+    return response.data;
+  },
+
+  getAll: async (): Promise<PublishJobListItem[]> => {
+    const response = await api.get<PublishJobListItem[]>('/jobs');
     return response.data;
   },
 };

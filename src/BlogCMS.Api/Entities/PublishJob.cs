@@ -30,4 +30,7 @@ public class PublishJob
     public DateTime? FinishedAt { get; set; }
 
     public int RetryCount { get; set; }
+
+    [MaxLength(500)]
+    public string? PublicUrl { get; set; }
 }
