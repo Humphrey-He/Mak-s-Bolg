@@ -89,7 +89,7 @@ var app = builder.Build();
 using (var scope = app.Services.CreateScope())
 {
     var dbContext = scope.ServiceProvider.GetRequiredService<BlogDbContext>();
-    dbContext.Database.EnsureCreated();
+    await BlogDbMigrator.ApplyAsync(dbContext);
     await DbSeeder.SeedAsync(dbContext);
 }
 

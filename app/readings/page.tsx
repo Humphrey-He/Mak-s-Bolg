@@ -1,11 +1,8 @@
 import { SiteShell } from "@/components/layout/SiteShell";
 import { ReadingTimeline } from "@/components/readings/ReadingTimeline";
 import { Icon } from "@/components/shared/Icon";
-import { copy } from "@/data/copy";
 
 export default function ReadingsPage() {
-  const t = copy.zh;
-
   return (
     <SiteShell>
       <section className="mx-auto max-w-4xl px-5 py-16">

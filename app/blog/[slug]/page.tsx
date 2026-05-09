@@ -59,58 +59,69 @@ export default async function ArticlePage({ params }: PageProps) {
       <ArticleReadingProgress />
 
       <div className="mx-auto max-w-7xl px-5 py-10">
-        <div className="xl:grid xl:grid-cols-[minmax(0,1fr)_280px] xl:gap-8">
-          <article className="overflow-hidden rounded-[2rem] border border-white/10 bg-white/[0.035] backdrop-blur-xl">
-            <div className="border-b border-white/10 bg-[radial-gradient(circle_at_top,_rgba(34,211,238,0.18),_transparent_42%),linear-gradient(180deg,rgba(255,255,255,0.04),rgba(255,255,255,0.01))] px-6 py-8 md:px-10 md:py-10">
-              <Link href="/blog" className="inline-flex items-center gap-2 text-sm text-slate-400 transition hover:text-cyan-200">
-                <Icon name="arrow" className="h-4 w-4 rotate-180" />
-                返回文章列表
-              </Link>
+        <article className="overflow-hidden rounded-[2rem] border border-white/10 bg-white/[0.035] backdrop-blur-xl">
+          <div className="border-b border-white/10 bg-[radial-gradient(circle_at_top,_rgba(34,211,238,0.18),_transparent_42%),linear-gradient(180deg,rgba(255,255,255,0.04),rgba(255,255,255,0.01))] px-6 py-8 md:px-10 md:py-10">
+            <Link href="/blog" className="inline-flex items-center gap-2 text-sm text-slate-400 transition hover:text-cyan-200">
+              <Icon name="arrow" className="h-4 w-4 rotate-180" />
+              返回文章列表
+            </Link>
 
-              <div className="mt-6 flex flex-wrap items-center gap-3">
-                <span className="rounded-full border border-cyan-300/20 bg-cyan-300/10 px-3 py-1 text-sm text-cyan-100">{post.tag}</span>
-                {post.top && (
-                  <span className="rounded-full border border-fuchsia-300/20 bg-fuchsia-400/10 px-3 py-1 text-sm text-fuchsia-100">
-                    精选
-                  </span>
-                )}
-              </div>
-
-              <h1 className="mt-6 max-w-4xl font-serif text-4xl font-black tracking-tight text-white md:text-6xl">{post.title}</h1>
-              <p className="mt-4 max-w-3xl text-lg leading-8 text-slate-300">{post.description}</p>
-
-              <div className="mt-8 flex flex-wrap items-center gap-3 text-sm text-slate-400">
-                <span className="rounded-full border border-white/10 bg-black/20 px-3 py-1">{post.date}</span>
-                <span className="rounded-full border border-cyan-300/20 bg-cyan-300/10 px-3 py-1 text-cyan-100">{post.readTime}</span>
-              </div>
+            <div className="mt-6 flex flex-wrap items-center gap-3">
+              <span className="rounded-full border border-cyan-300/20 bg-cyan-300/10 px-3 py-1 text-sm text-cyan-100">{post.tag}</span>
+              {post.top && (
+                <span className="rounded-full border border-fuchsia-300/20 bg-fuchsia-400/10 px-3 py-1 text-sm text-fuchsia-100">
+                  精选
+                </span>
+              )}
             </div>
 
-            <div className="px-6 py-8 md:px-10 md:py-10">
-              <div className="mb-8 grid gap-4 rounded-[1.5rem] border border-white/10 bg-black/20 p-5 md:grid-cols-3">
-                <div>
-                  <p className="text-xs uppercase tracking-[0.3em] text-cyan-200/70">文章定位</p>
-                  <p className="mt-2 text-sm leading-7 text-slate-300">生产环境里的实战经验沉淀，适合拿来做方案评审、复盘和升级前检查。</p>
-                </div>
-                <div>
-                  <p className="text-xs uppercase tracking-[0.3em] text-cyan-200/70">阅读建议</p>
-                  <p className="mt-2 text-sm leading-7 text-slate-300">先看标题和列表，再回到关键段落。技术文章更适合跳读和回查的结构。</p>
-                </div>
-                <div>
-                  <p className="text-xs uppercase tracking-[0.3em] text-cyan-200/70">适合场景</p>
-                  <p className="mt-2 text-sm leading-7 text-slate-300">云原生、后端工程、系统设计、性能优化、故障处理和团队知识沉淀。</p>
-                </div>
-              </div>
+            <h1 className="mt-6 max-w-4xl font-serif text-4xl font-black tracking-tight text-white md:text-6xl">{post.title}</h1>
+            <p className="mt-4 max-w-3xl text-lg leading-8 text-slate-300">{post.description}</p>
 
-              <div className="article-prose">
-                <Content components={mdxComponents} />
-              </div>
+            <div className="mt-8 flex flex-wrap items-center gap-3 text-sm text-slate-400">
+              <span className="rounded-full border border-white/10 bg-black/20 px-3 py-1">{post.date}</span>
+              <span className="rounded-full border border-cyan-300/20 bg-cyan-300/10 px-3 py-1 text-cyan-100">{post.readTime}</span>
             </div>
-          </article>
-
-          <div className="mt-8 xl:mt-0">
-            <ArticleTableOfContents headings={headings} />
           </div>
-        </div>
+
+          <div className="px-6 py-8 md:px-10 md:py-10">
+            <div className="mb-8 grid gap-4 rounded-[1.5rem] border border-white/10 bg-black/20 p-5 md:grid-cols-3">
+              <div>
+                <p className="text-xs uppercase tracking-[0.3em] text-cyan-200/70">文章定位</p>
+                <p className="mt-2 text-sm leading-7 text-slate-300">
+                  面向生产环境的实战经验沉淀，适合拿来做方案评审、复盘和升级前检查。
+                </p>
+              </div>
+              <div>
+                <p className="text-xs uppercase tracking-[0.3em] text-cyan-200/70">阅读建议</p>
+                <p className="mt-2 text-sm leading-7 text-slate-300">
+                  先看标题和列表，再回到关键段落。技术文章更适合跳读和回查的阅读节奏。
+                </p>
+              </div>
+              <div>
+                <p className="text-xs uppercase tracking-[0.3em] text-cyan-200/70">适合场景</p>
+                <p className="mt-2 text-sm leading-7 text-slate-300">
+                  云原生、后端工程、系统设计、性能优化、故障处理和团队知识沉淀。
+                </p>
+              </div>
+            </div>
+
+            <div
+              data-article-layout="body-grid"
+              className="xl:grid xl:grid-cols-[minmax(0,1fr)_280px] xl:items-start xl:gap-8"
+            >
+              <div className="min-w-0">
+                <div className="article-prose">
+                  <Content components={mdxComponents} />
+                </div>
+              </div>
+
+              <div className="mt-8 xl:mt-0">
+                <ArticleTableOfContents headings={headings} />
+              </div>
+            </div>
+          </div>
+        </article>
 
         {relatedPosts.length > 0 && (
           <section className="mt-10 rounded-[2rem] border border-white/10 bg-white/[0.035] p-6 backdrop-blur-xl">

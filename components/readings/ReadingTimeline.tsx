@@ -22,7 +22,7 @@ const mockReadings: ReadingItem[] = [
     meta: "系统设计 · 数据密集型应用",
     progress: 68,
     notes: "第三章提到的复制策略对理解分布式系统很有帮助，特别是 Paxos 和 Raft 的对比。",
-    relatedPosts: ["high-concurrency-go-cache", "object-storage-gateway"]
+    relatedPosts: ["high-concurrency-go-cache", "object-storage-gateway"],
   },
   {
     id: "2",
@@ -31,7 +31,7 @@ const mockReadings: ReadingItem[] = [
     meta: "Transformer · 模型基础论文",
     progress: 42,
     notes: "Self-Attention 的计算复杂度分析值得深入研究。",
-    relatedPosts: ["agent-source-code-analysis"]
+    relatedPosts: ["agent-source-code-analysis"],
   },
   {
     id: "3",
@@ -40,7 +40,7 @@ const mockReadings: ReadingItem[] = [
     meta: "Agent Runtime · 源码拆解",
     progress: 55,
     notes: "Tool Calling 的错误处理和重试机制设计得很优雅。",
-    relatedPosts: ["agent-source-code-analysis", "keycloak-apisix-rbac"]
+    relatedPosts: ["agent-source-code-analysis", "keycloak-apisix-rbac"],
   },
   {
     id: "4",
@@ -48,22 +48,22 @@ const mockReadings: ReadingItem[] = [
     title: "Go Web Programming",
     meta: "Go · Web 开发",
     progress: 30,
-    relatedPosts: ["go-pprof-performance"]
+    relatedPosts: ["go-pprof-performance"],
   },
   {
     id: "5",
     type: "paper",
-    title: " raft consensus paper",
+    title: "Raft Consensus Paper",
     meta: "分布式一致性 · 协议",
     progress: 15,
-    relatedPosts: ["kubernetes-canary-upgrade"]
-  }
+    relatedPosts: ["kubernetes-canary-upgrade"],
+  },
 ];
 
 const typeConfig = {
   book: { label: "书籍", icon: "book", color: "text-cyan-100", bg: "bg-cyan-400/20" },
   paper: { label: "论文", icon: "file", color: "text-fuchsia-100", bg: "bg-fuchsia-400/20" },
-  project: { label: "项目", icon: "github", color: "text-emerald-100", bg: "bg-emerald-400/20" }
+  project: { label: "项目", icon: "github", color: "text-emerald-100", bg: "bg-emerald-400/20" },
 };
 
 export function ReadingTimeline() {
@@ -155,7 +155,7 @@ export function ReadingTimeline() {
 
                 {item.relatedPosts && item.relatedPosts.length > 0 && (
                   <div className="mt-4">
-                    <p className="mb-2 text-xs font-bold uppercase tracking-widest text-slate-500">影响文章</p>
+                    <p className="mb-2 text-xs font-bold uppercase tracking-widest text-slate-500">关联文章</p>
                     <div className="flex flex-wrap gap-2">
                       {item.relatedPosts.map((slug) => (
                         <a
