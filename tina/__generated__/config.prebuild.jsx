@@ -116,11 +116,16 @@ var config_default = defineConfig({
           },
           {
             type: "string",
-            name: "description",
+            name: "desc",
             label: "\u63CF\u8FF0",
             ui: {
               component: "textarea"
             }
+          },
+          {
+            type: "string",
+            name: "repoUrl",
+            label: "\u4ED3\u5E93\u5730\u5740"
           },
           {
             type: "string",

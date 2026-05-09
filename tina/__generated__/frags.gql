@@ -1,0 +1,24 @@
+fragment PostParts on Post {
+  __typename
+  title
+  slug
+  date
+  description
+  tag
+  readTime
+  top
+  featured
+  body
+}
+
+fragment ProjectParts on Project {
+  __typename
+  name
+  slug
+  type
+  desc
+  repoUrl
+  techStack
+  highlights
+  body
+}
