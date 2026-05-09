@@ -6,11 +6,15 @@ public class GitService
 {
     private readonly string _repoPath;
     private readonly string? _token;
+    private readonly string _owner;
+    private readonly string _repo;
 
     public GitService(IConfiguration configuration)
     {
         _repoPath = configuration["Git:RepoPath"] ?? Directory.GetCurrentDirectory();
         _token = configuration["GitHub:Token"];
+        _owner = configuration["GitHub:Owner"] ?? "";
+        _repo = configuration["GitHub:Repo"] ?? "";
     }
 
     public async Task<(bool success, string message, string? commitSha)> PullAsync()
@@ -34,6 +38,12 @@ public class GitService
     {
         try
         {
+            // Configure remote with token before any operation
+            if (!string.IsNullOrEmpty(_token))
+            {
+                var remoteResult = await RunGitCommand($"remote set-url origin https://x-access-token:{_token}@github.com/{_owner}/{_repo}.git");
+            }
+
             // git add
             var addResult = await RunGitCommand($"add \"{filePath}\"");
             if (addResult.exitCode != 0)
@@ -72,6 +82,12 @@ public class GitService
     {
         try
         {
+            // Configure remote with token
+            if (!string.IsNullOrEmpty(_token))
+            {
+                await RunGitCommand($"remote set-url origin https://x-access-token:{_token}@github.com/{_owner}/{_repo}.git");
+            }
+
             var addResult = await RunGitCommand($"rm \"{filePath}\"");
             if (addResult.exitCode != 0)
             {
@@ -100,19 +116,12 @@ public class GitService
 
     private async Task<(int exitCode, string output, string error)> RunGitCommand(string args)
     {
-        var gitArgs = args;
-        if (!string.IsNullOrEmpty(_token))
-        {
-            // Insert token into URL if needed
-            gitArgs = args.Replace("origin main", $"origin main");
-        }
-
         var process = new Process
         {
             StartInfo = new ProcessStartInfo
             {
                 FileName = "git",
-                Arguments = gitArgs,
+                Arguments = args,
                 WorkingDirectory = _repoPath,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,

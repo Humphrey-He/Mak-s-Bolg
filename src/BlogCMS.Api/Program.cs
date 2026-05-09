@@ -5,6 +5,9 @@ using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
 using BlogCMS.Api.Data;
 using BlogCMS.Api.Services;
+using DotNetEnv;
+
+Env.Load(Path.Combine(Directory.GetCurrentDirectory(), ".env.local"));
 
 var builder = WebApplication.CreateBuilder(args);
 
