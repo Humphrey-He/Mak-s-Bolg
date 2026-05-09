@@ -1,0 +1,1081 @@
+---
+slug: "agent-rag-system"
+title: "RAG 系统设计：从经典 RAG 到 Advanced RAG、Modular RAG 与 Agentic RAG"
+description: "系统梳理 RAG 的历史、分类、近期进展、对 Agent 的价值、核心不足与生产落地经验。"
+date: "2026-05-09"
+tag: "AI Agent"
+readTime: "26 min"
+top: false
+featured: true
+---
+
+RAG，Retrieval-Augmented Generation，中文通常译为"检索增强生成"。
+
+在大模型应用里，RAG 是最早被大规模落地的技术路线之一。它看起来很简单：先检索外部知识，再把检索结果塞进 Prompt，让模型基于这些内容回答。
+
+但如果把 RAG 只理解为：
+
+```text
+向量库检索
+→ 拼 Prompt
+→ 让 LLM 回答
+```
+
+那就低估了它。
+
+RAG 真正解决的是一个更底层的问题：
+
+> 大模型的参数知识是静态、不可解释、难更新的；而真实业务知识是动态、私有、结构化、多源并且需要可追溯的。
+
+这也是为什么 RAG 对 Agent 尤其重要。Agent 要完成真实任务，不能只靠模型内部知识，它需要读取文档、检索事实、查证来源、比较证据、规划下一步，并在必要时重新检索。换句话说，RAG 是 Agent 的"外部知识系统"。
+
+这篇文章会从六个层面展开：
+
+1. RAG 的历史脉络；
+2. RAG 为什么对 Agent 重要；
+3. RAG 的主要分类；
+4. 近两年的关键进展；
+5. RAG 的核心不足；
+6. 生产系统里的设计判断。
+
+---
+
+## 一、RAG 的历史：从参数记忆到外部记忆
+
+RAG 的经典起点是 2020 年 Lewis 等人的论文 **Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks**。这篇论文提出将模型的 **parametric memory** 和外部 **non-parametric memory** 结合起来：前者是预训练 seq2seq 模型中的知识，后者是通过 dense vector index 访问的 Wikipedia 文档。论文还提出两种形式：一种是在整个生成序列中使用相同检索文档，另一种是每个 token 可以使用不同文档，并在多个知识密集任务上取得了当时的强结果。
+
+这篇论文的重要性不在于"用了向量检索"，而在于它提出了一个后来被反复验证的架构判断：
+
+> 大模型不应该把所有知识都压进参数里。外部知识库应该成为模型推理的一部分。
+
+从这个角度看，RAG 的历史可以分成四个阶段。
+
+### 1. 经典 RAG：检索 + 生成
+
+早期 RAG 的基本模式是：
+
+```text
+Query
+→ Retriever
+→ Top-K Documents
+→ Generator
+→ Answer
+```
+
+这类系统的核心目标是解决：
+
+```text
+知识更新困难
+事实准确性不足
+回答缺少来源
+领域知识无法覆盖
+```
+
+它在开放域问答、事实型 QA、知识密集型生成任务中非常有效。
+
+但经典 RAG 也有明显缺陷：检索质量高度决定生成质量。如果召回错了，生成器很可能"基于错误上下文一本正经地胡说"。
+
+### 2. Naive RAG：工程落地的第一代形态
+
+进入 LLM 应用时代，最常见的 RAG 变成了工程上的 Naive RAG：
+
+```text
+文档切分
+→ Embedding
+→ 向量库
+→ Top-K 检索
+→ 拼接上下文
+→ LLM 生成
+```
+
+这套方案非常容易搭建，因此成为企业知识库、客服机器人、文档问答、代码库问答的默认起点。
+
+2023 年的 RAG Survey 将 RAG 范式总结为 **Naive RAG、Advanced RAG、Modular RAG** 三类，并把 RAG 框架拆成 retrieval、generation、augmentation 三个核心部分。
+
+Naive RAG 的价值是快速验证，问题是生产上很快会遇到瓶颈：
+
+```text
+切分粒度不对
+召回结果不相关
+Top-K 固定
+长文档整体语义丢失
+多跳问题答不好
+上下文过长
+引用不可靠
+评测困难
+```
+
+### 3. Advanced RAG：围绕检索质量做增强
+
+Advanced RAG 的核心是承认一个事实：
+
+> RAG 的瓶颈首先是检索，不是生成。
+
+于是开始引入：
+
+```text
+Query Rewrite
+HyDE
+Hybrid Search
+Rerank
+Context Compression
+Metadata Filter
+Multi-query Retrieval
+Parent-child Chunk
+Multi-hop Retrieval
+```
+
+这些技术的目标是让检索结果更相关、更完整、更可用。
+
+### 4. Modular / Agentic RAG：RAG 变成可编排系统
+
+当 RAG 从"固定链路"演进到"可编排模块"时，系统开始支持：
+
+```text
+检索前判断是否需要检索
+检索失败后自动纠错
+多数据源路由
+多轮检索
+反思检索结果
+工具化检索
+由 Agent 决定下一步行动
+```
+
+这就是 Modular RAG 和 Agentic RAG 的方向。
+
+2024 年的 **RAG and Beyond** 更进一步提出，不同用户查询对外部数据的需求并不相同，并按外部数据需求和任务焦点将查询分为 explicit fact queries、implicit fact queries、interpretable rationale queries、hidden rationale queries 四类。
+
+这说明 RAG 不应该是一个固定组件，而应该根据任务类型动态选择策略。
+
+---
+
+## 二、RAG 为什么对 Agent 重要？
+
+Agent 的核心能力包括：规划、工具调用、记忆、检索、评测和执行。RAG 在其中承担的是"知识获取与证据约束"。
+
+对 Agent 来说，RAG 至少有五个价值。
+
+### 1. 给 Agent 提供外部事实
+
+Agent 经常需要回答动态问题：
+
+```text
+最新文档是什么？
+当前项目有哪些 API？
+这段代码依赖哪个配置？
+某个业务规则在哪里定义？
+```
+
+这些知识不可能全部存在模型参数中。RAG 让 Agent 能读取外部文档，而不是凭记忆猜。
+
+### 2. 降低幻觉
+
+RAG 不能彻底消除幻觉，但能显著降低"无依据回答"的概率。原始 RAG 论文就明确指出，大模型参数知识在精确访问和操作知识方面有限，并且知识更新和 provenance 仍是开放问题，因此引入显式非参数记忆能缓解这些问题。
+
+生产上，RAG 的价值往往不是让模型"更聪明"，而是让模型**有依据**。
+
+### 3. 提供可追溯性
+
+没有 RAG 的回答很难解释来源。
+有 RAG 的回答至少可以绑定：
+
+```text
+检索文档
+段落位置
+版本号
+更新时间
+来源系统
+```
+
+这对于企业应用非常关键。
+
+### 4. 支撑 Agentic Planning
+
+Agent 在规划时需要知道环境状态。RAG 可以作为环境观察的一部分：
+
+```text
+当前任务需要什么信息？
+已有上下文是否足够？
+需要查哪类文档？
+检索结果是否支持下一步行动？
+```
+
+Self-RAG 的思想很典型：它不是每次都固定检索，而是训练模型按需检索，并通过 reflection tokens 评价检索内容和生成质量。
+
+### 5. 让 Agent 具备"查证"能力
+
+一个成熟 Agent 不应该只会生成答案，还应该能问自己：
+
+```text
+这个答案有证据吗？
+证据是否相关？
+证据是否足够？
+是否需要重新检索？
+是否应该回答不知道？
+```
+
+这正是 Agentic RAG 和 Self-RAG / CRAG 这类方法的价值。
+
+---
+
+## 三、RAG 的主要分类
+
+为了工程落地，我建议从两条线分类：**架构范式**和**能力增强方向**。
+
+---
+
+## 3.1 按架构范式分类
+
+### 1. Naive RAG
+
+最基础形态：
+
+```text
+Chunk
+→ Embed
+→ Retrieve Top-K
+→ Stuff Context
+→ Generate
+```
+
+优点：
+
+```text
+实现简单
+成本低
+适合快速验证
+适合 FAQ / 简单知识库
+```
+
+缺点：
+
+```text
+召回质量不稳定
+固定 Top-K 粗糙
+上下文污染
+多跳推理弱
+引用不可靠
+```
+
+适用场景：
+
+```text
+简单文档问答
+FAQ
+内部制度查询
+低风险客服辅助
+```
+
+---
+
+### 2. Advanced RAG
+
+在 Naive RAG 基础上增加检索增强和上下文治理：
+
+```text
+Query Rewrite
+→ Hybrid Retrieval
+→ Rerank
+→ Context Compression
+→ Citation-aware Generation
+```
+
+典型技术包括：
+
+```text
+BM25 + Dense Hybrid Search
+Cross-Encoder Reranker
+Multi-query Retrieval
+Metadata Filter
+Parent Document Retrieval
+Contextual Compression
+```
+
+优点：
+
+```text
+召回更稳
+相关性更高
+可处理更复杂查询
+更适合生产
+```
+
+缺点：
+
+```text
+链路复杂
+延迟更高
+评测成本更高
+调参空间大
+```
+
+适用场景：
+
+```text
+企业知识库
+技术文档问答
+代码库检索
+复杂产品支持
+```
+
+---
+
+### 3. Modular RAG
+
+Modular RAG 把 RAG 拆成可替换模块：
+
+```text
+Query Router
+Retriever
+Reranker
+Compressor
+Generator
+Verifier
+Citation Builder
+```
+
+它的关键不是某个模块更强，而是整体可编排。
+
+优点：
+
+```text
+模块可替换
+易 A/B 测试
+适合多数据源
+适合多任务类型
+```
+
+缺点：
+
+```text
+工程复杂
+需要统一观测
+需要评测体系
+```
+
+适用场景：
+
+```text
+中大型企业知识平台
+多数据源智能助手
+Agent 平台
+```
+
+---
+
+### 4. Agentic RAG
+
+Agentic RAG 让 Agent 决定检索策略：
+
+```text
+是否检索？
+检索哪个数据源？
+如何改写 query？
+检索结果是否足够？
+是否需要二次检索？
+是否需要调用其他工具？
+```
+
+它不是一条固定链路，而是一个动态决策过程。
+
+优点：
+
+```text
+灵活
+适合复杂任务
+可以自我纠错
+适合多跳推理
+```
+
+缺点：
+
+```text
+成本高
+延迟高
+行为不稳定
+需要强观测和安全边界
+```
+
+适用场景：
+
+```text
+研究助手
+复杂技术分析
+多文档推理
+长任务 Agent
+```
+
+---
+
+## 3.2 按能力增强方向分类
+
+### 1. Retriever-centric RAG
+
+重点优化检索器：
+
+```text
+更好的 embedding
+混合检索
+重排序
+查询改写
+领域适配
+```
+
+代表方法：HyDE、Hybrid Search、Rerank。
+
+HyDE 的思路很有代表性：先让 LLM 为查询生成一个 hypothetical document，再将这个假文档编码成 embedding，用它去检索真实文档。论文指出，HyDE 不依赖人工 relevance labels，并在多任务、多语言上比无监督 dense retriever 表现更强。
+
+我的判断：HyDE 很适合冷启动知识库，但它生成的 hypothetical document 可能包含错误细节，因此必须依赖检索器把它"ground"回真实语料，不能直接把假文档当证据。
+
+---
+
+### 2. Generator-centric RAG
+
+重点优化生成阶段：
+
+```text
+引用约束
+答案格式约束
+拒答机制
+基于证据生成
+生成后验证
+```
+
+Self-RAG 属于这一类和 Agentic RAG 的交叉。它通过特殊 reflection tokens 学习何时检索、如何评价检索段落、如何批判自己的生成，并在开放域 QA、推理，事实验证和长文生成上提升 factuality 与引用准确性。
+
+我的判断：Self-RAG 的价值在于"按需检索 + 自我评价"，但它需要训练或专门模型支持；生产系统中更常见的是用外部 verifier 或 LLM-as-judge 模拟它的评价机制。
+
+---
+
+### 3. Robustness-oriented RAG
+
+重点解决"检索错了怎么办"。
+
+CRAG，Corrective RAG，提出一个轻量 retrieval evaluator 来评估检索文档质量，并根据置信度触发不同知识获取动作；当静态语料不足时，还会使用 Web search 扩展检索结果，并通过 decompose-then-recompose 过滤无关信息。
+
+CRAG 解决的是生产中非常常见的问题：
+
+```text
+Retriever 返回了低质量结果
+但 Generator 仍然强行基于它回答
+```
+
+我的判断：CRAG 的思路比"盲目扩大 Top-K"更生产友好。检索失败时，系统应该先判断失败，而不是把更多垃圾上下文塞给模型。
+
+---
+
+### 4. Structure-aware RAG
+
+重点让系统理解文档结构、实体关系和层级语义。
+
+RAPTOR 通过递归 embedding、聚类和摘要，把文档构造成树状结构，使检索可以在不同抽象层级上进行。论文指出，传统 RAG 多检索短连续 chunk，限制了对长文档整体上下文的理解；RAPTOR 通过层级摘要树改善了复杂、多步推理任务中的检索效果。
+
+GraphRAG 则进一步引入图结构。Microsoft GraphRAG 文档将其描述为一种结构化、层级化的 RAG 方法：从原始文本抽取知识图谱，构建 community hierarchy，生成社区摘要，并利用这些结构执行 RAG 任务。
+
+我的判断：RAPTOR 和 GraphRAG 的共同点是都在反对"纯 chunk 检索"。它们说明，知识不是一堆切片，而是有层次、有关系、有全局结构的。
+
+---
+
+## 四、RAG 最近的关键进展和突破
+
+近两年 RAG 的突破，不是"换一个更大的 embedding 模型"这么简单，而是从三个方向推进：**自适应、结构化、可验证**。
+
+---
+
+## 4.1 从固定检索到按需检索：Self-RAG
+
+Naive RAG 默认每次都检索固定 Top-K。这很粗糙。
+
+Self-RAG 指出，盲目检索和合并固定数量的段落会降低模型灵活性，甚至导致无用生成。它训练模型使用 reflection tokens 来按需检索、评价检索段落和生成内容，从而让模型在不同任务中调整行为。
+
+生产启发：
+
+```text
+不是所有问题都需要检索。
+不是所有检索结果都该进入上下文。
+不是所有答案都该强行生成。
+```
+
+工程上可以实现为：
+
+```text
+Retrieval Decision
+→ Retrieve or Direct Answer
+→ Evidence Evaluation
+→ Generate
+→ Self-check / Verifier
+```
+
+适合：
+
+```text
+Agentic RAG
+长文生成
+需要引用的回答
+事实校验
+```
+
+---
+
+## 4.2 从检索后盲信到检索纠错：CRAG
+
+CRAG 研究的是检索结果错误时怎么办。它提出 retrieval evaluator 评估文档整体质量，并根据置信度触发不同动作；如果静态库不足，可以扩展到 Web search，并对文档执行 decompose-then-recompose 以过滤无关内容。
+
+生产启发：
+
+```text
+RAG 系统必须有"检索失败"这一状态。
+```
+
+很多系统的问题是：检索不到也照样回答。
+正确做法应该是：
+
+```text
+高置信检索 → 正常回答
+低置信检索 → 二次检索 / 换数据源
+无有效证据 → 拒答或请求澄清
+```
+
+这比调大 Top-K 更重要。
+
+---
+
+## 4.3 从 Query Embedding 到 Hypothetical Document：HyDE
+
+HyDE 的核心思想是：用户 query 往往很短、语义不完整，而文档 embedding 空间更适合"文档到文档"的匹配。因此先让 LLM 生成一个假想文档，再用这个假想文档去检索真实文档。
+
+生产启发：
+
+```text
+当用户查询过短、领域术语缺失、没有标注数据时，HyDE 很有价值。
+```
+
+但风险是：
+
+```text
+假想文档可能带入错误细节。
+```
+
+所以 HyDE 的结果必须经过真实语料 grounding 和 rerank，不能把生成的假文档当事实。
+
+---
+
+## 4.4 从短 chunk 到层级文档理解：RAPTOR
+
+RAPTOR 解决的是传统 chunk 检索无法理解长文档整体结构的问题。它通过递归摘要构造层级树，让系统既能检索局部细节，也能检索高层摘要。
+
+生产启发：
+
+```text
+长文档问答不能只依赖 flat chunks。
+```
+
+适合：
+
+```text
+长报告
+论文
+产品手册
+法律合同
+技术设计文档
+```
+
+如果用户问：
+
+```text
+这份技术设计的核心风险是什么？
+```
+
+纯 chunk 检索可能只召回局部段落；RAPTOR 的层级摘要更容易提供全局视角。
+
+---
+
+## 4.5 从语义相似到关系推理：GraphRAG
+
+GraphRAG 的关键是把非结构化文本转成图结构，然后在实体、关系、社区摘要上进行检索和推理。Microsoft GraphRAG 文档强调，它区别于 naive semantic-search RAG，不只是检索文本片段，而是抽取结构化数据、构建社区层级并生成社区摘要。
+
+生产启发：
+
+```text
+当问题需要跨文档、多实体、多关系推理时，GraphRAG 比纯向量检索更合适。
+```
+
+适合：
+
+```text
+组织知识库
+案件分析
+金融关系网络
+供应链分析
+科研文献图谱
+企业内部制度关系
+```
+
+但 GraphRAG 成本更高：
+
+```text
+抽取成本高
+图谱构建复杂
+实体消歧困难
+更新延迟高
+解释链路更复杂
+```
+
+因此不适合所有场景。
+
+---
+
+## 五、RAG 的不足：它不是万能解法
+
+RAG 的价值很大，但生产落地时必须承认它的边界。
+
+---
+
+## 5.1 检索错，生成就错
+
+RAG 的第一性问题是：生成质量高度依赖检索质量。
+
+常见失败：
+
+```text
+召回不到关键文档
+召回到相似但无关文档
+召回到过期文档
+召回到冲突文档
+召回片段缺上下文
+```
+
+解决方向：
+
+```text
+Hybrid Search
+Reranker
+Metadata Filter
+Document Versioning
+Retrieval Evaluator
+```
+
+---
+
+## 5.2 Chunking 是被低估的核心问题
+
+很多 RAG 项目失败，不是模型不行，而是切分策略错误。
+
+常见错误：
+
+```text
+固定长度粗暴切分
+表格被切碎
+代码块被切断
+标题和正文分离
+跨页语义断裂
+元数据丢失
+```
+
+生产建议：
+
+```text
+按文档结构切分
+标题层级参与 chunk metadata
+表格单独处理
+代码块完整保留
+parent-child chunk
+为每个 chunk 保留 source path、heading、version、timestamp
+```
+
+---
+
+## 5.3 RAG 不等于事实正确
+
+RAG 只是提供证据，不保证模型正确使用证据。
+
+失败情况：
+
+```text
+模型忽略证据
+模型曲解证据
+模型把多个证据错误拼接
+模型生成证据中没有的结论
+引用位置不对应
+```
+
+解决方向：
+
+```text
+citation-aware generation
+answer verification
+faithfulness scoring
+LLM-as-judge
+claim-level attribution
+```
+
+---
+
+## 5.4 上下文越多不一定越好
+
+很多人遇到回答不好，就增加 Top-K。
+这通常会适得其反。
+
+问题：
+
+```text
+上下文污染
+注意力稀释
+成本上升
+延迟增加
+冲突证据增多
+```
+
+我的判断：
+
+> Top-K 不是越大越好，应该让上下文进入模型前经过排序、压缩和过滤。
+
+---
+
+## 5.5 RAG 不能替代权限系统
+
+RAG 经常接入企业内部数据，但检索层如果不做权限隔离，很容易泄露数据。
+
+必须保证：
+
+```text
+用户只能检索自己有权限访问的文档
+权限过滤发生在检索前或检索中
+不要检索后再靠模型"不要泄露"
+```
+
+模型不是权限系统。
+
+---
+
+## 5.6 RAG 评测很难
+
+RAG 不是只评回答对不对，还要评：
+
+```text
+检索是否召回正确文档？
+上下文是否相关？
+生成是否忠实于证据？
+引用是否准确？
+无答案时是否拒答？
+成本和延迟是否可接受？
+```
+
+如果没有评测集，RAG 调优基本靠感觉。
+
+---
+
+## 六、生产 RAG 系统应该怎么设计？
+
+下面给出一套我认为更适合生产的 RAG 架构。
+
+```text
+User Query
+  ↓
+Query Classifier
+  ↓
+Query Rewrite / HyDE / Multi-query
+  ↓
+Retriever Router
+  ├── BM25
+  ├── Vector Search
+  ├── Graph Search
+  └── SQL / Metadata Filter
+  ↓
+Candidate Merge
+  ↓
+Reranker
+  ↓
+Retrieval Evaluator
+  ↓
+Context Compressor
+  ↓
+Generator
+  ↓
+Answer Verifier
+  ↓
+Citation Builder
+  ↓
+Trace / Metrics / Feedback
+```
+
+这套结构的关键是：**检索不是一步，而是一条链路**。
+
+---
+
+## 七、结合 Agent 的 RAG 设计
+
+Agentic RAG 应该让 Agent 在可控范围内决策。
+
+一个合理流程是：
+
+```text
+1. 判断问题类型
+2. 判断是否需要检索
+3. 选择数据源
+4. 改写 query
+5. 检索
+6. 评估证据
+7. 必要时二次检索
+8. 基于证据生成答案
+9. 验证答案
+10. 输出引用
+```
+
+对应 Agent 工具可以设计为：
+
+```text
+search_docs(query, source, top_k)
+rerank(query, documents)
+evaluate_evidence(query, documents)
+compress_context(documents, budget)
+verify_answer(answer, evidence)
+```
+
+注意：不要把底层能力设计得过细。比如：
+
+```text
+embedding_search
+bm25_search
+graph_query
+```
+
+可以作为内部工具，但给 Agent 暴露时更适合封装为：
+
+```text
+search_knowledge_base
+```
+
+由系统内部路由到不同 retriever。
+
+---
+
+## 八、RAG 生产落地的关键经验
+
+### 1. 先做问题分类，再做 RAG
+
+不要所有问题都走同一条链路。
+
+可以按 RAG and Beyond 的思想，把查询分成：
+
+```text
+显式事实查询
+隐式事实查询
+可解释推理查询
+隐藏推理查询
+```
+
+简单事实问题可以直接检索；复杂推理问题需要多步检索、重排、压缩和验证。
+
+---
+
+### 2. 混合检索是生产默认项
+
+单纯向量检索不够。
+生产建议默认：
+
+```text
+BM25 + Dense Retrieval + Rerank
+```
+
+原因：
+
+```text
+BM25 擅长关键词、专有名词、错误码
+Dense 擅长语义相似
+Reranker 负责精排
+```
+
+---
+
+### 3. 元数据比 embedding 更重要
+
+必须保留：
+
+```text
+source
+path
+title
+heading
+created_at
+updated_at
+version
+author
+permission
+document_type
+```
+
+很多过滤应该在检索前完成：
+
+```text
+只检索当前用户有权限的文档
+只检索最新版本
+只检索指定项目
+只检索指定文档类型
+```
+
+---
+
+### 4. 引用必须和 chunk 绑定
+
+不要只返回文档标题。
+至少要能定位到：
+
+```text
+文档
+章节
+段落
+chunk id
+版本
+```
+
+否则引用不可验证。
+
+---
+
+### 5. RAG 必须可观测
+
+每次 RAG 调用都要记录：
+
+```text
+query
+rewritten_query
+retriever
+top_k
+retrieved_chunk_ids
+rerank_scores
+context_tokens
+answer
+citations
+latency
+cost
+user_feedback
+```
+
+没有 trace，就无法调优。
+
+---
+
+### 6. 建立黄金评测集
+
+至少维护三类问题：
+
+```text
+应该能回答的问题
+应该拒答的问题
+容易混淆的问题
+```
+
+每条评测样本包含：
+
+```json
+{
+  "question": "xxx",
+  "expected_sources": ["doc_1#chunk_3"],
+  "expected_answer": "xxx",
+  "must_not_use": ["outdated_doc_2"],
+  "answerable": true
+}
+```
+
+RAG 的优化应该围绕评测集，而不是感觉。
+
+---
+
+## 九、RAG 选型建议
+
+### 小型知识库
+
+```text
+Naive RAG + metadata + rerank
+```
+
+不要过度设计。
+
+### 企业文档问答
+
+```text
+Advanced RAG
+Hybrid Search
+Reranker
+Citation
+Permission Filter
+```
+
+这是最实用方案。
+
+### 长文档 / 论文 / 合同
+
+```text
+RAPTOR / hierarchical retrieval
+Parent-child chunk
+Long-context summarization
+```
+
+重点解决全局语义。
+
+### 多实体关系推理
+
+```text
+GraphRAG
+Knowledge Graph
+Entity Linking
+Community Summary
+```
+
+适合复杂关系，不适合简单 FAQ。
+
+### Agent 研究助手
+
+```text
+Agentic RAG
+Self-RAG-like decision
+CRAG-like correction
+Multi-step retrieval
+Verifier
+```
+
+成本更高，但能力更强。
+
+---
+
+## 十、我的最终判断
+
+RAG 的演进不是从"简单"到"复杂"，而是从"固定链路"到"任务自适应"。
+
+经典 RAG 解决了模型参数知识静态、不可更新、缺少来源的问题；Naive RAG 让企业快速构建知识库应用；Advanced RAG 开始围绕检索质量做系统增强；Modular RAG 让检索、重排、压缩、验证成为可替换模块；Agentic RAG 则让 Agent 按任务需要动态决定是否检索、如何检索、是否相信检索结果。
+
+我的核心判断是：
+
+> RAG 的本质不是"给大模型外挂一个向量库"，而是构建一个可检索、可验证、可追溯、可治理的外部知识系统。
+
+对于 Agent 来说，RAG 是它的外部知识与证据系统；对于生产应用来说，RAG 是降低幻觉、接入私有知识、提供引用和支持知识更新的关键基础设施。
+
+但 RAG 不是万能药。它解决的是"知识接入"问题，不自动解决"推理正确""权限安全""引用可靠""检索评测""生产观测"这些问题。
+
+真正可用的 RAG 系统，必须满足五个条件：
+
+```text
+检索可评测
+上下文可控
+答案可验证
+引用可追溯
+权限可治理
+```
+
+如果做不到这五点，它只是一个看起来很像 RAG 的 Prompt 拼接器。
+
+---
+
+## 参考资料
+
+| # | 资料 | 来源 |
+|---|------|------|
+| 1 | Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks | arXiv |
+| 2 | Retrieval-Augmented Generation for Large Language Models: A Survey | arXiv |
+| 3 | Retrieval Augmented Generation (RAG) and Beyond: A Comprehensive Survey on How to Make your LLMs use External Data More Wisely | arXiv |
+| 4 | Self-RAG: Learning to Retrieve, Generate, and Critique through Self-Reflection | arXiv |
+| 5 | Precise Zero-Shot Dense Retrieval without Relevance Labels / HyDE | arXiv |
+| 6 | Corrective Retrieval Augmented Generation | arXiv |
+| 7 | RAPTOR: Recursive Abstractive Processing for Tree-Organized Retrieval | arXiv |
+| 8 | Microsoft GraphRAG Documentation | Microsoft GitHub |

@@ -1,0 +1,343 @@
+---
+slug: "kafka-sarama-consumer-mark-commit"
+title: "Kafka 消费者：Mark 与 Commit 的边界、auto commit 与 manual commit 的对象模型"
+description: "深入解析 Sarama consumer offset 提交机制：Mark 只是改本地状态，Commit 才是发网络请求。以及为什么会出现'业务已处理但 offset 未提交'或反之的问题。"
+date: "2026-05-09"
+tag: "Go / Cache"
+readTime: "22 min"
+top: false
+featured: false
+---
+
+> **核心一句话：** Sarama 里"提交 offset"分成了两层：业务线程先在内存里"标记进度"，offset manager 再在合适时机把这份进度发给 Kafka coordinator。所以"看起来提交了"通常只是 **Mark 成功了**，不等于 **Commit 已经成功落到 broker**。
+
+---
+
+## 一、Mark 和 Commit 的边界是什么
+
+边界非常清楚：
+
+**Mark = 改本地状态**
+
+**Commit = 发网络请求，把本地状态持久化到 Kafka**
+
+源码上最直接的证据有三处。
+
+**第一处**，`ConsumerGroupSession` 接口注释已经写明：`MarkOffset` 不会立刻把 offset 提交到后端存储；为了效率，它甚至可能永远来不及提交，比如应用崩溃时。这会导致同一消息被处理两次，因此你的处理逻辑最好是幂等的。
+
+**第二处**，`consumerGroupSession.MarkOffset` 只是把调用转发给 `pom.MarkOffset`，而 `pom.MarkOffset` 做的事情只有：如果新 offset 更大，就把 `pom.offset` 和 `pom.metadata` 更新掉，并把 `dirty = true`。这里完全没有网络调用。
+
+**第三处**，真正的 `Commit` 在 `offsetManager.Commit()` 里只做两件事：`flushToBroker()` 和 `releasePOMs(false)`；`flushToBroker()` 里会拿 coordinator、构造 `OffsetCommitRequest`、调用 `sendOffsetCommit` 发给 broker。也就是说，只有走到这里，才算真正向 Kafka 提交。
+
+所以从语义上讲：
+
+- `MarkMessage / MarkOffset` 表示"**我想把消费进度推进到这里**"
+- `Commit` 表示"**请把这个进度正式写入 Kafka offset store**"
+
+这两个动作是故意拆开的，不是实现细节，而是 Sarama 的对象模型设计。
+
+---
+
+## 二、为什么 `MarkMessage` 用的是 `msg.Offset + 1`
+
+`MarkMessage` 的实现是：
+
+```
+MarkOffset(msg.Topic, msg.Partition, msg.Offset+1, metadata)
+```
+
+这说明 Kafka 里保存的 offset 语义不是"最后处理成功的是哪条消息"，而是"**下一次应该从哪里开始读**"。这也和 `partitionOffsetManager.NextOffset()` 对得上：如果当前已经有 offset，就直接返回它；没有时才回退到 `Consumer.Offsets.Initial`。而 `consumerGroupSession.consume()` 在创建 claim 前，正是通过 `pom.NextOffset()` 来决定下一次从哪里开始消费。
+
+所以应该把 offset 理解成：
+
+> **消费游标 / resume point**，不是业务完成日志。
+
+---
+
+## 三、自动提交与手动提交，在 Sarama 对象模型里是怎么分开的
+
+Sarama 的分离方式不是"两个不同的 offset manager"，而是：
+
+**同一套 offset manager，同时支持"定时自动触发 Commit"和"业务代码显式调用 Commit"两种提交方式。**
+
+源码上看，`offsetManager` 创建时，如果 `conf.Consumer.Offsets.AutoCommit.Enable` 为真，就会创建一个 ticker，周期是 `AutoCommit.Interval`。随后 `mainLoop()` 会在每次 ticker 到时调用 `om.Commit()`。这就是自动提交。
+
+而手动提交就是业务代码调用 `session.Commit()`，它直接转到 `s.offsets.Commit()`，同步执行一次 `flushToBroker()`。源码注释也明确说了：`Commit` 是一个 blocking synchronous operation。
+
+所以对象模型上可以这样记：
+
+| 操作 | 作用 |
+|------|------|
+| `MarkMessage / MarkOffset` | 只改内存里的"待提交进度" |
+| `AutoCommit mainLoop` | 按时间间隔自动把 dirty offsets 刷出去 |
+| `session.Commit()` | 业务显式立即刷一次 |
+| `offsetManager.Close()` | 关闭时如果开启自动提交，还会做最后一轮 flush 重试 |
+
+这也解释了一个常见误区：
+
+> **自动提交和手动提交不是两套独立语义，而是共用同一个 dirty offset 状态，只是触发 Commit 的时机不同。**
+
+---
+
+## 四、为什么会出现"业务已处理，但 offset 未提交"
+
+这是最常见、也最正常的一类情况。只要业务处理完成和 `Commit` 落盘之间存在时间窗口，就可能发生。Sarama 官方注释甚至直接提醒你：`MarkOffset` 可能永远不会被提交，比如应用崩溃。
+
+典型场景有这几类：
+
+### 1）只 Mark 了，还没等到 Commit
+
+比如你调用了 `MarkMessage`，但自动提交间隔还没到，或者你还没手动调 `Commit()`，进程就崩了。此时本地 `pom.offset` 已经推进，`dirty = true`，但 Kafka 端并不知道。
+
+### 2）Commit 发起了，但网络或 coordinator 失败
+
+`flushToBroker()` 会先找 coordinator，再构造请求，再 `sendOffsetCommit`。如果 coordinator 获取失败，或者发送失败，Sarama 会走错误处理并返回，此时业务可能已经做完了，但 commit 没落地。
+
+### 3）rebalance 或 shutdown 时，最后一次 commit 没赶上
+
+`Consume()` 的生命周期注释明确说：session 结束时会"最后再提交一次 marked offsets"，但如果 rebalance 超时，consumer 会被组移除，并导致 offset commit failures。
+
+### 4）收到 broker 响应前进程退出
+
+即便请求已经发出去，只有在响应里该 partition 返回 `ErrNoError` 时，Sarama 才会执行 `pom.updateCommitted(block.offset, block.metadata)`，把 dirty 清掉。也就是说，请求在飞行中时，业务上你可能已经"认为提交了"，但本地状态仍未被确认。
+
+这类场景的本质就是：
+
+> **业务成功是你的应用语义；offset commit 成功是 Kafka 协调器语义。两者之间天然存在间隙。**
+
+---
+
+## 五、什么时候会出现"offset 已提交，但业务其实没成功"
+
+这类情况通常更危险，因为它会导致"消息丢失式跳过"。
+
+出现条件通常是：
+
+### 1）你在业务处理前就先 `MarkMessage`，甚至立刻 `Commit`
+
+因为 `MarkMessage` 只是推进"下次从哪读"的游标。如果你先标记、先提交，而后面的数据库写入、RPC、状态变更失败了，那么 Kafka 端已经认为你消费到下一条了。重启后会从新的 offset 继续，当前消息不会再回来。
+
+### 2）自动提交窗口内，你的业务执行是异步的
+
+比如 `ConsumeClaim` 里只是把消息丢给内部 worker pool，然后立即 `MarkMessage`。如果自动提交 ticker 到点触发了 `Commit()`，而后台业务其实还没真正完成，就会产生"offset 领先于业务"的现象。`mainLoop()` 的自动提交就是按时间驱动的，它并不理解你的业务完成状态。
+
+### 3）业务把"放入本地队列"误当作"处理成功"
+
+Sarama 只知道你什么时候调用 `MarkMessage/Commit`，它不知道"真正业务成功"的定义。你一旦过早标记，它就会忠实地把 offset 往前推。
+
+所以这条主线的核心结论是：
+
+> **Sarama 提交的是"消费位置"，不是"业务结果"。**
+
+---
+
+## 六、`OffsetCommitRequest / Response` 进一步说明了什么
+
+`OffsetCommitRequest` 里携带的是：
+
+- `ConsumerGroup`
+- `ConsumerGroupGeneration`
+- `ConsumerID`
+- 可选的 `GroupInstanceId`
+- 各 topic/partition 的 offset block
+
+这说明 commit 从协议层就是一件"**把某个 group / generation / member 的消费位点写入协调器**"的事，而不是"向 broker 汇报业务执行成功"。
+
+`OffsetCommitResponse` 则返回每个 `topic -> partition` 的 `KError`。Sarama 只有在某个 partition 返回 `ErrNoError` 时，才会把该 partition 的 dirty 状态清掉。也就是说，commit 是按 partition 分别确认的，不是一个抽象的"整体成功"。
+
+这再次说明：
+
+> **offset commit 的成功条件，是 Kafka 协议成功响应，不是业务代码返回 nil。**
+
+---
+
+## 七、用一条时间线看最容易懂
+
+假设你消费到消息 `offset=100`。
+
+如果你在业务完成后调用 `MarkMessage(msg)`，Sarama 实际记下来的是 `101`，表示"下次从 101 开始读"。这时只是本地 `pom.offset=101, dirty=true`。
+
+随后会有三种可能：
+
+**第一种，自动提交或手动 `Commit()` 成功。** `flushToBroker()` 发出 `OffsetCommitRequest`，响应里该 partition 返回 `ErrNoError`，`updateCommitted` 把 dirty 清掉。这时才是"业务已成功，offset 也已正式提交"。
+
+**第二种，你已经处理成功，也已经 `MarkMessage`，但进程崩了或 rebalance 超时，最终 commit 没完成。** 重启后还会从旧 offset 再读一次，于是出现重复消费。
+
+**第三种，你在真正业务成功前就 `MarkMessage + Commit` 了。** 这样 Kafka 端保存的是 101，但业务其实没落地。重启后会从 101 开始，100 不会重来，于是形成"消息被跳过"。
+
+---
+
+## 八、Offset 提交完整时序图
+
+### 正确链路（业务成功 → 再提交）
+
+```
+Kafka Broker
+     │
+     │  FetchResponse(offset=100)
+     ▼
+Sarama Consumer (ConsumeClaim goroutine)
+     │  收到 msg(offset=100)
+     ▼
+业务处理逻辑
+     │  ✅ DB写入 / RPC成功 / 状态落地
+     ▼
+session.MarkMessage(msg)   ← 只更新本地 offset=101 (dirty=true)
+     │  (等待自动提交 或 手动 Commit)
+     ▼
+session.Commit()
+     │
+     ▼
+offsetManager.flushToBroker()
+     │  OffsetCommitRequest(offset=101)
+     ▼
+Kafka Coordinator
+     │  持久化 offset=101
+     ▼
+OffsetCommitResponse(OK)
+     │
+     ▼
+本地 dirty=false（真正提交完成）
+```
+
+---
+
+## 九、4 种最常见错误用法
+
+### ❌ 错误用法 1：先 Mark，再处理业务
+
+```go
+for msg := range claim.Messages() {
+    session.MarkMessage(msg, "")  // ❌ 提前标记
+
+    doBusiness(msg)               // ❗ 这里才处理业务
+}
+```
+
+如果业务失败：offset 已提交 → Kafka 不会重放 → **数据丢失**。
+
+**正确写法：**
+
+```go
+for msg := range claim.Messages() {
+    err := doBusiness(msg)
+    if err == nil {
+        session.MarkMessage(msg, "")
+    }
+}
+```
+
+---
+
+### ❌ 错误用法 2：异步处理 + 立即 Mark
+
+```go
+for msg := range claim.Messages() {
+    go process(msg)              // ❗ 异步处理
+    session.MarkMessage(msg, "") // ❌ 立刻提交
+}
+```
+
+结果：offset 提前推进，但 goroutine 还没执行完。进程崩溃时 **消息直接丢失**。
+
+**正确做法：**
+
+```go
+// 方案1：同步处理（最安全）
+for msg := range claim.Messages() {
+    process(msg)
+    session.MarkMessage(msg, "")
+}
+
+// 方案2：异步 + ack机制
+done := make(chan struct{})
+go func() {
+    process(msg)
+    close(done)
+}()
+<-done
+session.MarkMessage(msg, "")
+```
+
+---
+
+### ❌ 错误用法 3：依赖自动提交（不理解窗口期）
+
+```go
+config.Consumer.Offsets.AutoCommit.Enable = true
+config.Consumer.Offsets.AutoCommit.Interval = 5 * time.Second
+```
+
+你以为：业务成功 → offset 自动提交
+
+实际：业务成功 → 等最多 5 秒 → 才提交
+
+这期间崩溃或 rebalance，就会导致重复消费。
+
+**建议：** 高一致性场景关闭自动提交，使用手动 Commit；高吞吐场景接受重复消费并做好幂等。
+
+---
+
+### ❌ 错误用法 4：忽略 rebalance 收尾
+
+```go
+for msg := range claim.Messages() {
+    time.Sleep(10 * time.Second) // ❌ 阻塞
+    session.MarkMessage(msg, "")
+}
+```
+
+rebalance 触发时 `ConsumeClaim` 的 context 会被 cancel，但如果 handler 还在 sleep，rebalance timeout 超时后 consumer 被踢出 group，最后一次 commit 失败，重启后出现大量重复消费。
+
+**正确做法：**
+
+```go
+select {
+case msg := <-claim.Messages():
+    process(msg)
+    session.MarkMessage(msg, "")
+case <-session.Context().Done():
+    return  // ✅ 立刻响应 rebalance
+}
+```
+
+---
+
+## 十、给你的实践判断标准
+
+用这 4 句话快速判断代码是否安全：
+
+1. **Mark 是不是在业务成功之后？**
+2. **有没有异步导致"先提交后处理"？**
+3. **Commit 是不是可控的（而不是完全依赖 auto）？**
+4. **rebalance 时能不能 1 秒内退出？**
+
+只要有一个答"否"，就一定会出现：**重复消费 或 数据丢失**。
+
+---
+
+## 十一、架构级总结
+
+```
+Kafka offset ≠ 业务成功
+Kafka offset = 下次从哪读
+```
+
+**正确顺序必须是：**
+
+```
+消费 → 业务成功 → Mark → Commit
+```
+
+**错误顺序（一定出问题）：**
+
+```
+消费 → Mark → 业务
+消费 → 异步业务 → Mark
+消费 → Mark → 等自动提交
+rebalance 时不退出
+```
+
+Sarama 提交的不是"业务完成状态"，而是"消费游标"。真正要保证的不是"offset 正确"，而是：
+
+> **业务幂等 + 正确提交时机 + 可控提交策略**

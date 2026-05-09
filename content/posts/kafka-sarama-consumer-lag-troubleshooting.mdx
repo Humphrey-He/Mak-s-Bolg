@@ -1,0 +1,407 @@
+---
+slug: "kafka-sarama-consumer-lag-troubleshooting"
+title: "Kafka 消费堆积排障框架：先分层再定根因，不要先怀疑 Kafka"
+description: "Sarama 消费堆积的 6 种根因分类与对应的解决方向：session 不稳、业务处理慢、提交错位、热点 partition、下游依赖阻塞、拉取层失效。"
+date: "2026-05-09"
+tag: "Go / Cache"
+readTime: "18 min"
+top: false
+featured: false
+---
+
+> **核心观点：** 在 Sarama 里看"消费堆积"，不要先问"是不是 Kafka 慢"，而要先判断：**堆积到底卡在了哪一层。** 因为同样是 lag 上升，根因可能完全不同。
+
+---
+
+## 一、排障框架：消费堆积看 4 层
+
+把 Sarama Consumer Group 的消费链拆成 4 层来看：
+
+```
+Kafka Broker
+  ↓
+Fetch / Claim 层
+  ↓
+ConsumeClaim 处理层
+  ↓
+Mark / Commit 层
+  ↓
+Consumer Group 协调层
+```
+
+对应到 Sarama 语义：
+
+1. **拉取层**：有没有稳定拿到 `claim.Messages()`
+2. **处理层**：`ConsumeClaim()` 里业务是否变慢/阻塞
+3. **提交层**：`MarkMessage / Commit` 是否及时成功
+4. **会话层**：`JoinGroup / SyncGroup / Heartbeat / Rebalance` 是否稳定
+
+---
+
+## 二、堆积的 5 种典型类型
+
+### 类型 A：Lag 持续上升，但 Consumer CPU 很低
+
+**典型特征：**
+- group lag 越来越大
+- 实例 CPU 不高
+- 网络也不高
+- `ConsumeClaim()` 日志很少
+- 可能还伴随 rebalance 日志
+
+**说明什么：** 大概率不是"处理不过来"，而是 session 没稳定建立、claim 没真正消费起来、fetch 没持续推进、或 rebalance 把消费打断了。
+
+**优先怀疑：** `ErrRebalanceInProgress`、`ErrUnknownMemberId`、handler 没及时退出、coordinator 不稳定、topic/partition 变更过于频繁。
+
+**解决方向：** 先治**会话稳定性**，不是先扩机器。
+
+---
+
+### 类型 B：Lag 上升，Consumer CPU 很高
+
+**典型特征：**
+- `claim.Messages()` 一直有数据
+- 业务线程很忙
+- CPU 飙高
+- GC 压力大
+- commit 大体正常
+
+**说明什么：** 大概率是纯处理能力瓶颈：反序列化重、JSON/Proto 解码慢、业务逻辑重、单消息处理耗时太长、单实例吞吐不够。
+
+**优先怀疑：** 业务代码太重、每条消息同步调用外部服务、批处理没有做、热 partition 导致单线程瓶颈。
+
+**解决方向：** 优化业务处理路径、提高并行度、拆批、扩 partition。
+
+---
+
+### 类型 C：Lag 不算特别高，但反复回退 / 重复消费明显
+
+**典型特征：**
+- 看起来消费了很多
+- 重启后又从旧 offset 开始
+- lag 曲线锯齿明显
+- "明明处理成功了还重复来"
+
+**说明什么：** 大概率是业务处理完成了，但 offset commit 没稳住。
+
+**优先怀疑：** 自动提交窗口过大、rebalance 时 final commit 失败、业务成功后没及时 commit、提前退出/崩溃导致 dirty offset 未刷出。
+
+**解决方向：** 先治**提交策略**，不是先治消费速度。
+
+---
+
+### 类型 D：某几个 partition 堆积特别严重，其他 partition 很正常
+
+**典型特征：**
+- 总体看 group 消费还行
+- 但个别 partition lag 特别大
+- 扩副本数/消费者数效果很差
+
+**说明什么：** 大概率是**热点 partition**或**分区不均衡**。
+
+**优先怀疑：** key 分布不均、某个大客户/大租户流量集中、顺序消费语义限制了并发、sticky/range 分配下负载不均。
+
+**解决方向：** 从**生产分区策略**和**topic 设计**入手，不是简单加 consumer。
+
+---
+
+### 类型 E：Lag 上升，同时大量超时、DB/RPC 错误
+
+**典型特征：**
+- 消费线程看起来活着
+- 但消息处理耗时越来越长
+- 外部依赖错误率升高
+- goroutine 数量增加
+- commit 开始失败
+
+**说明什么：** 不是 Kafka 本身的问题，是**下游依赖把消费拖死了**。
+
+**优先怀疑：** DB 慢 SQL、Redis 抖动、HTTP/RPC 超时、线程池/worker pool 打满、内部 channel 堵塞。
+
+**解决方向：** 先治下游依赖和背压，不是先调 Kafka 参数。
+
+---
+
+## 三、排障顺序：5 步定位根因
+
+### 第一步：确认是"没拉到"还是"拉到了处理不动"
+
+在 `ConsumeClaim()` 里至少打三类指标：
+
+- 收到消息数
+- 业务成功数
+- Mark/Commit 成功数
+
+```
+收到消息 10000/s
+业务成功 3000/s
+commit 成功 2900/s
+```
+
+**解读：**
+
+- "收到消息数"很低 → 卡在 fetch / claim / rebalance / session 层
+- "收到消息很多，业务成功少" → 卡在业务处理层
+- "业务成功很多，commit 少" → 卡在 offset 提交层
+
+---
+
+### 第二步：看 session 是否稳定
+
+Sarama Consumer Group 最大的坑不是处理逻辑本身，而是**session 不稳定**。
+
+**重点看这些日志/错误：**
+- `ErrRebalanceInProgress`
+- `ErrUnknownMemberId`
+- `ErrIllegalGeneration`
+- `ErrNotCoordinatorForConsumer`
+- `ErrFencedInstancedId`
+
+**还要看：**
+- 每分钟 rebalance 次数
+- 单次 session 平均存活时间
+- `Consume()` 是否在频繁返回又重进
+- `Cleanup()` 是否很慢
+- `session.Context().Done()` 之后 handler 是否立刻退出
+
+如果 rebalance 很频繁，lag 本质不是"消费慢"，而是：**消费者一直在换届，没进入稳定消费态。**
+
+**解决办法：**
+1. 先让 `ConsumeClaim()` 能快速响应 `session.Context().Done()`
+2. `Cleanup()` 不做重操作
+3. 控制发布节奏，避免频繁上下线
+4. 慎用 static membership，避免 fencing
+5. topic partition 频繁变更时注意组抖动
+
+---
+
+### 第三步：看业务处理路径是不是瓶颈
+
+**重点指标：**
+- 单条消息处理耗时 p50/p95/p99
+- 外部依赖耗时
+- worker pool 队列长度
+- goroutine 数
+- CPU / GC / alloc
+- 每个 partition 的处理速率
+
+**典型排查方法：**
+
+在 `ConsumeClaim()` 内埋点，记录收到消息时间、业务开始/结束时间、Mark 时间、Commit 时间。
+
+看 goroutine dump，如果大量 goroutine 卡在 DB、HTTP client、channel send/recv、mutex，那不是 Kafka 堆积，是业务线程堵住了。
+
+**解决办法：**
+1. 所有外部调用必须带 timeout
+2. 业务处理拆成快路径 + 异步后处理
+3. 批处理代替逐条远程调用
+4. 控制内部队列长度，建立背压
+5. 避免 claim goroutine 里做长时间阻塞
+
+---
+
+### 第四步：看 offset 提交是不是错觉
+
+**要查什么：**
+- `MarkMessage` 调用次数
+- `Commit` 调用次数
+- commit 错误率
+- rebalance 时 final commit 是否失败
+- AutoCommit interval 是否过大
+
+**现象 1：业务成功很多，但 lag 降不快**
+
+可能是：只 Mark 没 Commit、AutoCommit 间隔太大、commit 失败、generation 失效后 commit 被拒。
+
+**现象 2：重启后重复消费明显**
+
+可能是：dirty offset 没刷出、shutdown/rebalance 时未完成 final commit。
+
+**解决办法：**
+1. 高一致性场景关闭 AutoCommit
+2. 业务成功后按条/按批手动 Commit
+3. 在 `session.Context().Done()` 时尽快收尾并最后 flush
+4. 保证消费逻辑幂等，接受 at-least-once 现实
+
+---
+
+### 第五步：看是不是热点 partition
+
+不能只看 group 总 lag，要看：
+
+- 每个 topic-partition 的 lag
+- 每个 partition 的消费速率
+- 每个 partition 的消息大小
+- key 分布
+
+如果 1 个 partition lag 10 万，其他 partition lag 几乎为 0，说明不是 group 总体吞吐不够，而是**负载倾斜**。
+
+**解决办法：**
+1. 优化 producer 分区键
+2. 增加 partition 数
+3. 对热点 key 做更细粒度打散
+4. 如果业务允许，拆 topic
+5. 如果必须顺序消费，接受单 partition 上限并做架构分流
+
+---
+
+## 四、堆积定位矩阵
+
+| 现象 | 更可能的根因 | 优先排查 |
+|------|------------|---------|
+| lag 上升，CPU 低 | session/fetch 问题 | rebalance、coordinator、claim 是否建立 |
+| lag 上升，CPU 高 | 业务处理瓶颈 | handler、反序列化、下游依赖 |
+| lag 回退、重复消费多 | commit 不稳 | Mark/Commit、AutoCommit、final commit |
+| 个别 partition 堆积 | 热点分区 | key 分布、partition 数 |
+| lag 上升伴随外部超时 | 下游依赖问题 | DB/RPC/Redis/内部队列 |
+
+---
+
+## 五、最常见的 6 个堆积根因
+
+### 1）`ConsumeClaim()` 里做了重阻塞逻辑
+
+慢 SQL、RPC 无 timeout、大对象序列化、同步批处理。
+
+**治法：** timeout、限流、批处理、异步后移、幂等化。
+
+---
+
+### 2）Rebalance 频繁，session 一直重建
+
+**治法：** 减少频繁发布/扩缩容、快速退出 claim、优化 `Cleanup()`、稳定 coordinator 连接、控制 group 抖动。
+
+---
+
+### 3）自动提交窗口过大
+
+**治法：** 关闭 AutoCommit、手动 commit、缩短间隔但注意 coordinator 压力。
+
+---
+
+### 4）热点 partition
+
+**治法：** 优化 key、扩 partition、拆热点 topic、改路由策略。
+
+---
+
+### 5）Worker pool / channel 堵塞
+
+很多人把消息丢给内部 goroutine pool，结果内部队列满了，claim goroutine 也卡住。
+
+**治法：** 队列可观测、明确背压、不要无限缓存、worker pool 满时做降级/拒绝。
+
+---
+
+### 6）误把 offset 提交当业务完成
+
+导致：提前提交 → 数据丢；延迟提交过久 → 大量重复。
+
+**治法：** 业务成功后再 Mark、Commit 策略明确化、做幂等，不幻想 offset=业务成功。
+
+---
+
+## 六、必建的排查指标体系
+
+### 消费流量指标
+- `consume_messages_total`
+- `consume_bytes_total`
+- `consume_batch_size`
+
+### 处理耗时指标
+- `business_handle_duration_ms`
+- `deserialize_duration_ms`
+- `downstream_rpc_duration_ms`
+- `db_duration_ms`
+
+### 提交指标
+- `mark_total`
+- `commit_total`
+- `commit_fail_total`
+- `commit_duration_ms`
+
+### Group 稳定性指标
+- `rebalance_total`
+- `session_lifetime_ms`
+- `join_group_fail_total`
+- `heartbeat_fail_total`
+
+### 分区维度指标
+- `lag{topic,partition}`
+- `consume_rate{topic,partition}`
+- `handle_duration{topic,partition}`
+
+只看总 lag 是远远不够的。
+
+---
+
+## 七、解决方向决策树
+
+### 场景 1：session 抖动
+
+**现象：** rebalance 多、CPU 低、lag 不断涨
+
+**解决：** 先稳 group、快速响应 `session.Context().Done()`、优化 shutdown/cleanup、控制发布和扩缩容节奏
+
+---
+
+### 场景 2：业务慢
+
+**现象：** 消息拿得到、处理耗时高、CPU/下游耗时高
+
+**解决：** 优化业务逻辑、批处理、异步化、外部依赖超时和隔离、扩 partition/consumer
+
+---
+
+### 场景 3：commit 不稳
+
+**现象：** 重复消费多、lag 回退、final commit 失败
+
+**解决：** 关闭 AutoCommit、手动 Commit、业务成功后再 Mark、rebalance 收尾要快、做幂等
+
+---
+
+### 场景 4：热点 partition
+
+**现象：** 少数 partition lag 巨高、其他都正常
+
+**解决：** 改 key、增 partition、热点拆分、顺序约束下做业务分流
+
+---
+
+### 场景 5：下游依赖拖垮
+
+**现象：** Kafka 本身正常、DB/RPC 慢、消费线程阻塞
+
+**解决：** 下游限流/熔断/隔离、任务异步化、引入缓冲但要可控、降级策略
+
+---
+
+## 八、实战判断口诀
+
+遇到 Sarama 消费堆积，先问这 5 句：
+
+1. **到底有没有稳定拉到消息？**
+2. **session 是否频繁重建？**
+3. **消息卡在业务处理，还是卡在 commit？**
+4. **是整体慢，还是少数 partition 热点？**
+5. **根因在 Kafka，还是在下游依赖？**
+
+这 5 个问题回答清楚，解决方向基本就定了。
+
+---
+
+## 九、总结
+
+**Sarama 里的消费堆积，本质不是"lag 大了"这么简单，而是：消费链路里的某一层失去了稳态。**
+
+你要做的不是一上来扩容，而是先判断是：
+
+- **会话不稳** — rebalance/coordination
+- **拉取不畅** — fetch/claim
+- **处理变慢** — 业务逻辑/反序列化
+- **提交错位** — Mark/Commit 时机
+- **热点倾斜** — key 分布不均
+- **下游阻塞** — DB/RPC/Redis/worker pool
+
+定位清楚层次，再给对应解法，才是资深开发和架构师该做的排障方式。

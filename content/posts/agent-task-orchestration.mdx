@@ -1,0 +1,1135 @@
+---
+slug: "agent-task-orchestration"
+title: "Agent 任务编排设计：从 ReAct、Tree of Thoughts 到 LangGraph 与 Handoff"
+description: "系统梳理主流 Agent 编排模式：ReAct Loop、Tree of Thoughts、Self-Refine、多 Agent Handoff 与图状态机编排，并给出一套成熟可落地的生产级 Agent 编排流程。"
+date: "2026-05-09"
+tag: "AI Agent"
+readTime: "24 min"
+top: false
+featured: true
+---
+
+Agent 系统的复杂度不在于"调用一次大模型"，而在于**如何控制多步任务的执行过程**。
+
+一个真实 Agent 往往需要完成这样的流程：
+
+```text
+理解目标
+→ 拆解任务
+→ 检索资料
+→ 调用工具
+→ 判断结果是否足够
+→ 失败后重试
+→ 必要时转交给专家 Agent
+→ 生成结果
+→ 自我检查
+→ 人类确认
+→ 执行发布或落库
+```
+
+如果没有编排层，Agent 很容易退化成一个危险的 while 循环：
+
+```text
+while not done:
+    ask_llm()
+    maybe_call_tool()
+```
+
+这种写法在 Demo 中可以跑，但在生产环境里很快会遇到问题：
+
+```text
+什么时候停止？
+失败是否重试？
+工具调用是否越权？
+中间状态如何保存？
+人类审批插在哪里？
+多 Agent 如何协作？
+如何复现一次失败任务？
+如何评估每一步是否正确？
+```
+
+因此，Agent 编排的核心不是让模型"更自由"，而是**在模型决策和工程控制之间建立可观测、可恢复、可评测的执行结构**。
+
+这篇文章讨论五类主流编排思想：
+
+1. **ReAct**：推理—行动—观察循环；
+2. **Tree of Thoughts**：多路径探索、自评估和回溯；
+3. **Self-Refine**：生成—反馈—修正的迭代改进；
+4. **LangGraph**：长运行、有状态 Agent 的图状态机编排；
+5. **OpenAI Agents SDK Handoffs**：agents-as-tools 与多 Agent 转交。
+
+最后我会给出一条适合生产落地的成熟流程：**Graph-based ReAct + Specialist Handoff + Self-Refine Verification**。
+
+---
+
+## 一、为什么 Agent 需要编排层？
+
+普通 LLM 调用是一次性生成：
+
+```text
+input → model → output
+```
+
+但 Agent 是多步执行：
+
+```text
+goal → plan → act → observe → revise → act → verify → final
+```
+
+这里的关键问题是：**谁控制流程？**
+
+如果全部由代码控制，就是传统 workflow：
+
+```text
+Step A
+→ Step B
+→ Step C
+→ End
+```
+
+如果全部由模型控制，就是高自由 Agent：
+
+```text
+模型自己决定下一步
+模型自己决定工具
+模型自己决定何时结束
+```
+
+两者都有问题。
+
+传统 workflow 可控，但灵活性差；全自由 Agent 灵活，但不稳定、难评测、难治理。
+
+生产系统需要的是中间形态：
+
+> 开发者定义状态机边界，模型在边界内做局部决策。
+
+这就是现代 Agent 编排的核心原则。
+
+---
+
+## 二、ReAct：最基础也最实用的 Agent Loop
+
+ReAct 是 Agent 编排的基础范式之一。它的核心思想是让模型交替生成 reasoning traces 和 task-specific actions。推理轨迹帮助模型制定、跟踪和更新行动计划，行动则让模型连接外部知识库或环境，获取新的观察结果。
+
+ReAct 的基本循环是：
+
+```text
+Thought
+→ Action
+→ Observation
+→ Thought
+→ Action
+→ Observation
+→ Final Answer
+```
+
+它把模型从"一次性回答"变成"边想边做"。
+
+### 2.1 ReAct 的优点
+
+ReAct 最大的优点是简单而有效。
+
+它解决了两个问题。
+
+第一，纯 Chain-of-Thought 可能会在错误假设上持续推理，产生错误传播。ReAct 通过 Action 获取外部观察，可以修正推理。论文在 HotpotQA、FEVER 等问答和事实验证任务中展示了 ReAct 通过与 Wikipedia API 交互，能缓解幻觉和错误传播问题。
+
+第二，纯工具调用缺少解释性。ReAct 的 Thought 让每一步行动有了可解释轨迹，更容易调试和理解。
+
+### 2.2 ReAct 的不足
+
+ReAct 也有明显局限。
+
+```text
+1. 容易陷入循环；
+2. 每一步都依赖模型判断，稳定性不足；
+3. 缺少全局规划能力；
+4. 对复杂任务没有天然回溯机制；
+5. 生产中不能直接暴露完整 reasoning trace；
+6. 工具选择错误时可能连续错误。
+```
+
+特别是在生产环境中，ReAct 的 "Thought" 不能简单暴露给用户，也不能完全作为可信执行依据。更安全的做法是保留结构化执行日志，而不是暴露模型内部推理文本。
+
+### 2.3 ReAct 的工程定位
+
+我的判断是：
+
+> ReAct 适合作为 Agent 的局部执行循环，不适合作为完整生产编排架构。
+
+也就是说，ReAct 应该被包在状态机节点里。例如：
+
+```text
+Research Node:
+  使用 ReAct 在 search_docs / read_paper / extract_claims 工具之间循环
+```
+
+而不是让整个系统只有一个无边界 ReAct loop。
+
+---
+
+## 三、Tree of Thoughts：复杂任务需要搜索，而不是单一路径推理
+
+Tree of Thoughts, ToT，解决的是另一个问题：很多任务不是沿着一条推理路径走到底就能完成，而是需要探索多个候选路径、评估、回溯和选择。
+
+ToT 论文指出，传统语言模型推理通常受限于从左到右的 token 级决策，而复杂任务需要探索、战略性前瞻和回溯。ToT 将推理过程扩展为对多个"thoughts"组成的路径进行搜索，并让模型自评估候选路径。
+
+ToT 的基本结构是：
+
+```text
+Generate multiple thoughts
+→ Evaluate thoughts
+→ Select promising branches
+→ Expand
+→ Backtrack if needed
+→ Final solution
+```
+
+论文在 Game of 24、Creative Writing、Mini Crosswords 等需要非平凡规划或搜索的任务上显著提升了表现；例如 Game of 24 中，GPT-4 + Chain-of-Thought 只解决了 4% 的任务，而 ToT 达到 74%。
+
+### 3.1 ToT 的优点
+
+ToT 的价值在于三点。
+
+第一，它承认初始路径可能是错的。模型不应该被第一条生成路径绑死。
+
+第二，它把推理从线性生成变成搜索问题。
+
+第三，它引入自评估，使模型可以在执行前比较多个方案。
+
+这对 Agent 非常重要。例如写一篇技术文章时，可以先生成多个大纲：
+
+```text
+大纲 A：按论文时间线组织
+大纲 B：按工程模块组织
+大纲 C：按问题-方法-生产落地组织
+```
+
+然后评估哪个更适合用户需求，再展开。
+
+### 3.2 ToT 的不足
+
+ToT 的代价也很明显。
+
+```text
+1. Token 成本高；
+2. 延迟高；
+3. 搜索空间容易爆炸；
+4. 自评估不一定可靠；
+5. 不适合所有任务；
+6. 生产系统中需要设置深度、宽度和预算限制。
+```
+
+如果把所有任务都用 ToT，会非常昂贵。ToT 应该用于高价值、高复杂度、高不确定性的节点，例如：
+
+```text
+复杂计划生成
+架构设计
+论文比较
+多方案决策
+长文大纲设计
+工具链选择
+```
+
+### 3.3 ToT 的工程定位
+
+我的判断是：
+
+> ToT 适合做"规划节点"和"决策节点"，不适合做每一步执行循环。
+
+也就是说，它适合在任务开始时用来生成和评估计划：
+
+```text
+Planning Node:
+  生成 3-5 条候选计划
+  评估风险、成本、成功概率
+  选择最优计划
+```
+
+执行阶段仍然应该用更受控的状态机和工具调用。
+
+---
+
+## 四、Self-Refine：生成结果不应该一次定稿
+
+Self-Refine 的核心思想是：LLM 的第一次输出通常不是最优的，可以让同一个模型生成初稿、反馈并修正。论文提出一个不需要监督数据、额外训练或强化学习的方法：使用同一个 LLM 作为 generator、feedback provider 和 refiner，通过迭代反馈和修正提升输出质量。
+
+Self-Refine 的流程是：
+
+```text
+Generate initial output
+→ Feedback
+→ Refine
+→ Feedback
+→ Refine
+→ Stop
+```
+
+论文在 7 类任务上评估 Self-Refine，覆盖对话生成、数学推理等，并报告相对传统一次性生成，Self-Refine 在人工偏好和自动指标上平均提升约 20 个百分点。
+
+### 4.1 Self-Refine 的优点
+
+Self-Refine 的价值在于它非常容易落地。
+
+不需要训练模型，不需要额外标注数据，不需要复杂环境，只需要把"生成"和"评审"拆开。
+
+适合这些任务：
+
+```text
+文章写作
+代码重构
+摘要润色
+计划优化
+Prompt 改写
+SQL 修正
+需求文档完善
+```
+
+### 4.2 Self-Refine 的不足
+
+Self-Refine 的主要问题是：模型自己评自己，可能出现"自我确认偏误"。
+
+常见失败：
+
+```text
+反馈很空泛
+修正幅度很小
+错误观点被保留
+越改越啰嗦
+没有外部标准
+```
+
+因此，生产系统不能只靠纯 Self-Refine。更好的方式是把反馈来源分成三类：
+
+```text
+模型自评
+规则校验
+外部工具验证
+```
+
+例如写技术文章：
+
+```text
+模型自评：逻辑是否清楚？
+规则校验：是否有标题、摘要、引用？
+外部验证：引用链接是否有效？
+```
+
+### 4.3 Self-Refine 的工程定位
+
+我的判断是：
+
+> Self-Refine 适合放在输出生成后的质量改进节点，而不是作为全局任务控制器。
+
+它适合这些节点：
+
+```text
+Draft → Review → Revise
+Plan → Critique → Improve
+Code → Test Error → Fix
+Answer → Faithfulness Check → Rewrite
+```
+
+---
+
+## 五、LangGraph：把 Agent 从 while loop 变成状态图
+
+论文给我们范式，但生产落地需要运行时框架。LangGraph 的价值在这里。
+
+LangGraph 官方文档将其定位为支持长运行、有状态 workflow 或 Agent 的底层基础设施；它不抽象 prompt 或架构，而是提供用于构建、管理和部署有状态 Agent 的低层级编排能力。
+
+这点非常关键。LangGraph 不是告诉你该用什么 Agent 架构，而是给你一种表达架构的方式。
+
+### 5.1 图编排的基本思想
+
+图编排把任务拆成节点和边：
+
+```text
+Node：执行一个明确步骤
+Edge：决定下一步去哪里
+State：保存任务上下文
+Checkpoint：持久化中间状态
+```
+
+例如：
+
+```text
+Start
+→ ClassifyTask
+→ Plan
+→ Retrieve
+→ ExecuteTools
+→ Verify
+→ HumanApproval
+→ Publish
+→ End
+```
+
+每个节点可以是 LLM、工具、规则、人工审批或子图。
+
+### 5.2 LangGraph 的优点
+
+图编排的核心优势是生产友好：
+
+```text
+1. 状态可持久化；
+2. 失败可恢复；
+3. 节点可单独测试；
+4. 人类审批容易插入；
+5. 分支逻辑清楚；
+6. 可观测性更好；
+7. 可以限制 Agent 自由度。
+```
+
+这正是 ReAct / ToT / Self-Refine 这些范式本身没有解决的工程问题。
+
+### 5.3 LangGraph 的不足
+
+图编排的代价是设计成本更高。
+
+```text
+1. 需要提前定义状态结构；
+2. 需要设计节点边界；
+3. 图过大后维护复杂；
+4. 对简单任务可能过度设计；
+5. 仍然需要你自己设计 prompt、工具和评测。
+```
+
+因此，LangGraph 适合中复杂任务，不适合所有简单问答。
+
+### 5.4 LangGraph 的工程定位
+
+我的判断是：
+
+> LangGraph 这类图状态机，是生产级 Agent 编排的主干；ReAct、ToT、Self-Refine 应该作为图中的局部节点策略。
+
+这句话很重要。
+
+正确组合方式不是：
+
+```text
+ReAct vs ToT vs Self-Refine vs LangGraph
+```
+
+而是：
+
+```text
+LangGraph 负责整体流程
+ReAct 负责工具执行节点
+ToT 负责规划节点
+Self-Refine 负责质量修正节点
+```
+
+---
+
+## 六、OpenAI Agents SDK：Handoff 和 agents-as-tools
+
+OpenAI Agents SDK 的编排文档给出了两种多 Agent 模式：**agents-as-tools** 和 **handoffs**。当主 Agent 需要保持最终回答责任时，可以把专家 Agent 当作工具调用；当任务应该由另一个专家接管时，则使用 handoff。
+
+Handoff 文档进一步说明，handoff 允许一个 Agent 把任务委托给另一个 Agent，适合不同 Agent 专精不同领域的场景；并且 handoffs 会被表示为给 LLM 的工具，例如 `transfer_to_refund_agent`。
+
+### 6.1 agents-as-tools
+
+这种模式中，主 Agent 保持控制权：
+
+```text
+Manager Agent
+├── call Research Agent as tool
+├── call Writer Agent as tool
+├── call Reviewer Agent as tool
+└── final answer by Manager Agent
+```
+
+优点：
+
+```text
+结果统一
+控制权清晰
+适合 manager-style workflow
+专家输出可被主 Agent 整合
+```
+
+适合：
+
+```text
+文章生成
+报告分析
+代码审查
+多工具综合任务
+```
+
+### 6.2 Handoff
+
+Handoff 中，控制权转移给专家 Agent：
+
+```text
+Triage Agent
+→ transfer_to_billing_agent
+→ Billing Agent takes over
+```
+
+优点：
+
+```text
+适合领域强分工
+每个 Agent 可以有不同工具权限
+上下文和系统提示更专门
+减少单 Agent prompt 复杂度
+```
+
+适合：
+
+```text
+客服路由
+企业助手
+多角色工作流
+复杂领域切换
+```
+
+### 6.3 Handoff 的风险
+
+Handoff 如果设计不好，会造成：
+
+```text
+上下文泄漏
+责任不清
+循环转交
+权限扩大
+用户体验割裂
+```
+
+因此，handoff 必须定义：
+
+```text
+什么时候允许转交？
+转交给谁？
+转交哪些上下文？
+是否需要用户确认？
+新 Agent 具备哪些工具权限？
+是否允许转回来？
+```
+
+我的判断是：
+
+> Handoff 不应该作为默认多 Agent 模式。能用 agents-as-tools 解决的，优先让主 Agent 保持控制权；只有任务领域真正切换时，才使用 handoff。
+
+---
+
+## 七、主流编排模式对比
+
+| 模式                  | 核心思想              | 优点             | 缺点                | 适用场景          |
+| ------------------- | ----------------- | -------------- | ----------------- | ------------- |
+| Workflow            | 代码定义固定流程          | 稳定、可控、易测       | 灵活性弱              | 确定性业务流程       |
+| ReAct               | 推理-行动-观察循环        | 简单、解释性好、适合工具调用 | 易循环、全局规划弱         | 工具执行、探索性任务    |
+| Tree of Thoughts    | 多路径搜索与自评估         | 适合复杂规划和回溯      | 成本高、延迟高           | 复杂决策、规划、大纲设计  |
+| Self-Refine         | 生成-反馈-修正          | 易落地、提升输出质量     | 自评可能不可靠           | 写作、代码、总结、计划优化 |
+| Graph State Machine | 节点+状态+边           | 可恢复、可观测、生产友好   | 设计成本高             | 长任务、复杂 Agent  |
+| agents-as-tools     | 主 Agent 调专家 Agent | 控制权清晰、结果统一     | 主 Agent prompt 复杂 | 报告、写作、综合分析    |
+| Handoff             | 专家 Agent 接管任务     | 领域分工强、权限隔离     | 上下文和责任复杂          | 客服、垂直领域切换     |
+
+---
+
+## 八、一条成熟可落地的生产级编排模式
+
+我建议生产系统采用：
+
+> Graph-based ReAct + Specialist-as-Tool + Self-Refine Verification
+
+中文可以叫：
+
+> **图状态机主控 + 局部 ReAct 执行 + 专家工具化协作 + 自我修正验证闭环**
+
+这条模式的原则是：
+
+```text
+1. 整体流程由状态图控制；
+2. 工具执行节点内部使用 ReAct；
+3. 规划节点使用 ToT-lite 生成多方案；
+4. 专家 Agent 以 tools 形式被主 Agent 调用；
+5. 生成结果后使用 Self-Refine 做修正；
+6. 高风险动作进入人工审批；
+7. 全链路 trace、checkpoint、评测。
+```
+
+### 8.1 推荐流程图
+
+```text
+User Goal
+  ↓
+Task Intake
+  ↓
+Classify Task
+  ↓
+Plan with ToT-lite
+  ↓
+Human Confirm? ── yes ──→ Approval
+  ↓ no
+Retrieve / Context Build
+  ↓
+Execute with ReAct Loop
+  ↓
+Specialist Agents as Tools
+  ↓
+Draft Output
+  ↓
+Self-Refine Review
+  ↓
+Verifier / Rule Check
+  ↓
+Human Approval for High-risk Actions
+  ↓
+Final Action / Publish / Response
+  ↓
+Trace + Memory + Evaluation
+```
+
+---
+
+## 九、各节点设计
+
+### 1. Task Intake：任务入口
+
+目标：把用户输入转成结构化任务。
+
+输出：
+
+```json
+{
+  "task_id": "task_001",
+  "goal": "写一篇 Agent 编排技术文章",
+  "task_type": "technical_writing",
+  "risk_level": "low",
+  "expected_output": "mdx_article",
+  "constraints": ["严谨", "逻辑缜密", "结合论文", "给出生产方案"]
+}
+```
+
+这一步不要让 Agent 直接执行。先结构化任务，后续才可控。
+
+---
+
+### 2. Classify Task：任务分类
+
+判断任务属于哪类：
+
+```text
+问答
+写作
+研究
+代码
+发布
+运维
+高风险操作
+```
+
+任务分类决定后续图分支。
+
+例如：
+
+```text
+写作任务 → Research → Outline → Draft → Review
+发布任务 → Validate → Publish → Verify Deployment
+运维任务 → Diagnose → Plan → Human Approval → Execute
+```
+
+---
+
+### 3. Plan with ToT-lite：轻量多方案规划
+
+不要完整 ToT 搜索所有路径，生产中可以用 ToT-lite：
+
+```text
+生成 3 个候选计划
+评估每个计划的优缺点
+选择一个主计划
+保留一个 fallback 计划
+```
+
+示例：
+
+```text
+Plan A：按论文逐篇分析
+Plan B：按编排模式分类
+Plan C：按生产架构主线组织
+```
+
+评估标准：
+
+```text
+逻辑清晰度
+资料覆盖度
+生产落地性
+读者可读性
+成本
+风险
+```
+
+ToT-lite 既吸收了 ToT 的多路径探索能力，又避免搜索成本爆炸。
+
+---
+
+### 4. Retrieve / Context Build：上下文构建
+
+这一步不是简单 RAG，而是为后续 Agent 执行准备上下文。
+
+输入：
+
+```text
+任务目标
+候选计划
+用户偏好
+已有资料
+可用工具
+历史反思
+```
+
+输出：任务上下文包。
+
+包括：
+
+```json
+{
+  "references": ["ReAct", "ToT", "Self-Refine", "LangGraph", "OpenAI Handoffs"],
+  "user_preferences": ["有深度", "逻辑缜密", "结合生产经验"],
+  "tools": ["web_search", "read_paper", "write_mdx"],
+  "constraints": ["必须引用来源", "必须给出落地流程"]
+}
+```
+
+---
+
+### 5. Execute with ReAct Loop：局部执行循环
+
+在具体节点中使用 ReAct，而不是全局无限循环。
+
+例如 Research Node：
+
+```text
+Thought: 需要确认 ReAct 的核心贡献
+Action: search_paper("ReAct")
+Observation: 找到论文摘要和实验结论
+Thought: 需要提取对编排的启发
+Action: extract_claims(...)
+Observation: ...
+```
+
+但必须设置边界：
+
+```text
+max_steps = 5
+max_tool_calls = 8
+timeout = 60s
+stop_condition = enough_evidence
+```
+
+这样可以避免 ReAct 失控。
+
+---
+
+### 6. Specialist Agents as Tools：专家 Agent 工具化
+
+对复杂任务，不要让一个 Agent 做所有事。
+
+设计专家：
+
+```text
+ResearchAgent：负责查资料和提炼观点
+PlannerAgent：负责生成结构和流程
+WriterAgent：负责写正文
+ReviewerAgent：负责批判和修正
+CitationAgent：负责检查引用
+```
+
+但在大多数内容生产任务里，我建议用 agents-as-tools，而不是 handoff。
+
+主 Agent 保持控制权：
+
+```text
+ManagerAgent
+→ call ResearchAgent
+→ call PlannerAgent
+→ call WriterAgent
+→ call ReviewerAgent
+→ final output
+```
+
+这样最终风格统一，责任清楚。
+
+---
+
+### 7. Self-Refine Review：生成后修正
+
+生成初稿后，进入 Self-Refine 节点。
+
+流程：
+
+```text
+Draft
+→ Critique
+→ Revision
+→ Critique
+→ Final
+```
+
+但反馈不能只靠模型自评。要引入规则：
+
+```text
+是否覆盖所有指定资料？
+是否解释每种模式优缺点？
+是否给出成熟流程？
+是否有生产经验判断？
+是否引用来源？
+是否有空泛表述？
+```
+
+这样 Self-Refine 才不会变成无效润色。
+
+---
+
+### 8. Verifier / Rule Check：验证节点
+
+验证节点是生产系统的关键。
+
+检查：
+
+```text
+引用是否存在
+输出格式是否正确
+是否包含 forbidden actions
+是否满足用户约束
+是否超过 token / 长度限制
+是否需要人工确认
+```
+
+对文章生成任务：
+
+```text
+必须有 frontmatter
+必须有参考资料
+必须包含主流模式对比
+必须包含落地流程
+```
+
+---
+
+### 9. Human Approval：人工审批
+
+高风险动作必须审批。
+
+例如：
+
+```text
+发布文章
+修改数据库
+发送邮件
+部署生产
+删除文件
+```
+
+审批内容必须结构化：
+
+```json
+{
+  "action": "publish_article",
+  "article_title": "Agent 任务编排设计",
+  "target_branch": "main",
+  "risk": "medium",
+  "summary": "将生成的 MDX 提交到 GitHub 并触发 Cloudflare Pages 部署"
+}
+```
+
+模型可以建议，但系统决定是否执行。
+
+---
+
+### 10. Trace + Memory + Evaluation：后处理
+
+每次任务结束后，必须记录：
+
+```text
+trace
+工具调用
+模型调用
+成本
+失败原因
+最终质量
+用户反馈
+```
+
+如果任务失败，生成 Reflexion-style 反思：
+
+```text
+失败原因：规划阶段未覆盖 Self-Refine
+改进策略：编排类文章必须先列模式对比，再给落地模式
+```
+
+但反思写入长期记忆前要经过验证。
+
+---
+
+## 十、为什么这条模式成熟可落地？
+
+这条模式的成熟之处在于它没有押注单一范式。
+
+```text
+ReAct 负责行动；
+ToT 负责规划；
+Self-Refine 负责质量改进；
+LangGraph 负责状态和恢复；
+Agents-as-tools 负责专家协作；
+Human Approval 负责风险控制；
+Trace 负责可观测；
+Evaluation 负责持续改进。
+```
+
+它避免了几种常见极端。
+
+### 避免纯 Workflow 的僵硬
+
+固定流程无法处理复杂开放任务。ToT-lite 和 ReAct 让系统有一定灵活性。
+
+### 避免纯 Agent 的失控
+
+状态图、权限、审批、max steps 限制让系统可控。
+
+### 避免多 Agent 混乱
+
+优先使用 agents-as-tools，让主 Agent 保持最终责任。
+
+### 避免自我修正空转
+
+Self-Refine 后面接规则校验和外部验证，避免"模型自己夸自己"。
+
+### 避免失败不可复现
+
+图状态、checkpoint 和 trace 让每一步可回放。
+
+---
+
+## 十一、这套编排模式的伪代码
+
+```ts
+async function runAgentTask(userInput: string) {
+  const task = await intake(userInput);
+
+  const classification = await classifyTask(task);
+
+  const plan = await planWithToTLite({
+    task,
+    candidates: 3,
+    selectBest: true,
+  });
+
+  if (plan.requiresHumanApproval) {
+    await requestApproval(plan);
+  }
+
+  const context = await buildContext({
+    task,
+    plan,
+    memory: true,
+    retrieval: true,
+  });
+
+  const execution = await executeWithBoundedReAct({
+    task,
+    plan,
+    context,
+    maxSteps: 5,
+    maxToolCalls: 8,
+  });
+
+  const specialistOutputs = await callSpecialistsAsTools({
+    managerState: execution.state,
+    specialists: ["research", "writer", "reviewer"],
+  });
+
+  const draft = await generateDraft({
+    task,
+    plan,
+    context,
+    specialistOutputs,
+  });
+
+  const refined = await selfRefine({
+    draft,
+    criteria: [
+      "logical_rigor",
+      "source_coverage",
+      "production_judgment",
+      "actionable_flow",
+    ],
+    maxIterations: 2,
+  });
+
+  const verification = await verifyOutput(refined);
+
+  if (!verification.passed) {
+    return await repairOrEscalate(refined, verification);
+  }
+
+  if (requiresFinalApproval(task)) {
+    await requestApproval({
+      action: "finalize",
+      preview: refined,
+    });
+  }
+
+  await persistTraceAndMemory({
+    task,
+    plan,
+    execution,
+    refined,
+    verification,
+  });
+
+  return refined;
+}
+```
+
+---
+
+## 十二、落地时的关键参数
+
+生产系统必须设置硬边界。
+
+```text
+max_plan_candidates = 3
+max_react_steps = 5
+max_tool_calls = 8
+max_refine_iterations = 2
+max_task_duration = 120s
+max_cost_per_task = $X
+human_approval_required_for = ["publish", "delete", "deploy", "send"]
+```
+
+没有这些限制，Agent 会不可控。
+
+---
+
+## 十三、常见反模式
+
+### 1. 全局 ReAct while loop
+
+问题：
+
+```text
+容易循环
+难恢复
+难调试
+难插入审批
+```
+
+改进：
+
+```text
+把 ReAct 放进图节点，并设置 max steps。
+```
+
+### 2. 所有专家都 handoff
+
+问题：
+
+```text
+上下文割裂
+责任不清
+风格不统一
+```
+
+改进：
+
+```text
+优先 agents-as-tools，必要时再 handoff。
+```
+
+### 3. ToT 用在所有任务上
+
+问题：
+
+```text
+成本高
+延迟高
+收益不稳定
+```
+
+改进：
+
+```text
+只在规划和复杂决策节点使用 ToT-lite。
+```
+
+### 4. Self-Refine 无验证
+
+问题：
+
+```text
+模型可能越改越偏
+```
+
+改进：
+
+```text
+Self-Refine 后接 rule verifier / external evaluator。
+```
+
+### 5. 没有 checkpoint
+
+问题：
+
+```text
+任务失败后只能重跑
+```
+
+改进：
+
+```text
+每个关键节点保存状态。
+```
+
+---
+
+## 十四、我的最终判断
+
+Agent 编排的核心不是选择 ReAct、ToT、Self-Refine、LangGraph 或 Handoff 中的某一个，而是理解它们各自解决的问题。
+
+```text
+ReAct 解决"边想边做"；
+ToT 解决"多路径规划"；
+Self-Refine 解决"输出质量迭代"；
+LangGraph 解决"状态、恢复和工程控制"；
+Handoff 解决"专家接管与职责切换"。
+```
+
+生产级 Agent 编排应该避免两种幼稚设计：
+
+```text
+1. 一切都写死成 workflow；
+2. 一切都交给模型自由决策。
+```
+
+更成熟的做法是：
+
+> 用状态图定义系统边界，用模型处理局部不确定性；用工具执行动作，用验证器控制质量；用专家 Agent 提供能力，用主 Agent 保持责任；用 checkpoint 和 trace 保证可恢复和可观测。
+
+所以我推荐的落地模式是：
+
+```text
+Graph-based ReAct + Specialist-as-Tool + Self-Refine Verification
+```
+
+这条路线既吸收了论文中的推理、行动、搜索和自我修正能力，又符合生产系统对确定性、可观测性、安全和可恢复性的要求。
+
+Agent 不应该是一个自由奔跑的黑箱。
+真正可靠的 Agent，是被良好编排的、可验证的、可恢复的任务执行系统。
+
+---
+
+## 参考资料
+
+| # | 资料 | 来源 |
+|---|------|------|
+| 1 | ReAct: Synergizing Reasoning and Acting in Language Models | arXiv |
+| 2 | Tree of Thoughts: Deliberate Problem Solving with Large Language Models | arXiv |
+| 3 | Self-Refine: Iterative Refinement with Self-Feedback | arXiv |
+| 4 | LangGraph Overview Documentation | LangChain 文档 |
+| 5 | OpenAI Agents SDK Orchestration and Handoffs | OpenAI 开发者 |
+| 6 | OpenAI Agents SDK Handoffs Documentation | openai.github.io |

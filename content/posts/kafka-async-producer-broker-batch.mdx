@@ -1,0 +1,247 @@
+---
+slug: "kafka-async-producer-broker-batch"
+title: "Kafka 异步生产者源码：broker 层批量聚合与 flush 机制"
+description: "深入解析 Sarama async producer 的 broker 层：批量如何积攒、flush 何时触发、重试时如何维持 partition 顺序。"
+date: "2026-05-09"
+tag: "Go / Cache"
+readTime: "20 min"
+top: false
+featured: false
+---
+
+> **Summary:** `brokerProducer.run()` 是"按 broker 聚合、择机 flush、接收响应并驱动重试/解锁"的调度器；`produceSet.buildRequest()` 则是"把当前积攒的 topic-partition 批次编码成一个 Kafka `ProduceRequest`" 的序列化入口。`brokerProducer` 初始化时就带着一个 `accumulatingBatch: newProduceSet(p)`，而网络侧 bridge goroutine 会对每个待发送的 `produceSet` 调 `set.buildRequest()` 后再真正发往 Broker。
+
+---
+
+## 1. 先建立 broker 层心智模型
+
+在 `newBrokerProducer()` 里，Sarama 为每个 broker 建了几条关键通道：`input`、`bridge`、`pending`、`responses`，同时挂了一个 `accumulatingBatch: newProduceSet(p)`。这已经说明 broker 层不是"来一条发一条"，而是先把消息收进 **当前累积批次**，等条件合适再把这个批次交给网络发送。
+
+其中最重要的是两段并行逻辑：
+
+- `bp.run()`：负责从 `input` 收消息、写入 `accumulatingBatch`、决定何时 flush、处理 `responses`
+- bridge goroutine：负责把 `produceSet` 变成 `ProduceRequest`，并异步拿回 broker 响应，再经 `pending/responses` 回传给 `bp.run()` 继续处理。
+
+也就是说，**`run()` 更像一个本地状态机；真正发网请求的是 bridge 那一侧。** `bridge` 里直接可见 `request := set.buildRequest()`，然后把响应连同原始 `set` 一起放回 `pending`，注释还特别说明了 unmute 要延后到 `handleResponse`，以确保 **同一 partition 的重试会阻塞后续批次**。
+
+---
+
+## 2. `produceSet` 是 broker 层"正在攒的批次"
+
+`produceSet` 内部核心字段是：
+
+- `msgs map[string]map[int32]*partitionSet`
+- `bufferBytes`
+- `bufferCount`
+- `producerID / producerEpoch`
+
+`partitionSet` 则持有该 topic-partition 的 `msgs`、`recordsToSend` 和 `bufferBytes`。这说明一个 `produceSet` 本质上是 **一个 broker 维度的大批次，里面再按 topic → partition 继续分桶**。
+
+`add(msg)` 时，它会先 encode key/value，补 timestamp，然后落到 `ps.msgs[msg.Topic][msg.Partition]` 对应的 `partitionSet`。如果 Kafka 版本至少 `0.11`，它会创建 `RecordBatch`；旧版本则走 legacy `MessageSet`。如果开启幂等，第一次往某个 partition batch 里加消息时还会把 `FirstSequence` 设成该消息的 sequence。
+
+这一点很关键，因为它解释了为什么 **broker 层的批量不是"无脑把消息拼一起"**，而是始终保留 **topic-partition 边界**。Kafka ProduceRequest 允许一个请求携带多个 topic/partition 的 records，但每个 partition 仍然必须有自己独立的 batch。
+
+---
+
+## 3. "批量"到底怎么形成
+
+批量形成不是在 `buildRequest()` 那一步才开始的，而是在 `produceSet.add()` 时就已经发生了。`add()` 每来一条消息，都把它放进相应的 `partitionSet`，同时累计 `bufferBytes` 和 `bufferCount`。如果某个 partition 第一次出现，会为它创建新的 `partitionSet` 和底层 `RecordBatch`/`MessageSet`。
+
+所以你可以把批量拆成两层：
+
+**第一层：partition 内批量**
+同一个 topic-partition 的多条消息被放进同一个 `partitionSet.recordsToSend`
+
+**第二层：broker 内聚合**
+同一 broker 下的多个 topic-partition 的 `partitionSet` 被放在同一个 `produceSet.msgs` 里，最终一起发成一个 ProduceRequest。
+
+这也是 Sarama 设计上很漂亮的地方：
+
+> **partition 保证语义，broker 提供吞吐。**
+
+---
+
+## 4. overflow 检查：什么时候当前批次不能再塞消息
+
+`produceSet.wouldOverflow(msg)` 把"当前批次是否还能继续装"定义得很清楚，一共有三类限制：
+
+1. **整个请求体的 size 上限**：`ps.bufferBytes + msg.ByteSize(version) >= MaxRequestSize - 10KiB`
+2. **单个 partition batch 的 size 上限**：当前该 partition 的 `bufferBytes + msg.ByteSize(version) >= Producer.MaxMessageBytes`
+3. **消息条数上限**：`Producer.Flush.MaxMessages > 0 && ps.bufferCount >= Flush.MaxMessages`
+
+这意味着 broker 层每次收到新消息时，通常都会先问一句：**"再加这一条，会不会把当前批次撑爆？"**
+
+如果会，就需要先把现有 `accumulatingBatch` flush 掉，再开始新的批次。这里最重要的不是具体阈值，而是它同时兼顾了：
+
+- 网络请求总大小
+- 单 partition 批次大小
+- 批量条数
+
+---
+
+## 5. flush 条件：不只是"满了再发"
+
+`produceSet.readyToFlush()` 的逻辑入口能看到几个核心判断：
+
+- 如果 `ps.empty()`，直接不 flush
+- 注释明确说：**如果三个 flush 配置都为 0，则"always flush as-fast-as-possible"**
+
+结合 Sarama Producer 的常见配置语义，这里可以把 flush 理解为至少受三类信号驱动：
+
+- **容量驱动**：`wouldOverflow`
+- **计数驱动**：`Flush.MaxMessages`
+- **策略驱动**：如果 flush 相关阈值都没设，就尽快发
+
+换句话说，Sarama 的 brokerProducer 不是单纯实现一个 linger.ms，而是围绕 `produceSet` 的"是否 ready / 是否 overflow"来决定是否将当前批次交给 bridge 网络层。
+
+---
+
+## 6. `buildRequest()`：真正把批次变成 Kafka 请求
+
+`produceSet.buildRequest()` 一开始就创建 `ProduceRequest`，把配置里的 `RequiredAcks` 和 `Timeout` 填进去。随后它会根据 Kafka 协议版本递增设置 `req.Version`：
+
+- `>= 0.10.0.0` 用 v2
+- `>= 0.11.0.0` 用 v3
+- `>= 1.0.0.0` 用 v5
+- `>= 2.0.0.0` 用 v6
+- `>= 2.1.0.0` 用 v7
+
+如果是事务生产者，还会把 `TransactionalID` 填进去。
+
+这一步很重要，因为它说明 `buildRequest()` 不只是"复制一下消息"，它还负责把 **Producer 配置、Kafka 版本能力、事务语义** 一并编码进最终请求。
+
+---
+
+## 7. `buildRequest()` 如何处理每个 partition batch
+
+进入 `for topic, partitionSets := range ps.msgs` 之后，`buildRequest()` 会逐个 partition 处理。对于 `req.Version >= 3` 的情况，源码注释明确写了：需要计算 **每条 record 相对 `FirstOffset` 的偏移**，并设置 `LastOffsetDelta`，最后一条记录的 delta 等于 `(# of records in batch) - 1`。这说明在新版本 RecordBatch 模式下，`buildRequest()` 要补齐的不只是"字节数组"，还有 Kafka 批记录的 offset-delta 元数据。
+
+然后它会按该 partition 是新记录格式还是老消息集格式，决定是直接带 `RecordBatch`，还是在需要压缩时把整组消息压成一个"外层压缩消息"再 `req.AddMessage(topic, partition, compMsg)`。从代码可见，压缩后的 `compMsg` 会带上 `Codec`、`CompressionLevel`，新一点的协议版本还会设置时间戳版本。
+
+因此 `buildRequest()` 做的可以概括成三步：
+
+1. **定协议版本和事务字段**
+2. **逐 partition 规范化 records/message set**
+3. **把每个 partition 的记录挂进 `ProduceRequest`**
+
+---
+
+## 8. 为什么 `buildRequest()` 不是简单 marshal
+
+因为在进入请求前，`produceSet` 里保存的还是 **逻辑批次**，而不是最终线上的 Kafka 包体。`buildRequest()` 在这里至少补了几类"发送前语义"：
+
+- 根据 broker 版本确定 Produce API version
+- 对 RecordBatch 设置 offset delta / last offset delta
+- 处理事务 ID
+- 处理压缩封装
+- 将内存中的 `msgs` 结构映射到 Kafka 协议中的 `topic -> partition -> records`
+
+所以它不是普通的"对象序列化函数"，而更像 **broker 发送前的协议适配层**。
+
+---
+
+## 9. `brokerProducer.run()` 在 flush 前后的真正职责
+
+虽然 `run()` 全部展开需要结合多个文件，但从 `newBrokerProducer()` 和 surrounding 逻辑可以明确看出它至少要承担四件事：
+
+1. 从 `input` 收到来自 `partitionProducer` 的消息
+2. 维护 `accumulatingBatch: newProduceSet(p)`
+3. 在适当时机把批次送到 `output/bridge`
+4. 从 `responses` 里拿回 broker 结果，再做 handleResponse / retry / unmute
+
+其中最关键的一点是：**响应处理不是"顺手通知一下上层"就完了，而是会影响后续 partition 是否继续放行。** bridge 注释明确说了，unmuting 要延后到 `handleResponse`，这样在重试场景下，同一 partition 的后续批次会被阻塞。
+
+这也就解释了为什么 broker 层的 run 不是纯粹的 flush loop，它同时还是 **partition 顺序控制的一环**。
+
+---
+
+## 10. muted / unmute：重试时为什么还能尽量维持顺序
+
+`partitionMuter` 维护的是 `topic -> partition -> in-flight count`，并提供：
+
+- `tryMute(set)`
+- `waitUntilMuted(set)`
+- `awaitUnmuteChan(set)`
+- `unmute(set)`
+
+它的职责是：**只要某个 partition 还有 in-flight batch，就不允许另一个包含同 partition 的 batch 并发飞出去。**
+
+bridge 那里的注释把这一点说得更直接：
+
+> **把 unmuting 延后到 `handleResponse`，就是为了让重试阻塞同一 partition 的后续批次。**
+
+所以顺序保障不是来自"Kafka 自己会帮你排好"，而是 Sarama 在客户端侧主动做了一个 **per-partition in-flight gate**。这和 Java 客户端里"同 partition 尽量串行化发送"的核心思想是一样的，只是 Sarama 用的是 Go 的 muter/cond/channel 风格。
+
+---
+
+## 11. broker 响应回来后，为什么重试能精准到 partition
+
+bridge 在发送时，会把原始 `set` 一起封进 `brokerProducerResponse{set, err, res}` 再丢回 `pending`。这意味着响应回来时，Sarama 手里不只是一个 `ProduceResponse`，还知道 **这次请求里到底包含了哪些 topic-partition 批次**。
+
+这很关键，因为重试不是"整坨请求全部重来"那么简单。Kafka 一个 ProduceRequest 里可能混着多个 partition，它们的结果未必一致。Sarama 之所以能在响应后做细粒度的成功、失败、重试、解锁，本质上依赖的就是：发送前保留了 `produceSet` 这份本地映射。
+
+---
+
+## 12. `dropPartition` / `takePartitions`：失败后拆批的基础能力
+
+`produceSet` 里还有两个很重要的辅助函数：
+
+- `takePartitions(predicate)`：把满足条件的 partitions 从当前批次里"摘出去"，形成新的 `produceSet`
+- `dropPartition(topic, partition)`：直接把某个 partition 从当前批次删掉并返回对应消息
+
+这两个函数的意义在于：**响应回来以后，Sarama 可以把"成功的 partition""要重试的 partition""要直接报错的 partition"拆开处理，而不用把整个 broker 批次当成不可分割的整体。** 这也是为什么它能把"broker 聚合发请求"和"partition 粒度做重试/顺序控制"同时兼容起来。
+
+---
+
+## 13. 幂等场景下，为什么批次顺序更敏感
+
+在 `add()` 里，幂等生产者会检查：如果当前消息的 `sequenceNumber` 小于这个 batch 的 `FirstSequence`，就报错 `"message out of sequence added to a batch"`。这说明一旦开启 idempotent，`produceSet` 就不仅要攒消息，还要维护该 partition batch 内严格的 sequence 单调性。
+
+这也是为什么 `brokerProducer.run()` 一定要和 muter / response-driven unmute 协同工作。否则同一 partition 两个批次乱序飞出去，或者前一个批次失败重试时后一个批次先发，sequence 关系就容易被打穿。
+
+---
+
+## 14. 整个 broker 层发送循环的伪流程
+
+更贴近源码的理解方式是：
+
+> **收到消息 → 尝试塞进 `accumulatingBatch` → 如果会 overflow 或已 ready，就把当前 `produceSet` 切出来 → 先 mute 这些 partitions → bridge 调 `buildRequest()` 发网请求 → 等响应 → 逐 partition 判断成功/失败/重试 → 最后 unmute。**
+
+这个链条分别由 `wouldOverflow`、`readyToFlush`、`buildRequest`、bridge callback、`partitionMuter.unmute` 这些点拼起来。
+
+这套机制的关键收益是：
+
+- **吞吐**：同 broker 多 partition 合并发送
+- **语义**：partition 仍然是顺序与重试的基本单位
+- **可恢复性**：响应后能按 partition 拆批重试
+
+---
+
+## 15. 推荐打断点位置
+
+如果准备继续往下抠，下一轮断点建议放在这几个点：
+
+- `produceSet.add()`
+- `produceSet.wouldOverflow()`
+- `produceSet.readyToFlush()`
+- `produceSet.buildRequest()`
+- bridge 里的 `request := set.buildRequest()`
+- 响应回来的 `handleResponse` / `unmute` 路径
+
+这样你会非常清楚看到：**一条消息是怎么从"累积对象"变成"真实协议请求"，以及响应后如何反向驱动 retry 和放行。**
+
+---
+
+## 附：三个核心问题快速答案
+
+**1. 批量是怎么攒起来的？**
+
+`partitionProducer` 收到消息后交给 `brokerProducer.input`，`brokerProducer.run()` 调 `accumulatingBatch.add(msg)`，按 topic-partition 分桶落入 `produceSet.msgs`，同时累加 `bufferBytes` 和 `bufferCount`。攒的过程中始终保留 partition 边界，不破坏语义。
+
+**2. flush 是被什么条件触发的？**
+
+核心是三类信号：`wouldOverflow(msg)` 发现装不下、计数达到 `Flush.MaxMessages`、或者所有阈值都没设时尽快发。实际由 `readyToFlush()` 综合判断，决定是否把当前 `accumulatingBatch` 切出来送入 bridge 发送通道。
+
+**3. 重试时为什么还能尽量维持 partition 顺序？**
+
+Sarama 在客户端侧维护了 `partitionMuter`，每个 partition 有 in-flight gate。bridge 发送时会 `tryMute(set)` 锁住涉及的 partitions，**unmute 动作被刻意延后到 `handleResponse` 之后**，使得重试中的 partition 在收到响应前，同 partition 的后续批次会被 `awaitUnmuteChan` 阻塞，确保串行。
