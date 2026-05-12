@@ -20,7 +20,7 @@ export type Live2DTapSignal = {
 
 export type Live2DExpressionSignal = {
   id: number;
-  expression: string;
+  expression: string | null;
 };
 
 type PixiApplication = {
@@ -50,6 +50,11 @@ type Live2DModelInstance = {
   hitTest?: (x: number, y: number) => string[];
   focus?: (x: number, y: number, instant?: boolean) => void;
   internalModel?: {
+    motionManager?: {
+      expressionManager?: {
+        resetExpression?: () => void;
+      };
+    };
     coreModel?: {
       setParameterValueById?: (id: string, value: number, weight?: number) => void;
     };
@@ -322,7 +327,16 @@ export function Live2DMascot({ model, tapSignal = null, expressionSignal = null,
   useEffect(() => {
     const live2dModel = modelRef.current;
 
-    if (!expressionSignal || !live2dModel?.expression) {
+    if (!expressionSignal || !live2dModel) {
+      return;
+    }
+
+    if (!expressionSignal.expression) {
+      live2dModel.internalModel?.motionManager?.expressionManager?.resetExpression?.();
+      return;
+    }
+
+    if (!live2dModel.expression) {
       return;
     }
 

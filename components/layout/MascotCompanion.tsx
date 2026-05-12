@@ -234,9 +234,7 @@ export function MascotCompanion() {
       localStorage.removeItem(mascotConfig.storageKeys.expression);
     }
 
-    if (expression) {
-      setExpressionSignal({ id: Date.now(), expression });
-    }
+    setExpressionSignal({ id: Date.now(), expression });
   }
 
   function runEvent(trigger: MascotEventTrigger, fallbackMessage?: string) {
@@ -250,10 +248,6 @@ export function MascotCompanion() {
     }
 
     eventCooldownRef.current[cooldownKey] = now;
-
-    if (rule?.expression) {
-      applyExpression(rule.expression, false, false);
-    }
 
     showMessage(rule ? pickMessage(rule.messages) : fallbackMessage, rule?.priority ?? DEFAULT_MESSAGE_PRIORITY);
   }

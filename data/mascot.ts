@@ -18,7 +18,6 @@ export type MascotEventRule = {
   messages: string[];
   priority?: number;
   cooldownMs?: number;
-  expression?: string;
   motionGroup?: string;
 };
 
@@ -104,8 +103,7 @@ export const mascotConfig = {
           trigger: "click",
           messages: ["嗯？在叫我吗。", "点到了，我在。"],
           priority: 90,
-          cooldownMs: 1200,
-          expression: "tap"
+          cooldownMs: 1200
         },
         {
           trigger: "drag-start",
@@ -123,15 +121,13 @@ export const mascotConfig = {
           trigger: "idle",
           messages: ["休息一下眼睛也很好。", "文章读累了，就看看窗外。"],
           priority: 30,
-          cooldownMs: 30000,
-          expression: "daimao"
+          cooldownMs: 30000
         },
         {
           trigger: "scroll-bottom",
           messages: ["读到这里啦，要不要看看下一篇？"],
           priority: 70,
-          cooldownMs: 20000,
-          expression: "photo"
+          cooldownMs: 20000
         },
         {
           trigger: "route-change",
