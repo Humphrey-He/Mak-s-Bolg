@@ -56,6 +56,20 @@ kubectl get events --sort-by=.lastTimestamp
 
 如果问题是“用户服务调用订单服务超时”，不要只看用户服务日志。还要确认 DNS、Service、EndpointSlice、readiness、targetPort、NetworkPolicy 和目标 Pod 状态。
 
+按现象判断优先层级：
+
+| 现象 | 优先检查 |
+| --- | --- |
+| 域名访问不通 | Ingress / Gateway / Controller logs |
+| Service 访问不通 | Service selector / EndpointSlice / readiness |
+| Pod 无法启动 | `describe pod` / events / logs |
+| Pod Pending | scheduler events / resources / nodeSelector / taints |
+| 容器反复重启 | `logs --previous` / liveness / OOM |
+| DNS 失败 | CoreDNS / `resolv.conf` / debug Pod |
+| 网络超时 | NetworkPolicy / CNI / EndpointSlice |
+| 卷挂载失败 | PVC / PV / CSI / events |
+| 配置缺失 | ConfigMap / Secret / `CreateContainerConfigError` |
+
 ## kubectl logs：单容器、多容器、previous
 
 基础日志命令：
@@ -99,7 +113,25 @@ CrashLoopBackOff 时要看上一次容器日志：
 kubectl logs <pod> -c <container> --previous
 ```
 
-`kubectl logs` 适合即时排障，不适合长期日志分析。生产环境应接入集中日志系统，例如 Loki、Elasticsearch、OpenSearch、Cloud Logging、Datadog、Splunk 等。应用日志要包含 `request_id` / `trace_id` / `user_id` / `tenant_id`，并对敏感字段脱敏。
+`kubectl logs` 适合即时排障，不适合长期日志分析。生产环境应接入集中日志系统，例如 Loki、Elasticsearch、OpenSearch、Cloud Logging、Datadog、Splunk 等。
+
+应用日志建议至少包含：
+
+```txt
+timestamp
+level
+service
+version
+trace_id
+request_id
+tenant_id
+path
+status
+latency_ms
+error_code
+```
+
+不要在日志中输出 token、cookie、密码、完整请求体、身份证、手机号、银行卡等敏感信息。
 
 ## Events：对象生命周期视角
 
@@ -159,12 +191,44 @@ kubectl get pod -l app=api -o wide
 - Pod 在另一个 namespace。
 - NetworkPolicy 拦截。
 
+## Ingress 与入口层排查
+
+如果外部域名访问不通，但集群内访问 Service 正常，优先看入口层：
+
+```bash
+kubectl get ingress api
+kubectl describe ingress api
+kubectl get ingressclass
+kubectl get svc -A | grep -i ingress
+kubectl logs -n ingress-nginx deploy/ingress-nginx-controller --tail=100
+```
+
+常见问题：
+
+- Ingress 没有设置正确的 `ingressClassName`。
+- Ingress Controller 没有接管该 Ingress。
+- host / path 规则和真实请求不匹配。
+- TLS Secret 缺失或证书错误。
+- 后端 Service 名称、端口或 namespace 写错。
+- 云厂商 LoadBalancer 或安全组没有放行。
+
 ## Debug Pod 与 Ephemeral Container
 
 临时 debug Pod 适合从集群内部模拟访问：
 
 ```bash
 kubectl run netshoot -n prod --rm -it --image=nicolaka/netshoot -- bash
+```
+
+如果集群启用了 NetworkPolicy，最好带上与源服务等价的 labels：
+
+```bash
+kubectl run netshoot \
+  -n prod \
+  --rm -it \
+  --image=nicolaka/netshoot \
+  --labels app=user \
+  -- bash
 ```
 
 进入后：
@@ -276,6 +340,7 @@ kubectl top pod <pod>
 如果问题在节点层，例如 CNI 异常、kubelet 异常、container runtime 异常、磁盘压力、DNS 配置异常，Pod 内 debug 不一定够。
 
 ```bash
+kubectl get nodes
 kubectl describe node <node>
 kubectl get node <node> -o yaml
 kubectl top node

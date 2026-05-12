@@ -1,21 +1,32 @@
 ---
 slug: "kubernetes-deployment-backend-service"
-title: "Deployment：后端服务的副本、滚动发布与回滚入口"
-description: "讲清 Deployment 如何管理 ReplicaSet 和 Pod，并用后端服务示例解释副本数、标签选择器、滚动更新和常用 kubectl 命令。"
+title: "Kubernetes Deployment：生产级后端服务发布模型"
+description: "从 Deployment、ReplicaSet、Pod 的控制关系出发，讲清滚动发布、三类探针、资源约束、优雅退出、安全上下文、PDB、拓扑分布和镜像不可变发布。"
 date: "2026-05-17"
 tag: "Cloud Native"
-readTime: "20 min"
+readTime: "32 min"
 top: false
 featured: false
 ---
 
-## 这篇解决什么问题
+## 为什么后端服务需要 Deployment
 
-后端服务上线后，最基本的要求不是“能启动一个容器”，而是能稳定运行多个副本、发布新版本时不中断、出问题时可以回滚。直接创建 Pod 做不到这些，Deployment 才是无状态后端服务最常用的管理对象。
+后端服务上线后，最基本的要求不是“能启动一个容器”，而是能稳定运行多个副本、发布新版本时不中断、出问题时可以回滚。直接创建裸 Pod 做不到这些，Deployment 才是无状态后端服务最常用的管理对象。
 
-Deployment 管理 ReplicaSet，ReplicaSet 管理 Pod。你声明期望副本数和 Pod 模板，Kubernetes 会持续确保集群里有符合模板的 Pod。更新镜像时，Deployment 会创建新的 ReplicaSet，逐步替换旧 Pod，从而实现滚动发布。
+Deployment 管理 ReplicaSet，ReplicaSet 管理 Pod。你声明期望副本数和 Pod 模板，Kubernetes 会持续确保集群里有符合模板的 Pod。更新镜像、环境变量、探针或资源配置时，Deployment 会创建新的 ReplicaSet，逐步替换旧 Pod，从而实现滚动发布。
 
-## 架构位置
+一份生产级 Deployment 不只是写一个镜像和副本数，还要回答这些问题：
+
+- Pod 什么时候可以接流量？
+- 容器卡死后谁来重启？
+- 服务慢启动时会不会被误杀？
+- 滚动发布期间是否会主动降低可用副本？
+- Pod 能否优雅下线？
+- 调度器如何知道它需要多少资源？
+- 节点维护时是否会一次驱逐太多副本？
+- 镜像版本是否可追踪、可审计、可回滚？
+
+## 控制关系
 
 关系可以理解为：
 
@@ -29,7 +40,7 @@ Deployment
 
 当你把镜像从 `v1.0.0` 改成 `v1.0.1`，Deployment 不会原地修改旧 Pod，而是创建新 Pod，等待它们就绪，再逐步减少旧 Pod。这个过程让发布具备可观察和可回滚能力。
 
-## 核心名词
+核心名词：
 
 - `Deployment`：管理无状态服务发布和副本。
 - `ReplicaSet`：保证某个版本 Pod 的副本数。
@@ -41,6 +52,8 @@ Deployment
 - `strategy`：更新策略，默认是 RollingUpdate。
 
 ## 最小可运行示例
+
+入门时可以先用最小 Deployment 理解控制器行为：
 
 ```yaml
 apiVersion: apps/v1
@@ -82,57 +95,337 @@ kubectl rollout status deploy/api
 
 `selector.matchLabels` 是 Deployment 选择 Pod 的规则。它必须和 `template.metadata.labels` 匹配，否则 Deployment 无法正确管理自己创建的 Pod。这个字段创建后通常不能随意修改。
 
-`template` 是 Pod 模板。镜像、端口、环境变量、探针、资源限制等都写在这里。只要模板变化，Deployment 就会触发新一轮发布。
+`template` 是 Pod 模板。镜像、端口、环境变量、探针、资源限制、安全上下文都写在这里。只要模板变化，Deployment 就会触发新一轮发布。
 
 `containerPort` 声明容器内服务端口，但不负责集群访问。让其他服务访问它，还需要创建 Service。
 
-## 高频命令
+## 生产级 Deployment 模板
+
+最小示例适合入门，但生产后端服务至少要补齐探针、资源、安全、优雅退出和滚动更新策略：
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  labels:
+    app.kubernetes.io/name: api
+    app.kubernetes.io/part-of: backend
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: api
+        app.kubernetes.io/part-of: backend
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: api
+          image: registry.example.com/team/api:v1.0.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: APP_ENV
+              value: "prod"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"
+          startupProbe:
+            httpGet:
+              path: /startup
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 10"]
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+```
+
+这份模板的关键价值：
+
+- `revisionHistoryLimit` 控制保留多少历史 ReplicaSet。
+- `maxUnavailable: 0` 避免滚动更新期间主动减少可用副本。
+- `startupProbe` 保护慢启动服务，避免被 `livenessProbe` 提前杀死。
+- `readinessProbe` 控制 Pod 是否进入 Service 后端。
+- `livenessProbe` 判断容器是否卡死、是否需要重启。
+- `resources` 帮助调度器做资源决策，也支持 HPA。
+- `securityContext` 建立非 root、最小权限运行基线。
+- `preStop` 和 `terminationGracePeriodSeconds` 给应用优雅下线时间。
+
+不是所有服务都要完全照抄这份模板，但生产后端服务应该逐项说明为什么需要、为什么暂时不需要，不能长期只保留最小 YAML。
+
+## 三类探针
+
+探针决定发布、流量接入和故障恢复的语义。
+
+| 探针 | 作用 | 失败后行为 | 是否建议检查外部依赖 |
+| --- | --- | --- | --- |
+| `startupProbe` | 判断应用是否启动完成 | 未成功前不执行其他探针 | 可以检查启动必要条件 |
+| `readinessProbe` | 判断 Pod 是否可以接流量 | 从 Service 后端移除 | 可以检查关键依赖，但要轻量 |
+| `livenessProbe` | 判断容器是否卡死，需要重启 | kubelet 重启容器 | 通常不要检查 DB/Redis |
+
+推荐语义：
+
+```txt
+/live    只检查进程和 HTTP server 是否还活着。
+/ready   检查是否可以接流量，例如配置加载完成、连接池可用。
+/startup 检查启动初始化是否完成。
+```
+
+数据库短暂不可用，不应该导致所有 Pod 被 `livenessProbe` 杀死。外部依赖异常更适合影响 readiness，让 Pod 暂时不接流量。如果把数据库、Redis、下游 HTTP 全放进 liveness，依赖抖动时可能触发大面积重启，反而扩大故障。
+
+## 资源 requests 和 limits
+
+生产级 Deployment 不能长期不写资源声明：
+
+```yaml
+resources:
+  requests:
+    cpu: "100m"
+    memory: "128Mi"
+  limits:
+    cpu: "1000m"
+    memory: "512Mi"
+```
+
+`requests` 是调度依据，表示 Pod 需要的最低资源保障。调度器会根据它判断节点是否能承载这个 Pod。
+
+`limits` 是资源上限。超过 memory limit 会被 OOMKilled；CPU limit 过小可能导致 CPU throttling，接口延迟升高。
+
+HPA 基于 CPU 利用率扩容时，通常依赖 CPU requests。没有 requests，HPA 和调度稳定性都会受影响。
+
+排查资源问题：
+
+```bash
+kubectl top pod
+kubectl describe pod <pod>
+kubectl get events --sort-by=.lastTimestamp
+```
+
+## 优雅退出与滚动发布
+
+滚动发布不是简单地删除旧 Pod。服务下线通常应该是：
+
+```txt
+Deployment 减少旧 Pod
+-> Pod 收到 SIGTERM
+-> readiness 尽快失败
+-> Service 不再把新流量打进该 Pod
+-> 应用停止接收新请求
+-> 等待已有请求完成
+-> 进程退出
+```
+
+推荐配置：
+
+```yaml
+terminationGracePeriodSeconds: 30
+lifecycle:
+  preStop:
+    exec:
+      command: ["sh", "-c", "sleep 10"]
+```
+
+`preStop sleep` 只是给负载均衡和 EndpointSlice 更新留时间，不是优雅退出的替代品。真正的优雅退出要由应用处理 SIGTERM。
+
+后端服务需要：
+
+- 收到 SIGTERM 后停止接新请求。
+- 关闭 HTTP server。
+- 等待正在处理的请求完成。
+- 关闭 DB / Redis / MQ 连接。
+- 在 `terminationGracePeriodSeconds` 内退出。
+
+## 安全上下文与最小权限
+
+容器默认以 root 运行会放大风险。后端服务应尽量使用非 root 用户、只读根文件系统和最小 Linux capabilities。
+
+```yaml
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+```
+
+如果应用需要写临时文件，应明确写入 `/tmp` 或挂载的临时卷；日志优先输出到 stdout/stderr；上传文件优先进入对象存储，而不是写容器本地目录。
+
+## PDB 与拓扑分布
+
+`replicas: 3` 不等于高可用。节点维护、集群升级或 drain 时，多个 Pod 可能被同时驱逐。可以用 PodDisruptionBudget 约束自愿中断：
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: api
+```
+
+PDB 不能防止节点宕机这种非自愿中断，但能降低维护期间的可用性风险。
+
+三个副本也可能都调度到同一个节点。可以用拓扑分布把副本分散到不同故障域：
+
+```yaml
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: api
+```
+
+多可用区集群可以把 `topologyKey` 换成：
+
+```yaml
+topologyKey: topology.kubernetes.io/zone
+```
+
+核心结论是：副本数解决数量问题，拓扑分布解决故障域问题。
+
+## 镜像不可变发布
+
+文档和示例里经常写：
+
+```yaml
+image: registry.example.com/team/api:v1.0.0
+```
+
+这比 `latest` 好，但还不够。Tag 是可变引用，Digest 是不可变内容身份。
+
+生产发布建议：
+
+- 不使用 `latest`。
+- 使用语义化版本 tag，例如 `v1.2.3`。
+- 同时打 commit tag，例如 `git-a1b2c3d`。
+- 发布系统记录 image digest。
+- 关键生产环境可以按 digest 部署。
+
+示例：
+
+```yaml
+image: registry.example.com/team/api@sha256:xxxxxxxx
+```
+
+或者在发布记录中保存：
+
+```txt
+image: registry.example.com/team/api:v1.2.3
+digest: sha256:xxxxxxxx
+git commit: a1b2c3d
+```
+
+只有能追溯到 digest，发布审计和历史回滚才真正可靠。
+
+## 发布、暂停、恢复和回滚命令
+
+常用命令：
 
 ```bash
 kubectl apply -f deployment.yaml
 kubectl get deploy
 kubectl describe deploy api
+kubectl get rs -l app.kubernetes.io/name=api
+kubectl describe rs <rs-name>
 kubectl rollout status deploy/api
 kubectl rollout history deploy/api
+kubectl rollout history deploy/api --revision=2
 kubectl set image deploy/api api=registry.example.com/team/api:v1.0.1
+kubectl rollout pause deploy/api
+kubectl rollout resume deploy/api
 kubectl rollout undo deploy/api
 kubectl scale deploy/api --replicas=5
 kubectl logs -f deploy/api
 ```
 
-`rollout status` 用来看发布是否完成。`rollout history` 看历史版本。`rollout undo` 回滚到上一个版本。`scale` 临时调整副本数，适合压测或流量高峰，但长期配置仍应回写 YAML。
+Deployment 的每次 Pod template 变化都会产生新的 revision。`revisionHistoryLimit` 决定能保留多少历史版本用于回滚。`rollout pause/resume` 适合临时暂停复杂发布过程。
 
-## 滚动更新策略
+`rollout undo` 只回滚 Pod template，也就是镜像、环境变量、探针等工作负载配置。它不能回滚数据库 schema、消息格式、缓存数据或外部依赖配置。
 
-可以显式声明滚动更新参数：
+发布前应确认：
 
-```yaml
-strategy:
-  type: RollingUpdate
-  rollingUpdate:
-    maxSurge: 1
-    maxUnavailable: 0
-```
-
-`maxSurge: 1` 表示更新过程中最多额外创建 1 个 Pod。`maxUnavailable: 0` 表示更新时不允许减少可用副本数。对后端 API 来说，这通常比“先停旧再启新”更平滑，但也要求集群有足够资源容纳额外 Pod。
+- 数据库迁移向前兼容。
+- 新旧版本可以短时间共存。
+- 消息格式兼容。
+- 回滚路径明确。
+- 涉及破坏性变更时，考虑蓝绿或分阶段发布。
 
 ## 常见问题
 
 第一，selector 和 template labels 不匹配。结果是 Deployment 创建或接管 Pod 异常，后续 Service 也可能选不中 Pod。
 
-第二，只改了镜像 tag 但 tag 内容漂移。生产发布应使用明确版本，避免多个环境的 `v1` 指向不同镜像内容。
+第二，只改镜像 tag，但 tag 内容漂移。生产发布应使用明确版本，并记录 digest，避免多个环境的 `v1` 指向不同镜像内容。
 
 第三，没有 readinessProbe。Deployment 可能认为 Pod 已经 Running，但服务还没准备好接流量。后端服务应该配置就绪检查，让滚动更新更稳。
 
-第四，发布失败只看 Deployment。要继续看 ReplicaSet、Pod、Events 和容器日志，才能判断是调度、拉镜像、启动崩溃还是探针失败。
+第四，livenessProbe 检查了数据库。数据库短暂抖动时，所有 Pod 可能被 kubelet 重启，导致雪崩。数据库依赖更适合放在 readiness 中，并设置短超时。
 
-## 后端开发者检查清单
+第五，没有 resources.requests。Pod 可能调度不稳定，HPA 也难以按 CPU 利用率工作。资源争抢时延迟会抖动。
 
-- [ ] 生产无状态服务是否使用 Deployment，而不是裸 Pod。
-- [ ] `selector.matchLabels` 是否和 Pod 模板 labels 匹配。
-- [ ] 镜像 tag 是否明确、可追踪、可回滚。
-- [ ] 是否知道 `replicas` 只是期望状态，控制器会持续修正。
-- [ ] 发布前是否配置 readinessProbe。
-- [ ] 是否会用 `rollout status` 观察发布过程。
-- [ ] 是否会用 `rollout undo` 快速回滚。
-- [ ] 扩缩容后是否把长期副本数写回 YAML。
+第六，只看 Deployment，不看 ReplicaSet、Pod、Events 和容器日志。发布失败要判断是调度、拉镜像、启动崩溃、配置缺失还是探针失败。
+
+## 生产级检查清单
+
+- [ ] 无状态后端服务是否使用 Deployment，而不是裸 Pod。
+- [ ] `selector.matchLabels` 与 `template.metadata.labels` 是否严格匹配。
+- [ ] labels 是否采用稳定规范，例如 `app.kubernetes.io/name`。
+- [ ] 镜像 tag 是否明确，发布系统是否记录 digest。
+- [ ] 是否配置 replicas，且副本数符合可用性要求。
+- [ ] 是否配置 RollingUpdate 策略。
+- [ ] 是否配置 `readinessProbe`、`livenessProbe`、`startupProbe`。
+- [ ] readiness 是否控制流量接入。
+- [ ] liveness 是否避免检查数据库等外部依赖。
+- [ ] 是否配置 `resources.requests` / `limits`。
+- [ ] 是否配置 `securityContext`，非 root、最小权限运行。
+- [ ] 是否支持 SIGTERM 优雅退出。
+- [ ] 是否配置 `terminationGracePeriodSeconds`。
+- [ ] 是否需要 PDB 保护节点维护期间可用性。
+- [ ] 是否需要 `topologySpreadConstraints` 分散副本。
+- [ ] 是否知道 `rollout undo` 不能回滚数据库变更。
