@@ -76,9 +76,69 @@ body {
   padding: 1rem 0;
 }
 
+.juno-mascot {
+  pointer-events: none;
+}
+
+.juno-mascot button {
+  pointer-events: auto;
+}
+
+.juno-mascot-stage {
+  animation: mascot-float 4.8s ease-in-out infinite;
+  transform-origin: 50% 100%;
+}
+
+.juno-mascot-body {
+  animation: mascot-breathe 3.6s ease-in-out infinite;
+  transform-origin: 50% 72%;
+  transition: transform 180ms ease-out;
+}
+
+.juno-mascot-head,
+.juno-mascot-eyes {
+  transition: transform 160ms ease-out;
+}
+
+.juno-mascot-eye {
+  animation: mascot-blink 5.8s infinite;
+  transform-box: fill-box;
+  transform-origin: center;
+}
+
+.juno-mascot-flower {
+  animation: mascot-flower 3.2s ease-in-out infinite;
+  transform-box: fill-box;
+  transform-origin: center;
+}
+
+.juno-mascot-flower:nth-of-type(2n) {
+  animation-delay: .4s;
+}
+
 @keyframes scan {
   0% { transform: translateY(-100%); }
   100% { transform: translateY(100%); }
+}
+
+@keyframes mascot-float {
+  0%, 100% { transform: translateY(0) rotate(-.6deg); }
+  50% { transform: translateY(-7px) rotate(.6deg); }
+}
+
+@keyframes mascot-breathe {
+  0%, 100% { transform: scaleY(1) translateY(0); }
+  50% { transform: scaleY(1.018) translateY(-1px); }
+}
+
+@keyframes mascot-blink {
+  0%, 91%, 100% { transform: scaleY(1); }
+  94%, 96% { transform: scaleY(.08); }
+}
+
+@keyframes mascot-flower {
+  0%, 100% { transform: rotate(-2deg); }
+  50% { transform: rotate(3deg); }
 }
 
 @media (prefers-reduced-motion: reduce) {

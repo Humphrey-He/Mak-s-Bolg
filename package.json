@@ -24,6 +24,8 @@
     "katex": "^0.16.45",
     "next": "^15.5.18",
     "next-mdx-remote": "^5.0.0",
+    "pixi-live2d-display": "0.4.0",
+    "pixi.js": "6.5.10",
     "react": "latest",
     "react-dom": "latest",
     "rehype-highlight": "^7.0.2",
