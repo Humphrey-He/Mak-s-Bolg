@@ -9,7 +9,41 @@
       "textures/texture_03.png"
     ],
     "Physics": "shiroko.physics3.json",
-    "DisplayInfo": "shiroko.cdi3.json"
+    "DisplayInfo": "shiroko.cdi3.json",
+    "Expressions": [
+      {
+        "Name": "daimao",
+        "File": "expressions/daimao.exp3.json"
+      },
+      {
+        "Name": "daimao-eye-shake",
+        "File": "expressions/daimao-eye-shake.exp3.json"
+      },
+      {
+        "Name": "apron",
+        "File": "expressions/apron.exp3.json"
+      },
+      {
+        "Name": "photo",
+        "File": "expressions/photo.exp3.json"
+      },
+      {
+        "Name": "pen",
+        "File": "expressions/pen.exp3.json"
+      },
+      {
+        "Name": "tap",
+        "File": "expressions/tap.exp3.json"
+      },
+      {
+        "Name": "cat-filter",
+        "File": "expressions/cat-filter.exp3.json"
+      },
+      {
+        "Name": "glasses",
+        "File": "expressions/glasses.exp3.json"
+      }
+    ]
   },
   "Groups": [
     {

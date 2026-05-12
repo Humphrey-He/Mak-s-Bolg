@@ -4,11 +4,20 @@ export type SvgMascotModel = {
   type: "placeholder";
 };
 
-export type Live2DOutfit = {
+export type Live2DExpression = {
   id: string;
   name: string;
-  type: "model" | "expression" | "motion";
-  modelId?: string;
+  expression: string;
+  persist?: boolean;
+};
+
+export type MascotEventTrigger = "hover" | "click" | "click-body" | "click-head" | "drag-start" | "drag-end" | "idle" | "scroll-bottom" | "route-change";
+
+export type MascotEventRule = {
+  trigger: MascotEventTrigger;
+  messages: string[];
+  priority?: number;
+  cooldownMs?: number;
   expression?: string;
   motionGroup?: string;
 };
@@ -25,7 +34,8 @@ export type Live2DMascotModel = {
   scale?: number;
   x?: number;
   y?: number;
-  outfits?: Live2DOutfit[];
+  expressions?: Live2DExpression[];
+  events?: MascotEventRule[];
 };
 
 export type MascotModel = SvgMascotModel | Live2DMascotModel;
@@ -36,7 +46,8 @@ export const mascotConfig = {
   storageKeys: {
     hidden: "juno-mascot-hidden",
     modelId: "juno-mascot-model-id",
-    position: "juno-mascot-position"
+    position: "juno-mascot-position",
+    expression: "juno-mascot-expression"
   },
   messages: [
     "哇，你终于回来啦～",
@@ -71,7 +82,64 @@ export const mascotConfig = {
       modelPath: "/live2d/models/shiroko/shiroko.model3.json",
       stageWidth: 420,
       stageHeight: 620,
-      scale: 1.02
+      scale: 1.02,
+      expressions: [
+        { id: "daimao", name: "呆猫", expression: "daimao" },
+        { id: "daimao-eye-shake", name: "呆猫眼珠摇晃", expression: "daimao-eye-shake" },
+        { id: "apron", name: "围裙", expression: "apron", persist: true },
+        { id: "photo", name: "拍照", expression: "photo" },
+        { id: "pen", name: "拿笔", expression: "pen", persist: true },
+        { id: "tap", name: "点一下", expression: "tap" },
+        { id: "cat-filter", name: "猫咪滤镜", expression: "cat-filter" },
+        { id: "glasses", name: "眼镜", expression: "glasses", persist: true }
+      ],
+      events: [
+        {
+          trigger: "hover",
+          messages: ["白子待机中。要换个表情吗？", "鼠标过来啦，我会看着你的。"],
+          priority: 50,
+          cooldownMs: 8000
+        },
+        {
+          trigger: "click",
+          messages: ["嗯？在叫我吗。", "点到了，我在。"],
+          priority: 90,
+          cooldownMs: 1200,
+          expression: "tap"
+        },
+        {
+          trigger: "drag-start",
+          messages: ["要搬家了吗？"],
+          priority: 80,
+          cooldownMs: 1000
+        },
+        {
+          trigger: "drag-end",
+          messages: ["这里也不错。"],
+          priority: 80,
+          cooldownMs: 1000
+        },
+        {
+          trigger: "idle",
+          messages: ["休息一下眼睛也很好。", "文章读累了，就看看窗外。"],
+          priority: 30,
+          cooldownMs: 30000,
+          expression: "daimao"
+        },
+        {
+          trigger: "scroll-bottom",
+          messages: ["读到这里啦，要不要看看下一篇？"],
+          priority: 70,
+          cooldownMs: 20000,
+          expression: "photo"
+        },
+        {
+          trigger: "route-change",
+          messages: ["换个页面继续出发。"],
+          priority: 70,
+          cooldownMs: 5000
+        }
+      ]
     },
     {
       id: "svg-default",

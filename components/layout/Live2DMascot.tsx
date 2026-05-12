@@ -5,9 +5,22 @@ import type { Live2DMascotModel } from "@/data/mascot";
 
 type Live2DMascotProps = {
   model: Live2DMascotModel;
-  tapSignal?: number;
+  tapSignal?: Live2DTapSignal | null;
+  expressionSignal?: Live2DExpressionSignal | null;
   onReady?: () => void;
   onError?: (message: string) => void;
+  onHit?: (hitAreas: string[]) => void;
+};
+
+export type Live2DTapSignal = {
+  id: number;
+  clientX: number;
+  clientY: number;
+};
+
+export type Live2DExpressionSignal = {
+  id: number;
+  expression: string;
 };
 
 type PixiApplication = {
@@ -32,6 +45,9 @@ type Live2DModelInstance = {
     set: (value: number) => void;
   };
   motion?: (group: string) => void;
+  expression?: (id?: string | number) => Promise<boolean>;
+  tap?: (x: number, y: number) => void;
+  hitTest?: (x: number, y: number) => string[];
   focus?: (x: number, y: number, instant?: boolean) => void;
   internalModel?: {
     coreModel?: {
@@ -127,7 +143,7 @@ function applyPointerFocus(live2dModel: Live2DModelInstance, x: number, y: numbe
   live2dModel.focus?.(x, y, instant);
 }
 
-function getCanvasPoint(canvas: HTMLCanvasElement, event: PointerEvent) {
+function getCanvasPoint(canvas: HTMLCanvasElement, event: Pick<PointerEvent, "clientX" | "clientY">) {
   const rect = canvas.getBoundingClientRect();
 
   if (rect.width <= 0 || rect.height <= 0) {
@@ -140,18 +156,20 @@ function getCanvasPoint(canvas: HTMLCanvasElement, event: PointerEvent) {
   };
 }
 
-export function Live2DMascot({ model, tapSignal = 0, onReady, onError }: Live2DMascotProps) {
+export function Live2DMascot({ model, tapSignal = null, expressionSignal = null, onReady, onError, onHit }: Live2DMascotProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const appRef = useRef<PixiApplication | null>(null);
   const modelRef = useRef<Live2DModelInstance | null>(null);
   const onReadyRef = useRef(onReady);
   const onErrorRef = useRef(onError);
+  const onHitRef = useRef(onHit);
   const [active, setActive] = useState(false);
 
   useEffect(() => {
     onReadyRef.current = onReady;
     onErrorRef.current = onError;
-  }, [onReady, onError]);
+    onHitRef.current = onHit;
+  }, [onReady, onError, onHit]);
 
   useEffect(() => {
     let cancelled = false;
@@ -280,10 +298,39 @@ export function Live2DMascot({ model, tapSignal = 0, onReady, onError }: Live2DM
   useEffect(() => {
     const live2dModel = modelRef.current;
 
-    if (tapSignal > 0 && model.tapMotionGroup && live2dModel?.motion) {
+    if (!tapSignal || !live2dModel) {
+      return;
+    }
+
+    const canvas = canvasRef.current;
+    const point = canvas
+      ? getCanvasPoint(canvas, { clientX: tapSignal.clientX, clientY: tapSignal.clientY } as PointerEvent)
+      : null;
+
+    if (point) {
+      live2dModel.tap?.(point.x, point.y);
+      onHitRef.current?.(live2dModel.hitTest?.(point.x, point.y) ?? []);
+    } else {
+      onHitRef.current?.([]);
+    }
+
+    if (model.tapMotionGroup && live2dModel.motion) {
       live2dModel.motion(model.tapMotionGroup);
     }
   }, [model.tapMotionGroup, tapSignal]);
+
+  useEffect(() => {
+    const live2dModel = modelRef.current;
+
+    if (!expressionSignal || !live2dModel?.expression) {
+      return;
+    }
+
+    live2dModel.expression(expressionSignal.expression).catch((error) => {
+      const message = error instanceof Error ? error.message : "Live2D 表情切换失败";
+      onErrorRef.current?.(message);
+    });
+  }, [active, expressionSignal]);
 
   return <canvas ref={canvasRef} className="pointer-events-none h-full w-full" aria-label={`${model.name} Live2D 模型`} />;
 }
