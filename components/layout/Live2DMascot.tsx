@@ -23,6 +23,9 @@ type PixiApplication = {
 type Live2DModelInstance = {
   x: number;
   y: number;
+  anchor?: {
+    set: (x: number, y?: number) => void;
+  };
   scale: {
     set: (value: number) => void;
   };
@@ -159,6 +162,7 @@ export function Live2DMascot({ model, tapSignal = 0, onReady, onError }: Live2DM
         }
 
         app.stage.addChild(live2dModel);
+        live2dModel.anchor?.set(0.5, 1);
         live2dModel.scale.set(model.scale ?? 0.18);
         live2dModel.x = model.x ?? width / 2;
         live2dModel.y = model.y ?? height;

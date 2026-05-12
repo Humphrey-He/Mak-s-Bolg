@@ -51,9 +51,9 @@ export const mascotConfig = {
       modelPath: "/live2d/models/hiyori/hiyori_pro_jp.model3.json",
       idleMotionGroup: "Idle",
       tapMotionGroup: "Tap",
-      scale: 0.24,
+      scale: 0.075,
       x: 125,
-      y: 292
+      y: 318
     },
     {
       id: "wanko",
@@ -62,18 +62,18 @@ export const mascotConfig = {
       modelPath: "/live2d/models/wanko/wanko_touch_t02.model3.json",
       idleMotionGroup: "Idle",
       tapMotionGroup: "Tap",
-      scale: 0.28,
+      scale: 0.12,
       x: 125,
-      y: 292
+      y: 318
     },
     {
       id: "shiroko",
       name: "神宫白子",
       type: "live2d",
       modelPath: "/live2d/models/shiroko/shiroko.model3.json",
-      scale: 0.12,
+      scale: 0.055,
       x: 125,
-      y: 292
+      y: 318
     },
     {
       id: "svg-default",
