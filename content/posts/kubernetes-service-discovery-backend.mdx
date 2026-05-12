@@ -1,0 +1,190 @@
+---
+slug: "kubernetes-service-discovery-backend"
+title: "Kubernetes 服务发现：Service、DNS 与后端调用链路"
+description: "面向后端开发者解释 Kubernetes 中服务名、DNS、Service、Endpoints 和负载均衡如何影响服务间调用。"
+date: "2026-05-16"
+tag: "Cloud Native"
+readTime: "18 min"
+top: false
+featured: false
+---
+
+在 Kubernetes 里，后端服务之间通常不再写固定 IP，而是调用服务名。比如用户服务访问订单服务，可以请求 `http://order-api.default.svc.cluster.local`。这背后不是魔法，而是 Service、DNS、Endpoints 和 kube-proxy 等组件共同完成的服务发现。
+
+理解服务发现很重要，因为“服务调用超时”经常不是代码问题，而是 DNS 解析、Service selector、targetPort、Pod readiness、NetworkPolicy 或连接池配置中的某一环出了问题。
+
+## 问题场景
+
+一个用户服务调用订单服务，在本地 Docker Compose 中使用 `ORDER_API=http://order:8080` 一切正常。迁移到 Kubernetes 后改成 `http://order-api`，偶尔成功，偶尔超时。排查发现订单服务有 3 个 Pod，其中 1 个没有真正监听 8080，但 readinessProbe 写错了路径，仍然被 Service 接入。
+
+这类问题说明：Kubernetes 能提供稳定入口，但不会自动保证每个后端实例都是业务可用的。服务发现必须和健康检查、端口配置、超时重试一起设计。
+
+## 架构解释
+
+集群内一次服务调用可以拆成：
+
+```txt
+user-api Pod
+  -> DNS 查询 order-api
+  -> CoreDNS 返回 Service ClusterIP
+  -> kube-proxy / dataplane 转发
+  -> Service endpoints 中某个 Pod IP
+  -> order-api 容器 targetPort
+```
+
+Service 本身不是一个传统进程，它更像一组稳定的访问规则。Pod IP 会变化，但 Service 名和 ClusterIP 通常稳定。Service 通过 selector 找到带有指定 label 且 Ready 的 Pod，把它们维护为 endpoints。
+
+## 核心名词
+
+- `Service`：为一组 Pod 提供稳定访问入口。
+- `ClusterIP`：集群内部虚拟 IP，默认 Service 类型。
+- `Endpoints`：Service 当前选中的后端 Pod 地址集合。
+- `EndpointSlice`：Endpoints 的可扩展替代对象。
+- `CoreDNS`：集群 DNS 服务，负责解析 Service 名。
+- `selector`：Service 用来选择 Pod 的 label 条件。
+- `port`：Service 暴露的端口。
+- `targetPort`：后端 Pod 容器实际监听端口。
+
+## 最小示例
+
+订单服务 Deployment：
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: order-api
+  template:
+    metadata:
+      labels:
+        app: order-api
+    spec:
+      containers:
+        - name: order-api
+          image: registry.example.com/team/order-api:v1.0.0
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+```
+
+对应 Service：
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-api
+spec:
+  type: ClusterIP
+  selector:
+    app: order-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+```
+
+用户服务可以这样配置：
+
+```yaml
+env:
+  - name: ORDER_API_BASE_URL
+    value: "http://order-api.default.svc.cluster.local"
+```
+
+同一个 namespace 内也可以简写为 `http://order-api`，但生产配置中写完整域名更清晰，尤其跨 namespace 调用时。
+
+## 高频命令
+
+查看 Service 和 endpoints：
+
+```bash
+kubectl get svc
+kubectl describe svc order-api
+kubectl get endpoints order-api
+kubectl get endpointslice -l kubernetes.io/service-name=order-api
+```
+
+检查 Service 是否选中 Pod：
+
+```bash
+kubectl get pod -l app=order-api -o wide
+kubectl get pod --show-labels
+```
+
+从调用方 Pod 内验证 DNS 和 HTTP：
+
+```bash
+kubectl exec -it <user-pod> -- nslookup order-api
+kubectl exec -it <user-pod> -- wget -qO- http://order-api
+kubectl exec -it <user-pod> -- wget -qO- http://order-api.default.svc.cluster.local
+```
+
+本地临时访问集群内 Service：
+
+```bash
+kubectl port-forward svc/order-api 8080:80
+```
+
+然后在本机访问：
+
+```bash
+curl http://127.0.0.1:8080/ready
+```
+
+## 参数意义
+
+`selector` 决定 Service 选中哪些 Pod。Deployment 的 `template.metadata.labels` 必须和 Service selector 对得上，否则 endpoints 为空。
+
+`port` 是 Service 暴露给调用方的端口。调用方请求 `http://order-api:80` 或省略 HTTP 默认端口时，会进入这个端口。
+
+`targetPort` 是 Pod 内业务容器实际监听端口。后端开发常见错误是应用监听 8080，但 Service targetPort 写成 80。
+
+`type: ClusterIP` 表示只在集群内访问。服务间调用通常用它，不需要 NodePort 或 LoadBalancer。
+
+`namespace` 会影响 DNS。完整格式是：
+
+```txt
+<service>.<namespace>.svc.cluster.local
+```
+
+同 namespace 可用短名 `<service>`，跨 namespace 建议写 `<service>.<namespace>` 或完整域名。
+
+## 后端调用的工程问题
+
+服务发现只解决“找到谁”，不解决“怎么可靠调用”。后端代码仍然要设置连接超时、读取超时、重试上限和熔断策略。
+
+重试要谨慎。查询接口可以短重试，支付、扣库存、创建订单这类写操作必须依赖幂等键或业务去重。否则 Service 的负载均衡会把重复请求打到不同 Pod，放大数据问题。
+
+连接池也要适配 Kubernetes。Pod 扩缩容和发布会改变 endpoints，客户端长连接可能连着即将下线的旧 Pod。应用应设置合理的连接生命周期、空闲连接回收和错误重连。
+
+## 常见坑
+
+第一，Service selector 写错。`kubectl get endpoints order-api` 为空时，优先检查 label，而不是怀疑 DNS。
+
+第二，targetPort 写错。Service 有 ClusterIP 不代表能连到业务端口，要确认容器真实监听地址和端口。
+
+第三，应用只监听 `127.0.0.1`。容器内进程应监听 `0.0.0.0`，否则 Pod IP 访问可能失败。
+
+第四，readinessProbe 太宽松。只要 Pod Ready，就可能进入 endpoints。探针应该覆盖依赖初始化、端口监听和必要的启动状态。
+
+第五，跨 namespace 使用短服务名。短名只在当前 namespace 下解析，跨命名空间要写明 namespace。
+
+## 后端开发者检查清单
+
+- [ ] 调用方配置使用 Service DNS，而不是 Pod IP。
+- [ ] Service selector 与 Pod label 完全匹配。
+- [ ] `kubectl get endpoints <svc>` 能看到 Ready Pod IP。
+- [ ] `port` 和 `targetPort` 与应用监听端口一致。
+- [ ] 应用监听 `0.0.0.0`，不是只监听 `127.0.0.1`。
+- [ ] 客户端设置超时、重试、熔断和连接池回收。
+- [ ] 写操作重试前确认幂等设计。
+

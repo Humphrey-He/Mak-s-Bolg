@@ -1,0 +1,158 @@
+---
+slug: "kubernetes-ingress-backend-routing"
+title: "Kubernetes Ingress：后端服务的 HTTP 入口和路由"
+description: "从后端视角理解 Ingress、Ingress Controller、域名、路径、TLS 与 Service 之间的关系。"
+date: "2026-05-13"
+tag: "Cloud Native"
+readTime: "19 min"
+top: false
+featured: false
+---
+
+## 这篇解决什么问题
+
+Service 解决的是集群内部访问，但真实业务还需要从浏览器、网关、移动端或第三方系统进入集群。你当然可以把每个服务都做成 LoadBalancer，但这样会让公网入口、证书、域名、转发规则分散在很多地方，后续很难治理。
+
+Ingress 负责描述 HTTP/HTTPS 入口规则：哪个域名、哪个路径、转发到哪个 Service。它让后端开发者不用直接操作七层负载均衡器，也能用 YAML 管理访问入口。
+
+## 架构位置
+
+Ingress 本身只是一份规则，真正接流量的是 Ingress Controller。常见请求链路是：
+
+```txt
+用户请求 https://api.example.com/orders
+  -> 外部负载均衡器
+  -> Ingress Controller
+  -> Ingress 规则匹配 host/path
+  -> Service api:80
+  -> Pod containerPort
+```
+
+所以排查时要分清三个对象：Ingress 是路由声明，Ingress Controller 是实际网关进程，Service 是后端稳定入口。只创建 Ingress 但集群没有 Controller，规则不会自动生效。
+
+## 核心名词
+
+- Ingress：HTTP/HTTPS 路由规则对象。
+- Ingress Controller：监听 Ingress 并处理真实流量的组件。
+- IngressClass：指定由哪个 Controller 处理规则。
+- host：域名匹配条件。
+- path：路径匹配条件。
+- pathType：路径匹配方式，如 `Prefix`、`Exact`。
+- backend：路由命中的后端 Service。
+- TLS：HTTPS 证书配置。
+
+## 最小可运行示例
+
+假设已经有一个名为 `api` 的 Service，暴露 80 端口：
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api
+spec:
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 80
+```
+
+应用并查看：
+
+```bash
+kubectl apply -f ingress.yaml
+kubectl get ingress
+kubectl describe ingress api
+```
+
+如果本地没有真实 DNS，可以临时用 `curl` 指定 Host 头测试：
+
+```bash
+curl -H "Host: api.example.com" http://<ingress-address>/
+```
+
+带 TLS 的写法通常是：
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api
+spec:
+  tls:
+    - hosts:
+        - api.example.com
+      secretName: api-tls
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 80
+```
+
+这里的 `api-tls` 是一个包含 `tls.crt` 和 `tls.key` 的 Secret。
+
+## 高频命令
+
+```bash
+kubectl get ingress
+kubectl describe ingress api
+kubectl get ingressclass
+kubectl get svc
+kubectl get endpoints api
+kubectl logs -n ingress-nginx deploy/ingress-nginx-controller
+```
+
+`get ingress` 重点看 ADDRESS 是否分配、HOSTS 是否正确。`describe ingress` 会显示路由、后端 Service 以及 Controller 写入的事件。`get ingressclass` 用来确认集群支持哪些 Controller。Controller 日志适合排查 404、502、证书加载失败、规则冲突等问题。
+
+## 参数意义
+
+`host` 是域名条件。没有 DNS 解析到入口地址，请求根本到不了 Controller；DNS 正确但 Host 不匹配，规则也不会命中。
+
+`pathType: Prefix` 表示按路径前缀匹配，`/api` 可以匹配 `/api/users`。`Exact` 表示完全匹配。后端 API 常用 Prefix，但要小心 `/api` 和 `/api/` 的行为差异，最好在网关和应用路由里保持一致。
+
+`backend.service.name` 必须是同命名空间下的 Service 名称。`backend.service.port.number` 指的是 Service 的 `port`，不是容器的 `containerPort`。请求从 Ingress 到 Service，再由 Service 转到 Pod。
+
+`ingressClassName` 可以显式指定 Controller：
+
+```yaml
+spec:
+  ingressClassName: nginx
+```
+
+多套入口并存时，比如内网和公网 Controller 同时存在，建议明确写上它。
+
+## 常见问题
+
+Ingress 创建成功但没有 ADDRESS，通常是 Controller 没安装、IngressClass 不匹配，或云负载均衡器创建失败。
+
+访问返回 404，先确认请求 Host 和 path 是否命中规则。很多时候浏览器访问的是 IP，没有带正确域名，Controller 找不到匹配规则。
+
+访问返回 502 或 503，重点看 Service 和 Endpoints。Ingress 能找到规则，但后端没有 Pod、Pod 未 Ready、端口错误，都会导致网关层错误。
+
+HTTPS 证书不生效，检查 Secret 是否在同一 namespace、类型是否正确、key 名是否为 `tls.crt` 和 `tls.key`。
+
+路径转发后应用路由不匹配，说明 Ingress 是否剥离前缀、应用是否以子路径部署没有统一。不要假设所有 Controller 都自动 rewrite，重写路径通常需要 Controller 特定配置。
+
+## 后端开发者检查清单
+
+- [ ] 集群已安装并运行 Ingress Controller。
+- [ ] IngressClass 与 Controller 匹配，必要时显式写 `ingressClassName`。
+- [ ] DNS 已解析到入口地址，测试时 Host 头正确。
+- [ ] `backend.service.port.number` 写的是 Service port。
+- [ ] Service Endpoints 非空，后端 Pod Ready。
+- [ ] TLS Secret 与 Ingress 位于同一命名空间。
+- [ ] 应用路由和 Ingress path 前缀、重写规则保持一致。

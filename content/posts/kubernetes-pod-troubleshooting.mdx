@@ -1,0 +1,166 @@
+---
+slug: "kubernetes-pod-troubleshooting"
+title: "Kubernetes 常见故障排查：Pod 为什么起不来"
+description: "从 Pending、ImagePullBackOff、CrashLoopBackOff、CreateContainerConfigError 到 Running 但访问不通，建立后端服务的 Pod 排查路径。"
+date: "2026-05-13"
+tag: "Cloud Native"
+readTime: "20 min"
+top: false
+featured: false
+---
+
+后端服务在 Kubernetes 里出问题时，最常见的一句话是：“Pod 起不来。”但 Pod 起不来只是表象，它可能是资源不足、镜像拉取失败、配置缺失、启动命令错误、健康检查失败，也可能是服务已经 Running 但没有 Ready。
+
+排查 Pod 的关键不是背状态名，而是把问题拆成三个层次：Kubernetes 有没有把 Pod 调度出去，容器运行时有没有把镜像拉下来并启动进程，应用进程启动后有没有准备好接流量。
+
+## 问题场景
+
+一个支付回调服务发布新版本后，Deployment 显示 3 个副本，但只有 1 个 Ready。用户请求偶尔 502。开发同学进入容器看不到明显错误，重启后又短暂恢复。
+
+这类问题不能直接归因于代码或集群。正确顺序是先看 Pod 状态，再看 Events，再看容器日志，最后检查 Service、探针和端口。Kubernetes 已经把很多线索放在对象状态里，关键是按顺序读。
+
+## 架构解释
+
+一个 Deployment 创建 Pod 后，会经历大致流程：
+
+```txt
+Deployment 更新
+  -> ReplicaSet 创建 Pod
+  -> scheduler 选择 Node
+  -> kubelet 拉取镜像
+  -> container runtime 启动容器
+  -> 探针判断 Ready
+  -> Service endpoints 收录 Pod
+```
+
+任何一步失败，都会反映在 `kubectl get pod`、`kubectl describe pod`、容器日志或 Events 中。不要一上来就 `exec`，很多失败状态下容器根本没有启动成功。
+
+## 核心名词
+
+- `Pending`：Pod 还没有被成功调度或容器还没有准备好创建。
+- `ImagePullBackOff`：镜像拉取失败后进入退避重试。
+- `ErrImagePull`：镜像第一次拉取失败。
+- `CrashLoopBackOff`：容器启动后很快退出，Kubernetes 反复重启。
+- `CreateContainerConfigError`：容器配置生成失败，常见于 ConfigMap 或 Secret 引用错误。
+- `OOMKilled`：容器超过内存限制被杀死。
+- `Ready`：Pod 是否可以被 Service 接入流量。
+- `Restart Count`：容器重启次数，是判断稳定性的关键字段。
+
+## 最小示例
+
+下面这个 Deployment 故意引用了一个不存在的 Secret，Pod 很可能进入 `CreateContainerConfigError`：
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+        - name: api
+          image: registry.example.com/team/api:v1.0.0
+          env:
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: missing-db-secret
+                  key: password
+```
+
+排查时不要先改代码，先执行：
+
+```bash
+kubectl get pod
+kubectl describe pod <pod>
+kubectl get events --sort-by=.lastTimestamp
+```
+
+`describe` 的 Events 通常会明确提示找不到哪个 Secret 或 ConfigMap。
+
+## 高频命令
+
+查看整体状态：
+
+```bash
+kubectl get deploy,rs,pod
+kubectl get pod -o wide
+kubectl get pod -l app=api --watch
+```
+
+查看单个 Pod 细节：
+
+```bash
+kubectl describe pod <pod>
+kubectl get pod <pod> -o yaml
+```
+
+查看日志：
+
+```bash
+kubectl logs <pod>
+kubectl logs <pod> --previous
+kubectl logs -f deploy/api --tail=200
+kubectl logs <pod> -c <container>
+```
+
+检查服务是否选中了 Pod：
+
+```bash
+kubectl get svc,endpoints
+kubectl describe svc api
+kubectl get pod -l app=api --show-labels
+```
+
+临时进入容器：
+
+```bash
+kubectl exec -it <pod> -- sh
+kubectl exec -it <pod> -- env
+kubectl exec -it <pod> -- netstat -lnt
+```
+
+如果镜像里没有 `sh`、`netstat` 等工具，需要用临时调试容器或单独启动 debug Pod。
+
+## 参数意义
+
+`-o wide` 会显示 Pod IP、所在 Node 等信息。Pending 时它能帮助判断是否已经调度；Running 但不通时它能帮助从同节点或跨节点方向继续排查。
+
+`--previous` 用来查看上一轮容器实例日志。CrashLoopBackOff 时当前容器可能刚启动，真正的异常在上一轮日志里。
+
+`-c <container>` 用于多容器 Pod。比如 sidecar、init container、主业务容器同时存在时，不指定容器可能看错日志。
+
+`--sort-by=.lastTimestamp` 会按时间排序 Events。排查发布故障时，时间顺序比资源类型更重要。
+
+## 常见状态怎么判断
+
+`Pending` 先看 `describe pod` 的 Events。如果提示 `Insufficient cpu` 或 `Insufficient memory`，说明资源请求过大或集群资源不足。如果提示 node selector、taint、affinity 不匹配，就检查调度约束。
+
+`ImagePullBackOff` 先确认镜像名、tag、仓库地址和镜像拉取凭据。私有仓库常见问题是 `imagePullSecrets` 没配置、命名空间不对或凭据过期。
+
+`CrashLoopBackOff` 优先看 `kubectl logs --previous`。常见原因包括启动参数错误、环境变量缺失、数据库连不上、迁移脚本失败、应用监听端口冲突。
+
+`CreateContainerConfigError` 多半不是代码崩溃，而是 Kubernetes 无法组装容器配置。重点查 ConfigMap、Secret、volumeMount、command、args。
+
+`Running` 但不 Ready，要看 readinessProbe。探针路径是否存在，端口是否写对，服务启动是否慢，依赖数据库失败时是否一直返回非 200。
+
+`Running` 且 Ready 但访问不通，要跳出 Pod，看 Service selector、targetPort、Ingress 路由和网络策略。
+
+## 后端开发者检查清单
+
+- [ ] 先执行 `kubectl get pod -o wide` 判断状态、重启次数和所在 Node。
+- [ ] 对异常 Pod 执行 `kubectl describe pod`，优先阅读 Events。
+- [ ] CrashLoopBackOff 必看 `kubectl logs --previous`。
+- [ ] ImagePullBackOff 检查镜像 tag、仓库地址和 `imagePullSecrets`。
+- [ ] CreateContainerConfigError 检查 ConfigMap、Secret 和挂载字段。
+- [ ] Running 但不通时，检查 readinessProbe、Service selector 和 endpoints。
+- [ ] 不在没有证据时删除 Pod；先保留现场，再决定重启或回滚。
+

@@ -1,0 +1,191 @@
+---
+slug: "backend-cloud-native-architecture"
+title: "从单体后端到云原生架构：Kubernetes 之后还要设计什么"
+description: "面向后端开发者梳理单体服务容器化、多服务拆分、配置、日志、监控、链路追踪、发布回滚与云原生架构边界。"
+date: "2026-05-17"
+tag: "Cloud Native"
+readTime: "22 min"
+top: false
+featured: false
+---
+
+很多团队第一次接触 Kubernetes 时，会把它理解成“更高级的部署平台”。这没错，但不完整。Kubernetes 能编排容器、维持副本、暴露服务、滚动发布，却不能自动替你完成领域拆分、数据一致性、接口兼容、容量规划和故障治理。
+
+云原生架构不是把单体应用拆成很多服务，也不是把所有东西都塞进集群。它的核心是让后端系统在变化、故障和流量波动中保持可交付、可观察、可恢复。
+
+## 问题场景
+
+一个传统单体后端包含用户、订单、库存、支付、运营后台和定时任务。最初迁移到 Kubernetes 时，团队只做了容器化：一个镜像，一个 Deployment，一个 Service。上线后部署确实更标准了，但问题也很快出现：日志分散、配置靠环境变量堆叠、数据库迁移依旧手工、后台任务和 API 抢资源、发布失败时回滚依赖人工经验。
+
+这说明容器化只是第一步。Kubernetes 解决运行形态，云原生架构还要解决服务边界、数据边界、观测体系和交付流程。
+
+## 架构位置
+
+一个典型后端云原生架构可以抽象成：
+
+```txt
+用户
+  -> CDN / WAF
+  -> Ingress / API Gateway
+  -> Backend API
+  -> Worker / Scheduler
+  -> Redis / MySQL / Message Queue / Object Storage
+  -> Metrics / Logs / Traces
+  -> CI/CD / Rollback
+```
+
+Kubernetes 主要承载中间的运行层：Deployment、Service、ConfigMap、Secret、Ingress、Job、CronJob、HPA。数据库、消息队列、对象存储、监控系统可以运行在集群内，也可以使用托管服务。架构设计要根据团队能力和业务风险选择，而不是为了“纯粹”把所有组件都自建。
+
+## 核心名词
+
+- `API Gateway / Ingress`：外部流量入口，负责路由、TLS、限流、鉴权等能力。
+- `Backend Service`：处理同步请求的后端服务，通常用 Deployment 管理。
+- `Worker`：处理异步任务、消息消费、补偿任务的进程。
+- `ConfigMap / Secret`：配置和敏感信息注入方式。
+- `Observability`：可观测性，包括日志、指标和链路追踪。
+- `CI/CD`：从代码提交到镜像构建、部署、验证和回滚的流水线。
+- `SLO`：服务级目标，用业务可接受的方式定义可靠性。
+
+## 最小示例：单体先容器化
+
+不要一开始就强拆微服务。一个更稳的路径是先把单体做成标准 Kubernetes 工作负载：
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: monolith-api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: monolith-api
+  template:
+    metadata:
+      labels:
+        app: monolith-api
+    spec:
+      containers:
+        - name: api
+          image: registry.example.com/team/monolith-api:v1.0.0
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: monolith-config
+            - secretRef:
+                name: monolith-secret
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"
+```
+
+配套 Service：
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: monolith-api
+spec:
+  selector:
+    app: monolith-api
+  ports:
+    - port: 80
+      targetPort: 8080
+```
+
+这个阶段重点不是拆，而是把运行标准补齐：健康检查、资源限制、配置注入、日志输出、发布回滚和监控告警。
+
+## 高频命令
+
+查看核心工作负载：
+
+```bash
+kubectl get deploy,svc,ingress,configmap,secret
+kubectl get pod -o wide
+kubectl describe deploy monolith-api
+kubectl rollout status deploy/monolith-api
+```
+
+观察运行状态：
+
+```bash
+kubectl top pod
+kubectl logs -f deploy/monolith-api --tail=200
+kubectl get events --sort-by=.lastTimestamp
+```
+
+发布和回滚：
+
+```bash
+kubectl set image deploy/monolith-api api=registry.example.com/team/monolith-api:v1.0.1
+kubectl rollout history deploy/monolith-api
+kubectl rollout undo deploy/monolith-api
+```
+
+检查服务入口：
+
+```bash
+kubectl get svc monolith-api
+kubectl get endpoints monolith-api
+kubectl port-forward svc/monolith-api 8080:80
+```
+
+## 参数意义
+
+`replicas` 是可用性和容量的基础，但不是越多越好。副本数增加会提高并发处理能力，也会增加数据库连接、缓存连接和下游压力。
+
+`envFrom` 可以批量注入 ConfigMap 和 Secret，适合配置项较多的服务。关键配置仍建议在文档中说明来源和默认值，避免环境变量变成不可维护的黑箱。
+
+`readinessProbe` 决定服务是否接流量。云原生架构里，发布安全很大程度依赖 readiness 是否准确。
+
+`resources` 决定调度和运行边界。单体服务通常模块多、内存画像复杂，更要通过压测和生产指标持续校准。
+
+## 从单体到多服务的演进
+
+拆服务应该从变化频率、团队边界、数据边界和故障隔离出发，而不是从代码目录出发。比如订单查询和订单写入可能读写压力不同，运营后台和用户 API 的可用性要求不同，消息消费和同步接口的资源模型也不同。
+
+一个务实的演进顺序是：
+
+```txt
+单体容器化
+  -> API 与 Worker 进程分离
+  -> 配置、日志、指标标准化
+  -> 按业务边界拆出低风险服务
+  -> 引入消息队列削峰和解耦
+  -> 建立灰度、回滚和数据迁移规范
+```
+
+拆分后，复杂度会从进程内部转移到网络、数据一致性和运维治理上。原来的函数调用变成 HTTP 或消息调用，原来的本地事务可能变成最终一致性，原来的单进程日志变成跨服务链路追踪。
+
+## 常见坑
+
+第一，把 Kubernetes 当成架构银弹。它能让服务跑起来，但不能自动解决慢 SQL、错误重试、循环依赖、接口不兼容和数据模型混乱。
+
+第二，过早微服务化。服务越多，发布、监控、链路追踪、权限、网络和数据一致性成本越高。没有成熟平台能力时，拆分会放大问题。
+
+第三，忽略异步任务。很多单体里的定时任务、消息补偿、报表导出不适合和 API 共享同一组 Pod，应该逐步拆成 Worker、Job 或 CronJob。
+
+第四，只建部署流程，不建回滚流程。真正的生产能力包括失败检测、停止放量、回滚镜像、回滚配置和处理数据兼容问题。
+
+第五，可观测性滞后。没有指标、日志聚合和 trace，服务拆分后排障会比单体更难。
+
+## 后端开发者检查清单
+
+- [ ] 单体服务先完成标准容器化，不急于拆分。
+- [ ] API、Worker、定时任务的资源模型和发布节奏分开评估。
+- [ ] 配置通过 ConfigMap/Secret 或配置中心管理，镜像保持环境无关。
+- [ ] 日志、指标、链路追踪在拆服务前建立统一规范。
+- [ ] 每个服务有 readiness、资源限制、发布策略和回滚预案。
+- [ ] 拆服务前明确数据归属、接口契约和失败补偿方式。
+- [ ] Kubernetes 负责编排，业务架构仍由后端团队设计和治理。
+

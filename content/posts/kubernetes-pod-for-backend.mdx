@@ -1,0 +1,126 @@
+---
+slug: "kubernetes-pod-for-backend"
+title: "Pod：Kubernetes 中后端服务的最小运行单元"
+description: "解释 Pod 与容器的关系、共享网络、生命周期特点，以及后端开发者最常用的 Pod 排查命令。"
+date: "2026-05-16"
+tag: "Cloud Native"
+readTime: "18 min"
+top: false
+featured: false
+---
+
+## 这篇解决什么问题
+
+后端开发者从 Docker 进入 Kubernetes 时，最常见的困惑是：我明明只想跑一个容器，为什么还要先理解 Pod？
+
+因为 Kubernetes 不直接调度单个容器，而是调度 Pod。Pod 是一个小运行环境，里面可以包含一个或多个容器，这些容器共享网络命名空间和部分存储。大多数后端 API 是“一个 Pod 一个主容器”，但理解 Pod 之后，日志、端口、探针、Sidecar 和 Service 选择都会清晰很多。
+
+## 架构位置
+
+Pod 位于 Deployment 和 Container 之间：
+
+```txt
+Deployment
+  -> ReplicaSet
+  -> Pod
+  -> Container
+  -> 后端进程
+```
+
+Deployment 负责维持副本数，Pod 承载真实运行环境，容器里才是你的后端进程。生产中通常修改 Deployment，让它创建新的 Pod，而不是手动修改现有 Pod。
+
+## 核心名词
+
+- `Pod`：Kubernetes 最小调度单位。
+- `Container`：Pod 内运行的容器。
+- `Pod IP`：Pod 在集群网络中的地址，Pod 重建后可能变化。
+- `label`：标签，Service 和控制器常用它选择 Pod。
+- `restartPolicy`：Pod 内容器退出后的重启策略。
+- `initContainer`：主容器启动前执行的初始化容器。
+- `sidecar`：和主容器同 Pod 运行的辅助容器。
+- `phase`：Pod 生命周期阶段，例如 Pending、Running、Succeeded、Failed。
+
+## 最小示例
+
+下面示例运行一个 nginx，模拟后端 HTTP 服务：
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: api-pod
+  labels:
+    app: api
+spec:
+  containers:
+    - name: api
+      image: nginx:1.27
+      ports:
+        - containerPort: 80
+      env:
+        - name: APP_ENV
+          value: dev
+```
+
+执行：
+
+```bash
+kubectl apply -f pod.yaml
+kubectl get pod api-pod -o wide
+kubectl describe pod api-pod
+kubectl logs api-pod
+```
+
+`containerPort` 是声明容器内进程监听的端口，主要给读 YAML 的人和某些工具看。它不是对外暴露服务，外部访问还需要 Service、Ingress 或端口转发。
+
+## Pod 内多容器通信
+
+同一个 Pod 内的容器共享网络命名空间，所以它们可以通过 `localhost` 互相访问。例如主容器监听 `8080`，Sidecar 可以请求 `http://127.0.0.1:8080`。
+
+但不同 Pod 之间不能用 `localhost`，即使它们在同一个 Node 上。Pod 间访问应该通过 Pod IP 或更稳定的 Service。后端服务调用另一个服务时，生产中优先使用 Service DNS。
+
+## 高频命令
+
+```bash
+kubectl get pods
+kubectl get pod api-pod -o wide
+kubectl describe pod api-pod
+kubectl logs api-pod
+kubectl logs -f api-pod
+kubectl logs api-pod -c api
+kubectl exec -it api-pod -- sh
+kubectl delete pod api-pod
+```
+
+`get pod` 看状态，`describe pod` 看事件和配置，`logs` 看应用输出，`exec` 进容器临时排查。生产环境里 `exec` 要谨慎，排查结论应回到镜像、配置或 YAML，而不是在容器里手工修。
+
+## 参数意义
+
+`-o wide` 会显示 Pod IP、所在 Node 等更多信息。网络不通或调度异常时，这些字段很关键。
+
+`-c` 用来指定 Pod 内某个容器。如果 Pod 里有多个容器，不加 `-c` 可能无法确定要看哪个容器的日志。
+
+`--previous` 可以查看上一次崩溃容器的日志。遇到 `CrashLoopBackOff` 时，当前容器可能刚重启，真正错误在 previous 日志里。
+
+`delete pod` 对裸 Pod 是删除，对 Deployment 管理的 Pod 则会触发重建。看到 Pod 被删除后又出现，是控制器在维持副本数。
+
+## 常见问题
+
+第一，直接管理生产 Pod。裸 Pod 缺少滚动更新和副本管理能力，生产后端服务应使用 Deployment。
+
+第二，把 Pod IP 写进配置。Pod IP 会变化，服务调用应该走 Service。
+
+第三，容器内服务只监听 `127.0.0.1`。如果主进程只绑定本地回环地址，Pod 外部可能无法访问，后端服务通常要监听 `0.0.0.0`。
+
+第四，只看日志不看事件。镜像拉取失败、调度失败、配置引用错误等问题，日志里未必有，`describe pod` 的 Events 更直接。
+
+## 后端开发者检查清单
+
+- [ ] 知道 Kubernetes 调度的是 Pod，不是单个容器。
+- [ ] 能解释同 Pod 容器为什么可以通过 `localhost` 通信。
+- [ ] 后端服务是否监听 `0.0.0.0` 和正确端口。
+- [ ] 排查 Pod 时是否先看状态，再看 Events，再看日志。
+- [ ] 多容器 Pod 查看日志时是否指定 `-c`。
+- [ ] 遇到重启是否查看 `--previous` 日志。
+- [ ] 是否避免把 Pod IP 写入业务配置。
+- [ ] 生产服务是否交给 Deployment 管理。

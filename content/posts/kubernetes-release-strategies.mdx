@@ -1,0 +1,194 @@
+---
+slug: "kubernetes-release-strategies"
+title: "Kubernetes 发布策略：滚动发布、蓝绿发布与灰度发布"
+description: "从 Deployment RollingUpdate 出发，理解后端服务如何在 Kubernetes 中发布、观察、回滚，并设计蓝绿和灰度发布链路。"
+date: "2026-05-15"
+tag: "Cloud Native"
+readTime: "21 min"
+top: false
+featured: false
+---
+
+后端服务上线不是把镜像 tag 改掉这么简单。一次可靠发布至少包含镜像构建、配置变更、数据库兼容、流量切换、监控观察和失败回滚。Kubernetes 提供了 Deployment 的滚动更新能力，但蓝绿发布和灰度发布还需要配合 Service、Ingress、网关或服务网格。
+
+发布策略的目标不是追求复杂，而是在“变更速度”和“故障半径”之间做权衡。内部后台服务可能用默认滚动发布就足够，核心交易链路则需要更细的灰度和回滚控制。
+
+## 问题场景
+
+一个订单 API 新版本修复了库存扣减逻辑，但同时引入了新的 Redis key 格式。直接全量发布后，老版本 worker 无法处理新消息，导致部分订单卡住。最后虽然执行了 `rollout undo`，数据兼容问题仍然需要人工修复。
+
+这说明发布策略不只是 Kubernetes 字段，还涉及接口兼容、消息兼容、数据库迁移和观测指标。Kubernetes 能帮你控制 Pod 替换节奏，但不能替你判断业务变更是否安全。
+
+## 架构解释
+
+Deployment 默认通过 ReplicaSet 管理版本：
+
+```txt
+Deployment api
+  -> ReplicaSet api-v1
+  -> ReplicaSet api-v2
+  -> Pod 新旧副本逐步替换
+```
+
+Service 通常不关心版本，只根据 label 选择一组 Ready Pod。滚动发布时，新旧 Pod 会在一段时间内同时接流量。因此后端必须保证新旧版本在接口、配置、数据库结构和消息格式上短时间兼容。
+
+## 核心名词
+
+- `RollingUpdate`：滚动发布，逐步创建新 Pod 并移除旧 Pod。
+- `maxSurge`：发布过程中允许额外创建的 Pod 数量或比例。
+- `maxUnavailable`：发布过程中允许不可用的 Pod 数量或比例。
+- `rollout history`：Deployment 的发布历史。
+- `rollout undo`：回滚到上一个版本或指定 revision。
+- `Blue/Green`：蓝绿发布，两套环境同时存在，通过切换 Service 或网关流量完成发布。
+- `Canary`：灰度发布，让少量流量先进入新版本。
+
+## 最小示例：滚动发布
+
+一个偏保守的滚动发布配置如下：
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  replicas: 4
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+        - name: api
+          image: registry.example.com/team/api:v1.0.1
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            periodSeconds: 5
+```
+
+`maxUnavailable: 0` 表示发布过程中不主动减少可用副本，`maxSurge: 1` 表示最多额外多一个 Pod。这个策略会稍慢，但对后端 API 更稳。
+
+发布镜像：
+
+```bash
+kubectl set image deploy/api api=registry.example.com/team/api:v1.0.2
+kubectl rollout status deploy/api
+```
+
+回滚：
+
+```bash
+kubectl rollout history deploy/api
+kubectl rollout undo deploy/api
+```
+
+## 蓝绿发布示例
+
+蓝绿发布的核心是准备两套 Deployment，用 Service selector 决定当前流量指向哪一套。
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+spec:
+  selector:
+    app: api
+    version: blue
+  ports:
+    - port: 80
+      targetPort: 8080
+```
+
+当 green 环境验证完成后，将 selector 切到 green：
+
+```yaml
+spec:
+  selector:
+    app: api
+    version: green
+```
+
+蓝绿发布的优点是切换清晰、回退快；缺点是资源占用更高，并且如果数据库变更不兼容，回退仍然可能失败。
+
+## 灰度发布思路
+
+Kubernetes 原生 Service 不支持按百分比分流。简单灰度可以通过两个 Deployment 加不同 label，再由 Ingress Controller、网关、服务网格或业务路由按 header、用户 ID、比例做分流。
+
+```txt
+Ingress / Gateway
+  -> 95% traffic -> Service api-stable -> Deployment api-v1
+  -> 5% traffic  -> Service api-canary -> Deployment api-v2
+```
+
+灰度发布最重要的是观察指标：错误率、延迟、核心业务成功率、资源使用、日志异常、下游依赖错误。没有指标的灰度只是慢一点的全量发布。
+
+## 高频命令
+
+```bash
+kubectl get deploy,rs,pod -l app=api
+kubectl rollout status deploy/api
+kubectl rollout history deploy/api
+kubectl rollout undo deploy/api
+kubectl rollout undo deploy/api --to-revision=3
+kubectl set image deploy/api api=registry.example.com/team/api:v1.0.2
+kubectl describe deploy api
+```
+
+观察新旧 ReplicaSet：
+
+```bash
+kubectl get rs -l app=api
+kubectl get pod -l app=api --show-labels
+kubectl logs -f deploy/api --tail=200
+```
+
+暂停和继续发布：
+
+```bash
+kubectl rollout pause deploy/api
+kubectl rollout resume deploy/api
+```
+
+## 参数意义
+
+`maxSurge` 可以是数字也可以是百分比。副本数为 4 时，`maxSurge: 1` 表示最多创建 5 个 Pod。它影响发布速度和资源占用。
+
+`maxUnavailable` 控制发布期间最多允许多少副本不可用。对核心 API，通常倾向于 0 或较小值；对离线任务，可以更激进。
+
+`revisionHistoryLimit` 控制保留多少历史 ReplicaSet。保留太少会影响回滚，保留太多会增加对象数量。
+
+`progressDeadlineSeconds` 控制 Deployment 多久没有进展后判定失败。镜像拉取慢、探针失败、资源不足都可能导致 rollout 卡住。
+
+## 常见坑
+
+第一，readinessProbe 缺失。没有 readinessProbe 时，新 Pod 一启动就可能被 Service 接流量，即使应用还在加载缓存或连接数据库。
+
+第二，使用 `latest` tag。回滚时你以为回到旧版本，实际镜像内容可能已经变了。生产发布应该使用不可变版本号或镜像 digest。
+
+第三，数据库先做破坏性变更。字段删除、语义修改、消息格式不兼容都会让回滚失效。更稳的做法是 expand -> migrate -> contract。
+
+第四，只看 Pod Ready，不看业务指标。Pod Ready 只能说明探针通过，不代表下单、支付、发券等核心流程正常。
+
+## 后端开发者检查清单
+
+- [ ] 镜像 tag 可追溯，不使用 `latest` 做生产发布。
+- [ ] Deployment 配置了合理的 RollingUpdate 策略。
+- [ ] readinessProbe 能真实反映是否可接流量。
+- [ ] 新旧版本短时间内兼容数据库、缓存、消息和接口。
+- [ ] 发布前有回滚命令和数据变更预案。
+- [ ] 发布中观察错误率、延迟、业务成功率和资源指标。
+- [ ] 灰度发布有明确放量规则和停止条件。
+

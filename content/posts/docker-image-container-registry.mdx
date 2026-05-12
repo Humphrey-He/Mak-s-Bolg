@@ -1,0 +1,335 @@
+---
+slug: "docker-image-container-registry"
+title: "Docker 镜像、容器与 Registry：从基础概念到生产交付治理"
+description: "解释 Image、Container、Registry、Repository、Tag、Digest 的关系，并扩展到 tag 策略、digest 部署、多架构镜像、SBOM、漏洞扫描和镜像治理。"
+date: "2026-05-13"
+tag: "Cloud Native"
+readTime: "30 min"
+top: false
+featured: false
+---
+
+## 这篇解决什么问题
+
+很多后端同学第一次接触 Docker 时，会把镜像理解成“安装包”，把容器理解成“运行中的安装包”。这个类比能入门，但不够准确。
+
+真正做部署时，你会遇到更多工程问题：
+
+- 为什么一个镜像可以启动多个互不影响的容器？
+- 为什么 `latest` 明明没变，线上行为却变了？
+- 为什么测试环境拉到的不是刚刚构建的版本？
+- 为什么同一个 tag 在不同节点上运行结果不同？
+- 为什么 Apple Silicon 上构建的镜像到 x86 Linux 服务器报 `exec format error`？
+- 生产部署应该记录 tag，还是 digest？
+- 镜像能启动就算合格吗，是否还需要扫描、签名和 SBOM？
+
+要回答这些问题，需要把 Image、Container、Registry、Repository、Tag、Digest 的关系，以及镜像交付链路和治理策略讲清楚。
+
+## 基本关系
+
+镜像是只读模板，容器是运行实例，Registry 是镜像分发中心。一次后端服务发布的入门链路通常是：
+
+```txt
+docker build
+  -> 本地 Image
+  -> docker tag
+  -> docker push
+  -> Registry
+  -> 服务器 docker pull
+  -> docker run
+  -> Container
+```
+
+镜像由多层 layer 组成。每条 Dockerfile 指令可能生成一层，Docker 会利用层缓存加快构建。容器启动时不会修改镜像本身，而是在镜像上叠加一个可写层。所以同一个镜像可以同时启动多个容器，这些容器有不同的容器 ID、网络、挂载和可写层。
+
+```bash
+docker pull redis:7
+docker run -d --name redis-a redis:7
+docker run -d --name redis-b redis:7
+docker ps
+```
+
+删除容器不会删除镜像；删除镜像也不会自动停止已经运行的容器。容器是运行时实例，镜像是交付产物。
+
+## 核心名词
+
+- Repository：镜像仓库名，例如 `redis` 或 `registry.example.com/acme/payment/api`。
+- Tag：镜像标签，例如 `7`、`v1.0.0`、`git-a1b2c3d`、`latest`。
+- Digest：内容摘要，例如 `sha256:...`，是镜像内容身份。
+- Image ID：本地镜像 ID，主要用于本机管理。
+- Container ID：容器实例 ID。
+- Layer：镜像分层，影响复用、缓存、体积和历史内容。
+- Manifest list：多架构镜像索引，同一个 tag 可以指向多个平台镜像。
+- Registry：集中存储、推送、拉取镜像的服务。
+
+## Tag 是指针，Digest 是内容身份
+
+`latest` 不是“最新版本”的可靠承诺，它只是一个普通 tag。更准确地说：
+
+```txt
+repository:tag     -> 可变指针
+repository@digest  -> 内容身份
+```
+
+例如：
+
+```bash
+docker pull registry.example.com/team/api:v1.2.3
+docker pull registry.example.com/team/api@sha256:0123456789abcdef
+```
+
+两种引用方式的差异：
+
+| 引用方式 | 是否可变 | 适用场景 |
+| --- | --- | --- |
+| `api:latest` | 可变 | 本地临时测试 |
+| `api:dev` | 可变 | 开发环境快速迭代 |
+| `api:v1.2.3` | 技术上可覆盖，规范上应不可变 | 正式版本发布 |
+| `api:git-a1b2c3d` | 建议不可变 | CI/CD 可追踪部署 |
+| `api@sha256:<digest>` | 内容不可变 | 生产精确部署、审计、回滚 |
+
+生产环境不要只依赖裸 tag 做最终部署锁定。更稳妥的方式是：CI 同时生成语义化 tag、commit tag、build tag，并让部署系统记录最终 digest。
+
+推荐发布结果：
+
+```txt
+registry.example.com/team/api:v1.8.0
+registry.example.com/team/api:git-a1b2c3d
+registry.example.com/team/api:build-20260512-001
+registry.example.com/team/api@sha256:...
+```
+
+这样排障时可以回答三个问题：
+
+- 业务版本是什么？
+- 代码 commit 是什么？
+- 最终运行的镜像内容到底是哪一个 digest？
+
+## 生产级镜像交付链路
+
+入门链路只讲 `build -> push -> pull -> run`，生产链路更长：
+
+```txt
+git commit
+  -> CI checkout
+  -> docker build
+  -> unit test / integration test
+  -> image scan
+  -> SBOM generate
+  -> docker tag
+  -> docker push
+  -> sign image
+  -> deploy by digest
+  -> runtime pull
+  -> container start
+  -> healthcheck
+  -> rollout / rollback
+```
+
+Docker 在这里不只是“把环境打包一下”。更准确地说，它把源码和构建过程变成可分发、可追踪、可审计、可回滚的运行产物。
+
+## Registry 命名规范与权限
+
+私有仓库一般需要登录：
+
+```bash
+docker login registry.example.com
+docker tag my-api:local registry.example.com/acme/payment/api:v1.12.0
+docker push registry.example.com/acme/payment/api:v1.12.0
+```
+
+推荐命名结构：
+
+```txt
+registry.example.com/<org>/<project>/<service>:<tag>
+```
+
+示例：
+
+```txt
+registry.example.com/acme/payment/api:v1.12.0
+registry.example.com/acme/payment/worker:v1.12.0
+registry.example.com/acme/order/api:git-a1b2c3d
+```
+
+团队规范建议：
+
+- repository 名称按组织、项目、服务分层。
+- tag 中包含 git commit 或构建号。
+- 不同环境不要使用不同镜像内容的同名 tag。
+- CI 有 push 权限，开发者本地默认不应直接 push 生产仓库。
+- 生产部署系统只允许 pull 特定 namespace。
+- 禁止随意覆盖 release tag。
+
+反例：
+
+```txt
+api:prod
+api:test
+api:latest
+```
+
+这些 tag 太模糊，长期会导致排障困难。`prod` 是环境，不是镜像版本；`latest` 是指针，不是版本锁。
+
+## 多架构镜像
+
+现在很多后端开发者在 Apple Silicon 上构建镜像，然后部署到 x86 Linux 服务器。如果构建平台和运行平台不一致，可能遇到：
+
+```txt
+exec format error
+```
+
+可以用 `buildx` 构建指定架构：
+
+```bash
+docker buildx build \
+  --platform linux/amd64 \
+  -t registry.example.com/team/api:linux-amd64 \
+  --push .
+```
+
+也可以发布多架构镜像：
+
+```bash
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -t registry.example.com/team/api:v1.0.0 \
+  --push .
+```
+
+同一个 tag 可以对应一个 manifest list，里面包含多个平台的镜像。运行节点会根据自身架构拉取匹配的镜像。
+
+检查镜像平台：
+
+```bash
+docker buildx imagetools inspect registry.example.com/team/api:v1.0.0
+```
+
+## SBOM、漏洞扫描与镜像签名
+
+生产镜像不仅要能运行，还要能被审计。
+
+| 能力 | 作用 |
+| --- | --- |
+| SBOM | 记录镜像里包含哪些依赖、系统包和组件 |
+| Vulnerability Scan | 扫描基础镜像、系统包和语言依赖漏洞 |
+| Image Signing | 证明镜像来源可信，防止被替换 |
+| Provenance | 记录镜像由哪个 CI、源码和构建参数产生 |
+| Digest Pinning | 确保部署内容不可变 |
+
+常见工具：
+
+```txt
+syft        -> 生成 SBOM
+grype       -> 漏洞扫描
+trivy       -> 漏洞扫描和配置检查
+cosign      -> 镜像签名
+docker scout -> Docker 官方生态扫描工具
+```
+
+示例命令：
+
+```bash
+syft registry.example.com/team/api:v1.0.0
+trivy image registry.example.com/team/api:v1.0.0
+cosign sign registry.example.com/team/api@sha256:<digest>
+```
+
+镜像不是“能启动就合格”。生产镜像还应可追踪、可审计、可扫描、可签名、可回滚。
+
+## Registry 保留与清理策略
+
+Registry 不是无限制归档系统。真实团队会遇到：
+
+```txt
+CI 每次构建都生成 tag
+镜像越推越多
+Registry 存储持续上涨
+旧 digest 仍被节点缓存或部署引用
+删除 tag 不一定立刻删除 blob
+垃圾回收策略因 Registry 实现而不同
+```
+
+常见保留策略：
+
+- 保留最近 N 个构建。
+- 保留最近 90 天。
+- 保留所有 release tag。
+- 保留生产正在运行的 digest。
+- 删除未被任何环境引用的临时镜像。
+
+对 Harbor、GitLab Registry、ECR、ACR、GCR 这类仓库来说，清理策略是平台治理的一部分，不是“磁盘满了再说”。
+
+## 本地镜像与容器清理
+
+常用命令：
+
+```bash
+docker images
+docker ps -a
+docker system df
+docker container prune
+docker image prune
+docker image prune -a
+docker system prune
+```
+
+含义：
+
+| 命令 | 作用 |
+| --- | --- |
+| `docker container prune` | 删除已停止容器 |
+| `docker image prune` | 删除 dangling images |
+| `docker image prune -a` | 删除未被容器使用的镜像 |
+| `docker system df` | 查看 Docker 磁盘占用 |
+| `docker system prune` | 清理多类未使用资源 |
+
+不要在不了解影响时直接执行：
+
+```bash
+docker system prune -a --volumes
+```
+
+它可能删除本地数据库 volume、仍需复用的镜像缓存或其他项目依赖。
+
+## 高频命令
+
+```bash
+docker pull redis:7
+docker images
+docker inspect redis:7
+docker history redis:7
+docker tag my-api:local registry.example.com/team/my-api:v1.0.0
+docker push registry.example.com/team/my-api:v1.0.0
+docker buildx imagetools inspect registry.example.com/team/my-api:v1.0.0
+docker system df
+```
+
+`docker inspect` 可以查看镜像或容器的完整元数据，包括环境变量、启动命令、端口、挂载和网络。`docker history` 用来观察镜像层来源，排查镜像为什么很大、某个文件可能在哪一层进入镜像。
+
+## 常见坑
+
+第一，把 tag 当版本锁。`api:prod`、`api:latest`、`api:test` 都可能被覆盖。部署系统如果只写 tag，实际拉到哪个内容取决于仓库当前状态、节点缓存和拉取策略。
+
+第二，镜像层泄漏敏感信息。即使后续 `RUN rm secret.txt`，密钥也可能留在历史层里。敏感文件从一开始就不应该进入构建上下文。
+
+第三，容器内修改被误认为镜像修改。进入容器手动改文件，只影响该容器的可写层。删除容器后修改就没了，也不会进入镜像。
+
+第四，Apple 芯片构建镜像后直接部署到 x86 服务器，导致 `exec format error`。需要指定 `--platform` 或发布多架构镜像。
+
+第五，Registry 权限过宽。开发者可以随意覆盖生产 tag，会让回滚和审计变得非常危险。
+
+## 后端开发者检查清单
+
+- [ ] 能区分 repository、tag、digest、image id、container id。
+- [ ] 知道 tag 是可变引用，digest 是内容不可变引用。
+- [ ] 生产部署不依赖裸 `latest`。
+- [ ] CI 为每次构建生成 commit tag 或 build tag。
+- [ ] 发布系统记录最终部署 digest。
+- [ ] 镜像命名符合组织 / 项目 / 服务规范。
+- [ ] Registry 权限最小化，开发者不能随意覆盖生产 tag。
+- [ ] 旧镜像有保留和清理策略。
+- [ ] 生产镜像经过漏洞扫描。
+- [ ] 关键镜像有 SBOM 和签名。
+- [ ] 构建上下文不会包含密钥、日志、缓存和测试数据。
+- [ ] 知道如何检查镜像平台架构。

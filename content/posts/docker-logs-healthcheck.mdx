@@ -1,0 +1,437 @@
+---
+slug: "docker-logs-healthcheck"
+title: "容器日志与健康检查：结构化日志、探针语义与优雅退出"
+description: "讲清容器化后 stdout/stderr、logging driver、结构化日志、日志脱敏、Docker HEALTHCHECK、readiness/liveness/startup、优雅退出和排障路径。"
+date: "2026-05-14"
+tag: "Cloud Native"
+readTime: "29 min"
+top: false
+featured: false
+---
+
+## 这篇解决什么问题
+
+容器跑起来不代表服务真的可用。后端进程可能已经启动，但数据库连不上；端口可能监听了，但依赖缓存不可用；接口可能返回 500，但容器状态仍然是 `Up`。
+
+容器化之后，日志和健康检查是排查问题的第一入口：
+
+```txt
+日志回答：服务内部发生了什么？
+健康检查回答：这个容器当前是否适合存活或接流量？
+```
+
+它们不是监控系统的全部，但能让本地开发、CI、Compose 和编排系统更快判断问题。高质量后端容器文档不应只写 `docker logs` 和 `/health`，还要讲结构化日志、脱敏、日志轮转、probe 语义、健康检查边界和 SIGTERM 优雅退出。
+
+## 容器日志链路
+
+容器内通常只运行一个主进程。这个进程输出到 `stdout` 和 `stderr`，Docker 负责收集日志：
+
+```txt
+后端进程
+  -> stdout / stderr
+  -> Docker logging driver
+  -> docker logs / host log file / 日志平台
+```
+
+`stdout/stderr` 是应用输出规范；logging driver 是 Docker 如何保存或转发这些输出；日志轮转是防止宿主机磁盘被容器日志打满的必要配置。
+
+新后端服务默认应把日志输出到控制台，而不是只写容器内文件。容器可以删除、重建、迁移，文件日志如果没有挂载或采集，很容易丢失。
+
+例外场景也存在：某些 legacy 应用或审计场景必须写文件日志。这时应该把日志目录挂载到 volume，并由 sidecar、agent 或 host collector 采集。但对于新服务，优先 stdout/stderr。
+
+## 结构化日志
+
+只输出：
+
+```txt
+payment failed
+```
+
+对排障帮助有限。更推荐 JSON 结构化日志：
+
+```json
+{
+  "ts": "2026-05-14T10:12:30.123Z",
+  "level": "error",
+  "service": "payment-api",
+  "env": "prod",
+  "version": "v1.2.3",
+  "trace_id": "4f8c9c...",
+  "request_id": "req-123",
+  "method": "POST",
+  "path": "/payments",
+  "status": 500,
+  "latency_ms": 82,
+  "error_code": "DB_TIMEOUT",
+  "message": "database timeout"
+}
+```
+
+建议字段：
+
+- `timestamp` / `ts`
+- `level`
+- `service`
+- `env`
+- `version`
+- `trace_id`
+- `request_id`
+- `method`
+- `path`
+- `status`
+- `latency_ms`
+- `error_code`
+- `message`
+- `user_id` / `tenant_id`，但要注意脱敏
+
+`trace_id`、`request_id`、`correlation_id` 是后端排障非常关键的字段。它们能把网关、API、Worker、数据库慢查询、消息消费日志串起来。
+
+## 日志脱敏与轮转
+
+容器日志通常会被平台集中采集，日志一旦进入日志平台，传播范围往往比应用数据库更大，因此必须做脱敏。
+
+高危内容包括：
+
+```txt
+密码
+token
+cookie
+authorization header
+身份证 / 手机号 / 邮箱
+银行卡
+数据库连接串
+私钥
+验证码
+session id
+refresh token
+```
+
+实践建议：
+
+- 对 `Authorization`、`Cookie`、`Set-Cookie` 默认屏蔽。
+- 对手机号、邮箱、身份证做部分掩码。
+- 错误日志不要打印完整请求体。
+- Debug 日志不要在生产默认开启。
+- 日志采集链路要设置保留周期和访问权限。
+
+Docker 单机或 Compose 场景下，要防止容器日志无限增长：
+
+```bash
+docker run \
+  --log-driver json-file \
+  --log-opt max-size=10m \
+  --log-opt max-file=3 \
+  my-api:local
+```
+
+Compose：
+
+```yaml
+services:
+  api:
+    image: my-api:local
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+```
+
+其他 logging driver 包括：
+
+```txt
+local
+json-file
+journald
+syslog
+fluentd
+gelf
+awslogs
+```
+
+生产环境通常由平台统一采集 stdout/stderr，而不是让应用自己管理日志文件。
+
+## Docker HEALTHCHECK 工作机制
+
+Docker 健康检查是在容器内定期执行一条命令，根据退出码判断健康状态。退出码 `0` 表示成功，非 `0` 表示失败。
+
+写法一：运行镜像有 wget / curl。
+
+```dockerfile
+HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=3 \
+  CMD wget -qO- http://127.0.0.1:8080/health || exit 1
+```
+
+写法二：应用内置 healthcheck 子命令，更适合 distroless。
+
+```dockerfile
+HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=3 \
+  CMD ["/app/api", "healthcheck"]
+```
+
+写法三：不在 Dockerfile 写，交给 Compose 或 Kubernetes 按环境配置。
+
+Compose：
+
+```yaml
+services:
+  api:
+    healthcheck:
+      test: ["CMD", "/app/api", "healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+```
+
+Kubernetes：
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /live
+    port: 8080
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: 8080
+startupProbe:
+  httpGet:
+    path: /startup
+    port: 8080
+```
+
+Dockerfile `HEALTHCHECK` 适合声明镜像默认健康检查；Compose / Kubernetes 层的健康检查更适合按环境调整。
+
+一个关键边界：Docker `HEALTHCHECK` 只改变容器健康状态，不会自动重启普通 `docker run` 启动的容器。
+
+如果想自动恢复，需要：
+
+- Docker restart policy。
+- Docker Compose 配合 `restart`。
+- Swarm / Kubernetes 这类编排系统。
+- 外部 supervisor。
+
+但 `restart` policy 主要基于进程退出，不一定基于 `unhealthy` 自动重启。如果进程还活着但 healthcheck unhealthy，普通 Compose 并不会像 Kubernetes 一样自动替换容器。
+
+## /live、/ready、/startup、/health
+
+不要把所有探针都混成 `/health`。
+
+| 接口 | 语义 | 是否检查依赖 | 失败后含义 |
+| --- | --- | --- | --- |
+| `/live` | 进程是否还活着 | 通常不检查外部依赖 | 失败说明进程可能需要重启 |
+| `/ready` | 是否可以接流量 | 检查关键依赖 | 失败说明暂时不应接流量 |
+| `/startup` | 是否完成启动 | 检查初始化完成状态 | 失败说明还在启动或启动失败 |
+| `/health` | 通用健康接口 | 语义容易混杂 | 小项目可用，大项目建议拆分 |
+
+不要把所有依赖都塞进 liveness。数据库短暂不可用不一定意味着进程应该被重启。依赖不可用更适合影响 readiness，让流量暂时不要打进来。
+
+健康检查可以分三层：
+
+```txt
+Level 1：进程级
+- HTTP server 是否响应
+- event loop / goroutine 是否未死锁
+
+Level 2：关键依赖级
+- 数据库连接池是否可用
+- Redis 是否可用
+- 必要配置是否加载
+
+Level 3：业务级
+- 下单链路是否正常
+- 支付网关是否可用
+- 第三方供应商是否稳定
+```
+
+推荐对应关系：
+
+```txt
+/live    -> Level 1
+/ready   -> Level 1 + 关键依赖
+synthetic monitoring / blackbox probe -> Level 3
+```
+
+## 健康检查参数与雪崩风险
+
+关键参数：
+
+- `interval`：检查间隔。
+- `timeout`：单次检查超时。
+- `retries`：连续失败多少次判定 unhealthy。
+- `start_period`：启动宽限期。
+
+如果每个容器每 5 秒 healthcheck 一次，每次都查 DB、Redis、下游 HTTP，当服务有 500 个副本时，健康检查本身就会形成持续压力。
+
+建议：
+
+- `/live` 只做本进程轻量检查。
+- `/ready` 可以检查关键依赖，但要设置短超时。
+- 依赖检查结果可短时间缓存，例如 1-5 秒。
+- 健康检查不要执行写操作。
+- 健康检查不要调用昂贵查询。
+- 健康检查不要依赖长链路下游。
+- 健康检查命令输出应简短，只输出失败原因摘要。
+- 不要在 healthcheck 中打印大量日志、堆栈或敏感信息。
+
+## Compose 下的日志与健康检查模板
+
+```yaml
+services:
+  api:
+    image: registry.example.com/team/api:v1.2.3
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      LOG_FORMAT: json
+      LOG_LEVEL: info
+    healthcheck:
+      test: ["CMD", "/app/api", "healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    restart: unless-stopped
+```
+
+含义：
+
+- `LOG_FORMAT=json`：便于日志平台解析。
+- `healthcheck`：让 Docker 记录容器健康状态。
+- `logging options`：限制本机日志文件体积。
+- `restart`：进程异常退出后自动拉起。
+
+再次提醒：普通 Docker / Compose 不等价于 Kubernetes。`healthcheck unhealthy` 不一定会自动重建容器。生产自愈能力应交给编排系统或外部 supervisor。
+
+## SIGTERM 与优雅退出
+
+日志、健康检查和容器生命周期应该连在一起。
+
+服务收到 `SIGTERM` 时，推荐流程：
+
+```txt
+1. 收到 SIGTERM。
+2. readiness 立即返回失败。
+3. 停止接收新请求。
+4. 等待已有请求完成。
+5. 关闭数据库连接、消息消费者、后台任务。
+6. 在 grace period 内退出。
+```
+
+Go 示例：
+
+```go
+ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+defer stop()
+
+<-ctx.Done()
+
+ready.Store(false)
+
+shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+defer cancel()
+
+_ = server.Shutdown(shutdownCtx)
+```
+
+这能避免发布、扩容、缩容时流量继续打到正在退出的实例上。
+
+## 高频命令
+
+```bash
+docker logs api
+docker logs -f api
+docker logs --tail 100 api
+docker logs --since 10m api
+docker inspect --format='{{json .State.Health}}' api
+docker ps
+docker exec -it api sh
+```
+
+如果有 `jq`：
+
+```bash
+docker inspect --format='{{json .State.Health}}' api | jq
+```
+
+如果没有：
+
+```bash
+docker inspect api
+```
+
+## 问题导向排障
+
+### 容器显示 Up 但接口不可用
+
+```bash
+docker ps
+docker logs --tail 100 api
+docker inspect --format='{{json .State.Health}}' api
+docker exec -it api sh
+```
+
+进入容器后：
+
+```bash
+ss -lntp
+wget -qO- http://127.0.0.1:8080/health
+```
+
+判断：
+
+- 应用是否监听 `0.0.0.0`。
+- 健康检查命令是否存在。
+- `/health` 是否阻塞。
+- 端口是否和 `EXPOSE` / `ports` 配置一致。
+- 应用是否实际启动成功。
+
+### 健康检查一直 unhealthy
+
+```bash
+docker inspect --format='{{json .State.Health}}' api
+docker logs --tail 100 api
+docker exec -it api sh
+```
+
+检查：
+
+- `HEALTHCHECK` 命令在镜像里是否存在。
+- `127.0.0.1:8080` 是否是正确地址。
+- `/health` 是否返回 200。
+- `timeout` 是否太短。
+- `start_period` 是否太短。
+- healthcheck 是否依赖了尚未就绪的外部服务。
+
+### 日志里找不到请求链路
+
+检查：
+
+- 网关是否生成 `request_id` 或 `trace_id`。
+- 应用是否把 ID 写入每条请求日志。
+- 异步任务是否把 correlation ID 传到消息里。
+- 错误日志是否包含 `service`、`version`、`env`。
+- 日志平台是否按 JSON 解析字段。
+
+## 后端开发者检查清单
+
+- [ ] 应用日志是否输出到 stdout / stderr。
+- [ ] 日志是否为结构化 JSON 或可被稳定解析的格式。
+- [ ] 日志是否包含 timestamp、level、service、version、trace_id、request_id。
+- [ ] 日志是否避免输出 token、cookie、密码、隐私字段。
+- [ ] Docker 单机场景是否配置日志轮转。
+- [ ] 是否区分 `/live`、`/ready`、`/startup`，或明确 `/health` 语义。
+- [ ] liveness 是否避免依赖数据库、Redis、第三方服务。
+- [ ] readiness 是否覆盖关键依赖但保持轻量和短超时。
+- [ ] healthcheck 命令在运行镜像中是否真实存在。
+- [ ] `interval`、`timeout`、`retries`、`start_period` 是否符合服务特征。
+- [ ] 是否理解 Docker `HEALTHCHECK` 不会自动修复普通容器。
+- [ ] 是否实现 `SIGTERM` 优雅退出。
+- [ ] 服务退出前是否先让 readiness 失败，停止接流量。
+- [ ] 是否有日志与健康检查的排障命令模板。

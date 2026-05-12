@@ -1,0 +1,149 @@
+---
+slug: "kubernetes-service-backend-networking"
+title: "Kubernetes Service：给后端服务一个稳定入口"
+description: "面向后端开发者理解 Service 如何屏蔽 Pod IP 变化，并完成集群内服务发现、端口转发和排查。"
+date: "2026-05-12"
+tag: "Cloud Native"
+readTime: "18 min"
+top: false
+featured: false
+---
+
+## 这篇解决什么问题
+
+后端服务放进 Kubernetes 后，最先遇到的网络问题通常不是代码不能跑，而是“我该访问哪个 IP”。Pod 会随着发布、扩缩容、节点故障而被重建，Pod IP 也会变化。如果调用方把某个 Pod IP 写进配置，下一次滚动发布后链路就可能断掉。
+
+Service 的价值就是给一组 Pod 提供稳定入口。调用方访问 Service 名称或 Service IP，Kubernetes 再把流量转发到真正可用的 Pod。对后端开发者来说，它相当于应用内部的服务名、虚拟 IP 和负载均衡规则的组合。
+
+## 架构位置
+
+一次典型请求可以理解为：
+
+```txt
+调用方 Pod
+  -> Service DNS 名称 api.default.svc.cluster.local
+  -> Service ClusterIP:port
+  -> Endpoints 中的 Pod IP:targetPort
+  -> 容器里的后端进程
+```
+
+Service 自己不是一个进程，也不会启动你的应用。它通过 selector 选择符合标签的 Pod，再由 kube-proxy 或集群网络组件维护转发规则。Deployment 负责“有几个 Pod”，Service 负责“怎么稳定访问这些 Pod”。
+
+## 核心名词
+
+- Service：一组 Pod 的稳定访问入口。
+- ClusterIP：集群内部虚拟 IP，默认类型。
+- NodePort：在每个 Node 上暴露固定端口，常用于临时测试或接入外部负载均衡。
+- LoadBalancer：请求云厂商创建外部负载均衡器。
+- selector：Service 用来匹配后端 Pod 的标签条件。
+- port：Service 对外暴露的端口。
+- targetPort：Pod 容器实际监听的端口。
+- Endpoints：Service 当前选中的后端地址列表。
+
+## 最小可运行示例
+
+先创建一个三副本后端 Deployment：
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+        - name: api
+          image: hashicorp/http-echo:1.0
+          args:
+            - "-text=hello from api"
+          ports:
+            - containerPort: 5678
+```
+
+再创建 Service：
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+spec:
+  type: ClusterIP
+  selector:
+    app: api
+  ports:
+    - name: http
+      port: 80
+      targetPort: 5678
+```
+
+应用配置：
+
+```bash
+kubectl apply -f api-deployment.yaml
+kubectl apply -f api-service.yaml
+```
+
+在集群内访问：
+
+```bash
+kubectl run curl --rm -it --image=curlimages/curl -- sh
+curl http://api
+curl http://api.default.svc.cluster.local
+```
+
+如果只想从本机临时调试，不必把 Service 改成 NodePort：
+
+```bash
+kubectl port-forward svc/api 8080:80
+curl http://127.0.0.1:8080
+```
+
+## 高频命令
+
+```bash
+kubectl get svc
+kubectl describe svc api
+kubectl get endpoints api
+kubectl get pod -l app=api -o wide
+kubectl port-forward svc/api 8080:80
+kubectl run debug --rm -it --image=busybox -- sh
+```
+
+`kubectl get svc` 看 Service 类型、ClusterIP 和端口映射。`describe svc` 重点看 selector 和 Endpoints，能快速判断是否选中了 Pod。`get endpoints` 如果为空，说明 Service 没有后端，常见原因是标签不匹配或 Pod 没有 Ready。`port-forward` 适合本地验证应用是否通，不适合作为长期流量入口。
+
+## 参数意义
+
+`type: ClusterIP` 表示只在集群内访问，是微服务之间调用最常见的模式。后端服务互相调用时，优先使用 `http://service-name.namespace.svc.cluster.local` 或同命名空间下的短名称 `http://service-name`。
+
+`port` 是 Service 暴露给调用方的端口。你可以让调用方统一访问 80，而容器内部仍然监听 8080 或 5678。`targetPort` 是容器实际监听端口，必须和应用配置一致；如果这里写错，Service 看起来存在，但请求会超时或连接失败。
+
+`selector` 是 Service 和 Pod 建立关系的关键。它不会关心 Deployment 名称，只认 Pod label。后端发布时最容易踩的坑，就是 Deployment 模板里的 label 改了，但 Service selector 没改。
+
+## 常见问题
+
+Service 有 IP，但访问失败，先看 Endpoints 是否为空。如果为空，检查 `kubectl get pod --show-labels`，确认 Pod label 能被 selector 匹配。
+
+Endpoints 有值但请求失败，检查 `targetPort` 和应用监听端口。很多后端服务在容器里监听 8080，却把 Service 的 targetPort 写成 80。
+
+集群内能访问，本机不能访问，这是正常现象。ClusterIP 默认只在集群网络内可达，本机调试用 `port-forward`，公网入口通常交给 Ingress 或 LoadBalancer。
+
+同一个 Service 后面的 Pod 返回不一致，通常是应用副本状态不一致、缓存预热不同，或发布过程中有新旧版本同时存在。Service 只做转发，不保证业务状态一致。
+
+## 后端开发者检查清单
+
+- [ ] Deployment 的 Pod label 和 Service selector 完全匹配。
+- [ ] `port` 是调用方访问的端口，`targetPort` 是容器真实监听端口。
+- [ ] 应用监听 `0.0.0.0`，而不是只监听 `127.0.0.1`。
+- [ ] `kubectl get endpoints <svc>` 能看到后端 Pod 地址。
+- [ ] 服务间调用优先使用 Service DNS 名称，不写 Pod IP。
+- [ ] 本地临时调试使用 `kubectl port-forward`，不要为调试随意暴露 NodePort。
+- [ ] 发布后检查 `kubectl describe svc`，确认新 Pod 已进入 Endpoints。

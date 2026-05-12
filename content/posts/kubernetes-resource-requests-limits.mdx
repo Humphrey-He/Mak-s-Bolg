@@ -1,0 +1,139 @@
+---
+slug: "kubernetes-resource-requests-limits"
+title: "Kubernetes 资源限制：CPU、内存与 OOM 排查"
+description: "面向后端开发者理解 requests、limits、CPU throttling、OOMKilled，以及服务在 Kubernetes 中如何合理申请和限制资源。"
+date: "2026-05-12"
+tag: "Cloud Native"
+readTime: "18 min"
+top: false
+featured: false
+---
+
+后端服务迁移到 Kubernetes 之后，很多问题不再表现为“机器负载高”，而是变成了 Pod Pending、接口突然变慢、容器被 OOMKilled、发布后部分副本一直不 Ready。资源配置就是这些问题背后的第一层地基。
+
+在虚拟机时代，一个 Java、Go 或 Node 服务通常独占一台机器的一部分资源；在 Kubernetes 中，同一台 Node 上会运行很多 Pod。调度器需要知道每个 Pod 至少需要多少资源，运行时也需要知道容器最多能用多少资源。`requests` 和 `limits` 就分别回答这两个问题。
+
+## 问题场景
+
+假设一个订单服务平时 QPS 不高，但大促时会出现批量导出、复杂查询和消息补偿任务。上线初期没有配置资源限制，服务在高峰时把 Node 内存吃满，导致同节点上的其他服务也异常。后来团队给它加了 `memory: 256Mi` 的 limit，又频繁出现 OOMKilled。
+
+这不是 Kubernetes “不稳定”，而是资源画像没有被说清楚：服务启动需要多少内存，正常请求需要多少 CPU，峰值是否允许排队，GC 是否会因为内存限制变得激进，这些都需要通过 requests、limits 和监控一起校准。
+
+## 架构位置
+
+资源配置写在 Pod 模板的容器上，Deployment 只是负责复制这份模板：
+
+```txt
+Deployment
+  -> ReplicaSet
+  -> Pod
+  -> Container
+  -> resources.requests / resources.limits
+```
+
+调度阶段主要看 `requests`。如果一个 Pod 请求 `500Mi` 内存，调度器会寻找剩余可分配资源足够的 Node。运行阶段主要看 `limits`。如果容器超过 memory limit，通常会被内核杀掉；如果超过 CPU limit，通常会被限流，而不是直接杀掉。
+
+## 核心名词
+
+- `requests`：资源请求量，Kubernetes 调度 Pod 时的承诺值。
+- `limits`：资源上限，容器运行时允许使用的最大资源。
+- `cpu: "200m"`：表示 0.2 个 CPU 核，`1000m` 等于 1 核。
+- `memory: "256Mi"`：表示 256 MiB 内存，注意 `Mi` 和 `M` 不是完全一样的单位。
+- `OOMKilled`：容器内进程超过内存上限后被杀死。
+- `CPU throttling`：CPU 使用超过 limit 后被节流，表现为延迟上升。
+- `QoS`：Kubernetes 根据 requests 和 limits 推导出的服务质量等级。
+
+## 最小示例
+
+下面是一个后端 API 的 Deployment 片段。它告诉 Kubernetes：每个副本至少需要 200m CPU 和 256Mi 内存，最多允许使用 1 核 CPU 和 512Mi 内存。
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+        - name: api
+          image: registry.example.com/team/api:v1.0.0
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "512Mi"
+```
+
+`requests.cpu` 太小会让调度看起来更容易，但服务在高峰时可能和同节点其他 Pod 激烈竞争。`limits.cpu` 太小会让接口延迟出现尖刺，因为容器被节流。`limits.memory` 太小则更直接，进程可能被杀死。
+
+## 高频命令
+
+先看集群有没有 metrics-server，否则 `kubectl top` 可能不可用：
+
+```bash
+kubectl top node
+kubectl top pod
+kubectl top pod -n prod
+kubectl top pod -l app=api
+```
+
+查看 Pod 的资源配置和最近状态：
+
+```bash
+kubectl describe pod <pod>
+kubectl get pod <pod> -o yaml
+kubectl get pod <pod> -o jsonpath='{.status.containerStatuses[*].lastState}'
+```
+
+排查 OOM 时重点看 `Last State`、`Reason`、`Exit Code` 和 Events：
+
+```bash
+kubectl describe pod <pod>
+kubectl logs <pod> --previous
+kubectl get events --sort-by=.lastTimestamp
+```
+
+`--previous` 很重要。容器已经重启后，普通 `logs` 只能看到当前实例的日志，而上一轮崩溃前的异常栈、GC 日志或启动失败信息通常在 previous 日志里。
+
+## 参数意义
+
+`requests.cpu` 决定调度器给你的服务预留多少 CPU 份额。它不是硬限制，但会影响 Pod 能不能被调度，以及节点资源是否被过度承诺。
+
+`limits.cpu` 是硬上限。CPU 是可压缩资源，超过上限通常不会杀进程，而是让它等。后端接口会表现为 p95、p99 延迟升高，线程池排队变长，连接池等待时间增加。
+
+`requests.memory` 决定调度时为 Pod 预留多少内存。内存是不可压缩资源，节点内存紧张时，低 QoS 的 Pod 更容易被驱逐。
+
+`limits.memory` 是容器可使用内存的边界。超过之后最常见结果是 OOMKilled。对 JVM 服务还要注意 `-Xmx`、Metaspace、线程栈、直接内存和容器 limit 的关系，不能只把 `-Xmx` 设成和 limit 一样大。
+
+## 常见坑
+
+第一个坑是不设置资源。短期看省事，长期看会让调度不可预测。某个批处理任务可能吃掉整台 Node，拖慢无关服务。
+
+第二个坑是 requests 和 limits 差距过大。例如 requests 只有 `50m`，limit 却是 `4`。调度器会把很多 Pod 放到同一台 Node，一旦它们同时冲高，CPU 争抢会非常严重。
+
+第三个坑是把内存 limit 当成应用可用内存。容器里除了业务堆内存，还有运行时、线程栈、网络缓冲、日志库、native 依赖。Java 服务尤其要给非堆内存留余量。
+
+第四个坑是只看平均值。资源配置应该参考峰值、启动阶段、发布阶段和异常流量。一个服务平均只用 100Mi，但启动时加载缓存需要 600Mi，那么 256Mi limit 仍然会导致发布失败。
+
+## 后端开发者检查清单
+
+- [ ] 每个容器都配置了 `requests.cpu`、`requests.memory`、`limits.cpu`、`limits.memory`。
+- [ ] 内存 limit 大于应用堆、线程栈、直接内存和运行时开销之和。
+- [ ] CPU limit 不会让高峰请求长期 throttling。
+- [ ] `kubectl describe pod` 中没有 OOMKilled、Evicted 或频繁重启。
+- [ ] 压测数据覆盖启动、高峰、批处理和发布场景。
+- [ ] JVM、Go runtime、Node.js 的运行时参数已经适配容器限制。
+- [ ] 资源配置和 HPA 指标一起评估，而不是孤立调整。
+

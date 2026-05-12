@@ -1,0 +1,152 @@
+---
+slug: "docker-volume-config"
+title: "Docker 数据卷与配置：数据库文件、日志和配置怎么处理"
+description: "解释容器文件系统的临时性、Docker volume、宿主机挂载、配置注入方式和后端服务数据持久化检查清单。"
+date: "2026-05-16"
+tag: "Cloud Native"
+readTime: "19 min"
+top: false
+featured: false
+---
+
+## 这篇解决什么问题
+
+容器运行起来以后，很多后端开发者会自然地把文件写进容器：数据库数据、上传文件、日志、配置文件、临时缓存。短期看没问题，容器一删，问题就来了：数据没了，配置回滚了，日志也找不到了。
+
+Docker 的基本原则是：镜像提供不可变运行环境，容器可写层只适合临时状态。需要长期保存或独立管理的内容，应该放在 volume、宿主机挂载目录、外部数据库、对象存储或配置中心里。
+
+## 架构解释
+
+容器文件系统可以理解为：
+
+```txt
+Image 只读层
+  + Container 可写层
+  + Volume / Bind Mount
+  -> 容器看到的文件系统
+```
+
+容器可写层跟容器生命周期绑定，删除容器后通常一起消失。Volume 由 Docker 管理，适合数据库数据目录。Bind mount 把宿主机文件或目录挂进容器，适合本地开发配置、源码热更新或明确路径的数据交换。
+
+## 核心名词
+
+- Volume：Docker 管理的数据卷，生命周期独立于容器。
+- Bind mount：把宿主机路径挂载到容器路径。
+- Container writable layer：容器自己的可写层。
+- Config：运行配置，例如端口、环境、连接地址。
+- Secret：密码、Token、证书等敏感配置。
+- Read-only mount：只读挂载，减少误写风险。
+- `--mount`：比 `-v` 更明确的挂载语法。
+
+## 最小可运行示例
+
+用 volume 保存 MySQL 数据：
+
+```bash
+docker volume create mysql-data
+docker run -d \
+  --name mysql-demo \
+  -e MYSQL_ROOT_PASSWORD=root \
+  -e MYSQL_DATABASE=app \
+  -v mysql-data:/var/lib/mysql \
+  mysql:8
+```
+
+删除容器后，volume 仍然存在：
+
+```bash
+docker rm -f mysql-demo
+docker volume ls
+docker volume inspect mysql-data
+```
+
+挂载配置文件可以这样做：
+
+```bash
+docker run --rm \
+  -v ${PWD}/config.yaml:/app/config.yaml:ro \
+  my-api:local
+```
+
+`:ro` 表示只读挂载，防止容器内进程意外修改宿主机配置。
+
+## 高频命令
+
+```bash
+docker volume ls
+docker volume create mysql-data
+docker volume inspect mysql-data
+docker volume rm mysql-data
+docker run -v mysql-data:/var/lib/mysql mysql:8
+docker run -v ./config.yaml:/app/config.yaml:ro my-api:local
+docker system df
+```
+
+`docker volume inspect` 可以看到 volume 的真实挂载点。`docker system df` 用来观察镜像、容器、volume 占用空间，排查磁盘被构建缓存或数据卷吃满的问题。
+
+## 参数意义
+
+`-v` 常见两种写法：
+
+```bash
+docker run -v mysql-data:/var/lib/mysql mysql:8
+docker run -v /host/config.yaml:/app/config.yaml:ro my-api:local
+```
+
+第一种左侧是 volume 名称，由 Docker 管理；第二种左侧是宿主机路径，由你自己管理。容器路径必须和应用实际读取路径一致。
+
+更清晰的 `--mount` 写法如下：
+
+```bash
+docker run \
+  --mount type=volume,source=mysql-data,target=/var/lib/mysql \
+  mysql:8
+```
+
+```bash
+docker run \
+  --mount type=bind,source=${PWD}/config.yaml,target=/app/config.yaml,readonly \
+  my-api:local
+```
+
+`type=volume` 表示 Docker volume；`type=bind` 表示宿主机路径；`source` 是来源；`target` 是容器内挂载点；`readonly` 表示只读。
+
+## 配置应该怎么注入
+
+后端服务常用三类配置方式：
+
+```bash
+docker run -e APP_ENV=dev -e DB_HOST=mysql my-api:local
+```
+
+环境变量适合少量、简单、非结构化配置。配置文件适合结构化内容：
+
+```yaml
+server:
+  port: 8080
+database:
+  host: mysql
+  port: 3306
+```
+
+敏感配置不要写进镜像，也不要提交到仓库。单机 Docker 阶段可以通过环境变量或只读挂载传入；进入 Kubernetes 后通常交给 Secret、外部密钥系统或平台配置能力管理。
+
+## 常见坑
+
+第一，把数据库文件放在容器可写层。容器重建后数据丢失，升级镜像也会变得危险。数据库目录必须挂载 volume 或使用外部数据库服务。
+
+第二，把日志只写到容器内部文件。容器化服务更推荐输出到 stdout/stderr，由 Docker、Compose 或日志系统采集。如果确实要写文件，也要挂载目录并做轮转。
+
+第三，误删 volume。`docker compose down -v` 或 `docker volume prune` 会删除数据卷，执行前必须确认数据是否可丢弃。
+
+第四，挂载路径覆盖镜像内文件。例如把空目录挂到 `/app`，可能把镜像里已经构建好的程序遮住，导致启动时报 “file not found”。
+
+## 后端开发者检查清单
+
+- [ ] 数据库、上传文件、消息队列数据不放在容器可写层。
+- [ ] 重要 volume 有明确名称和备份策略。
+- [ ] 配置通过环境变量、只读文件挂载或配置中心注入。
+- [ ] 密钥没有写进镜像、Dockerfile、Git 仓库和普通日志。
+- [ ] 日志优先输出到 stdout/stderr。
+- [ ] 使用 `docker volume inspect` 确认数据实际位置。
+- [ ] 执行 `down -v`、`volume rm`、`volume prune` 前确认数据可删除。

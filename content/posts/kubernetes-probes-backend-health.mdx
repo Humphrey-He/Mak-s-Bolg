@@ -1,0 +1,139 @@
+---
+slug: "kubernetes-probes-backend-health"
+title: "Kubernetes Probe：让集群正确判断后端服务是否健康"
+description: "解释 livenessProbe、readinessProbe、startupProbe 的区别、参数含义、接口设计和排查方法。"
+date: "2026-05-16"
+tag: "Cloud Native"
+readTime: "19 min"
+top: false
+featured: false
+---
+
+## 这篇解决什么问题
+
+后端服务启动并不等于可用。进程可能还在加载配置、迁移缓存、建立数据库连接，也可能因为死锁、连接池耗尽而“进程还活着但请求处理不了”。Kubernetes 需要一种信号判断：该不该重启容器，该不该把流量打给这个 Pod。
+
+Probe 就是 Kubernetes 对容器做健康判断的机制。它不是业务监控，也不会告诉你订单是否正确，但它能决定容器生命周期和流量入口，是后端服务稳定性的基础配置。
+
+## 架构位置
+
+```txt
+kubelet 定期探测容器
+  -> livenessProbe 判断是否需要重启
+  -> readinessProbe 判断是否进入 Service Endpoints
+  -> startupProbe 保护慢启动应用
+  -> Service 只转发到 Ready 的 Pod
+```
+
+探针由每个 Node 上的 kubelet 执行。它不是从用户网关发起，所以探针通过不代表公网一定可达；但 readiness 失败时，Pod 会从 Service Endpoints 移除，正常流量不会再进入。
+
+## 核心名词
+
+- livenessProbe：判断容器是否还活着，失败后重启容器。
+- readinessProbe：判断容器是否可以接流量，失败后从 Service Endpoints 移除。
+- startupProbe：判断应用是否完成启动，启动期失败不会立刻触发 liveness。
+- httpGet：通过 HTTP 请求探测。
+- tcpSocket：通过 TCP 端口探测。
+- exec：在容器内执行命令探测。
+- initialDelaySeconds：容器启动后延迟多久开始探测。
+- failureThreshold：连续失败多少次才判定失败。
+
+## 最小可运行示例
+
+常见后端服务可以提供两个接口：`/health` 表示进程基本存活，`/ready` 表示依赖已准备好，可以接流量。
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+        - name: api
+          image: registry.example.com/team/api:v1.0.0
+          ports:
+            - containerPort: 8080
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            periodSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 2
+```
+
+应用后观察：
+
+```bash
+kubectl apply -f deployment.yaml
+kubectl get pod -l app=api
+kubectl describe pod <pod>
+kubectl get endpoints api
+```
+
+## 高频命令
+
+```bash
+kubectl describe pod <pod>
+kubectl get pod <pod> -o yaml
+kubectl logs <pod>
+kubectl logs <pod> --previous
+kubectl get events --sort-by=.lastTimestamp
+kubectl get endpoints api
+```
+
+探针失败最重要的信息在 `describe pod` 的 Events 里，例如 HTTP 状态码、连接拒绝、超时。容器被 liveness 重启后，用 `logs --previous` 看上一次崩溃前的日志。readiness 失败时，`get endpoints` 可以验证 Pod 是否被 Service 摘除。
+
+## 参数意义
+
+`initialDelaySeconds` 是首次探测延迟，但对慢启动应用更推荐使用 `startupProbe`。有了 startupProbe，启动成功前 liveness 和 readiness 不会过早干预，适合 Java、.NET 或需要加载大量模型、缓存的服务。
+
+`periodSeconds` 是探测周期。周期越短，故障发现越快，但 kubelet 和应用压力也越大。普通 HTTP 服务 readiness 用 5 秒、liveness 用 10 秒通常是可接受的起点。
+
+`timeoutSeconds` 是单次探测超时。不要设得太长，否则故障 Pod 会长时间挂在流量池里；也不要太短，否则 GC、短暂抖动会导致误判。
+
+`failureThreshold` 是连续失败次数。liveness 太激进会制造重启风暴，readiness 可以相对敏感，因为它只是摘流量，不会重启容器。
+
+`successThreshold` 对 readiness 有意义，表示连续成功多少次才重新接流量。服务刚恢复时如果依赖仍不稳定，可以适当提高。
+
+## 常见问题
+
+把 liveness 和 readiness 都指向同一个深度依赖检查接口，是高频坑。如果数据库短暂抖动，liveness 失败会重启所有 Pod，原本的小问题会被放大。通常 liveness 检查进程基本健康，readiness 再检查关键依赖。
+
+探针路径需要轻量、稳定、无副作用。不要让 `/ready` 触发复杂 SQL、大量日志或远程写操作。健康检查接口应该快速返回，并设置清晰的状态码。
+
+应用只监听 `127.0.0.1` 或端口写错，会导致探针连接失败。容器内服务通常要监听 `0.0.0.0`，探针 port 要和容器实际监听端口一致。
+
+readiness 一直失败时，Pod 可能是 Running，但 Service Endpoints 为空，外部表现就是接口 503。此时不要只看 Pod 状态，要看 Ready 列和 Endpoints。
+
+## 后端开发者检查清单
+
+- [ ] 服务提供轻量的 `/health` 和 `/ready` 接口。
+- [ ] liveness 不依赖容易抖动的外部系统。
+- [ ] readiness 能反映服务是否真的可以处理请求。
+- [ ] 慢启动服务配置 startupProbe。
+- [ ] 探针 path、port、scheme 与应用真实监听一致。
+- [ ] `timeoutSeconds` 和 `failureThreshold` 不会因短暂抖动频繁误判。
+- [ ] 排查探针失败时优先看 `describe pod` Events 和 `logs --previous`。
