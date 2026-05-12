@@ -1,0 +1,406 @@
+---
+slug: "docker-container-networking"
+title: "Docker 容器网络：端口映射、服务互通与排障路径"
+description: "面向后端开发者讲清 Docker bridge、自定义网络、容器 DNS、expose 与 ports、host.docker.internal、网络命名空间和常见排障命令。"
+date: "2026-05-15"
+tag: "Cloud Native"
+readTime: "27 min"
+top: false
+featured: false
+---
+
+## 这篇解决什么问题
+
+后端服务容器化后，最常见的问题不是代码错，而是“连不上”：浏览器访问宿主机端口失败，API 连不上 Redis，容器里访问 `localhost` 却不是想象中的服务，明明进程启动了但端口映射后外部仍然无法访问。
+
+Docker 网络要先分清三件事：
+
+- 容器内端口：进程在容器 network namespace 中监听的端口。
+- 宿主机端口：宿主机上暴露给浏览器、curl 或其他客户端访问的端口。
+- 容器间网络：容器之间通过 bridge、DNS、服务名或网络别名互相访问。
+
+这篇文章的目标不是把所有 Docker 网络实现讲成内核课，而是让后端开发者能建立正确边界：什么时候用服务名，什么时候发布端口，什么时候不该写死 IP，出了问题按什么顺序排查。
+
+## 架构解释
+
+默认情况下，Docker 会创建 bridge 网络。容器加入 bridge 后拥有自己的网络命名空间和 IP。宿主机访问容器服务，需要通过端口映射；同一个自定义网络里的容器，可以通过容器名或网络别名互相访问。
+
+```txt
+浏览器 / curl
+  -> 宿主机 127.0.0.1:8080
+  -> Docker port mapping
+  -> 容器 api:8080
+  -> 后端进程
+
+api 容器
+  -> redis:6379
+  -> Docker DNS
+  -> redis 容器
+```
+
+从原理层看，可以简化成：
+
+```txt
+container eth0
+  <-> veth pair
+  <-> docker bridge
+  <-> NAT / iptables / userland proxy
+  <-> host network
+```
+
+每个容器默认有独立 network namespace。容器里的 `127.0.0.1` 只属于这个 namespace，所以它指向容器自己，不是宿主机，也不是其他容器。这就是大量“本地裸跑正常，容器里连不上”的根因。
+
+## 核心名词
+
+- Bridge network：单机容器网络模型，Docker 默认会创建 `bridge`。
+- User-defined bridge：用户自定义 bridge 网络，推荐用于真实项目服务互联。
+- Port mapping：把宿主机端口转发到容器端口。
+- Container port：服务在容器内监听的端口。
+- Host port：宿主机对外暴露的端口。
+- Docker DNS：自定义网络中按容器名或别名解析地址。
+- `localhost`：当前网络命名空间里的本机。
+- `host.docker.internal`：容器访问宿主机的约定名称，在 Docker Desktop 中通常内置。
+- `expose`：声明容器网络内端口，不发布到宿主机。
+- `ports`：发布端口到宿主机。
+
+## 默认 bridge 与自定义 bridge
+
+不要依赖默认 `bridge` 做复杂服务互联。真实项目里建议为每个应用栈创建自定义 bridge 网络，例如 `app-net`。
+
+```bash
+docker network create app-net
+docker run -d --name redis --network app-net redis:7
+docker run --rm --network app-net redis:7 redis-cli -h redis ping
+```
+
+如果最后输出 `PONG`，说明临时容器通过 Docker DNS 找到了名为 `redis` 的容器。
+
+用户自定义 bridge 的价值是：
+
+- 容器名 DNS 更符合服务互联习惯。
+- 应用栈之间有更清晰的网络隔离。
+- 可以通过 network alias 兼容历史配置。
+- 排查时 `docker network inspect app-net` 更容易看清成员。
+
+查看网络：
+
+```bash
+docker network ls
+docker network inspect app-net
+```
+
+容器 IP 是动态分配的，容器重建后可能变化。业务配置中不要写 `172.x.x.x`，应该使用服务名、网络别名或更上层的服务发现机制。
+
+## ports、expose 与绑定地址
+
+端口映射最常见写法是：
+
+```bash
+docker run -d --name web -p 8080:80 nginx:1.27
+curl http://127.0.0.1:8080
+```
+
+这里 `8080` 是宿主机端口，`80` 是容器端口。写反会导致访问失败或端口冲突。
+
+更安全的本地开发写法是只绑定本机回环地址：
+
+```bash
+docker run -d --name web -p 127.0.0.1:8080:80 nginx:1.27
+```
+
+Compose 中：
+
+```yaml
+services:
+  api:
+    ports:
+      - "127.0.0.1:8080:8080"
+```
+
+这表示只允许宿主机本机访问，不绑定到所有网卡。在本地开发中，优先使用 `127.0.0.1:hostPort:containerPort`；确实需要局域网其他机器访问时，再绑定 `0.0.0.0` 或省略绑定地址。
+
+`expose` 与 `ports` 的区别：
+
+| 配置 | 含义 | 典型场景 |
+| --- | --- | --- |
+| `expose` | 只声明容器网络内端口，不发布到宿主机 | MySQL、Redis 只给 API 容器访问 |
+| `ports` | 发布到宿主机，宿主机或外部可以访问 | API 给浏览器、curl、本机调试访问 |
+
+示例：
+
+```yaml
+services:
+  redis:
+    expose:
+      - "6379"
+```
+
+数据库、Redis、MQ 等依赖服务，如果只被 API 容器访问，优先使用 `expose` 或完全不写 `ports`。只有需要宿主机调试访问时才发布 `ports`。
+
+## 容器监听地址
+
+端口映射能否访问成功，还取决于容器内服务监听在哪个地址。
+
+进入容器检查：
+
+```bash
+docker exec -it api sh
+ss -lntp
+```
+
+如果镜像没有 `ss`，可以尝试：
+
+```bash
+netstat -lntp
+```
+
+看到下面这种结果，说明服务只监听容器内 loopback：
+
+```txt
+127.0.0.1:8080
+```
+
+外部端口映射可能仍然访问不到。后端服务应该监听：
+
+```txt
+0.0.0.0:8080
+```
+
+然后再通过 `ports` 绑定地址、防火墙、网关和鉴权控制暴露范围。不要用应用监听 `127.0.0.1` 来表达安全边界。
+
+## 访问宿主机服务
+
+容器内访问宿主机服务，不能直接写 `localhost`。`localhost` 指向容器自己。
+
+Docker Desktop 通常内置：
+
+```txt
+host.docker.internal
+```
+
+容器内可以这样访问宿主机：
+
+```bash
+curl http://host.docker.internal:8080
+```
+
+Linux 原生 Docker 建议显式添加 `host-gateway`。
+
+`docker run`：
+
+```bash
+docker run \
+  --add-host=host.docker.internal:host-gateway \
+  my-api:local
+```
+
+Compose：
+
+```yaml
+services:
+  api:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+```
+
+这个配置适合开发环境临时访问宿主机上的数据库、mock 服务或调试代理。生产环境不应该依赖这种写法作为稳定架构。
+
+## Compose 网络分层与别名
+
+一个更清晰的后端开发网络模型是：
+
+```yaml
+services:
+  api:
+    build: .
+    ports:
+      - "127.0.0.1:8080:8080"
+    networks:
+      - frontend
+      - backend
+
+  mysql:
+    image: mysql:8.4
+    networks:
+      backend:
+        aliases:
+          - db
+    expose:
+      - "3306"
+
+  redis:
+    image: redis:7.4
+    networks:
+      - backend
+    expose:
+      - "6379"
+
+networks:
+  frontend:
+  backend:
+```
+
+含义：
+
+- `frontend`：API 对宿主机或入口层暴露服务。
+- `backend`：API、MySQL、Redis 内部通信。
+- `aliases`：让 `mysql` 同时可以被 `db` 访问，适合兼容历史配置。
+
+如果想让某个内部网络不能直接访问外部网络，可以使用：
+
+```yaml
+networks:
+  backend:
+    internal: true
+```
+
+但要谨慎使用。`internal: true` 会限制网络访问外部，可能导致依赖服务无法拉取外部资源，或者 API 访问第三方接口失败。更常见的做法是先最小化 `ports` 暴露，再按需要设计内部网络。
+
+## 高频命令
+
+```bash
+docker network ls
+docker network inspect bridge
+docker network create app-net
+docker run --network app-net --name redis redis:7
+docker run --network app-net --name api my-api:local
+docker port api
+docker inspect api
+docker exec -it api sh
+```
+
+`docker network inspect` 能看到网络里的容器、IPAM 配置和网关。`docker port` 查看容器端口映射结果。`docker inspect` 可以确认容器加入了哪个网络、分配了哪个 IP、启动参数里有没有 `Ports`。
+
+## 容器内 DNS 与网络排障
+
+进入 API 容器：
+
+```bash
+docker exec -it api sh
+```
+
+检查 DNS：
+
+```bash
+getent hosts redis
+nslookup redis
+ping redis
+```
+
+很多极简镜像没有 `ping`、`nslookup`、`curl`、`nc`。这时可以用临时网络排障容器：
+
+```bash
+docker run --rm -it --network app-net nicolaka/netshoot
+```
+
+进入后检查：
+
+```bash
+dig redis
+nc -vz redis 6379
+curl http://api:8080/health
+ip addr
+ip route
+```
+
+`nicolaka/netshoot` 适合开发和排障使用，不建议作为业务镜像依赖。业务镜像应保持精简，排障工具用临时容器补充。
+
+## 问题导向排障
+
+### API 连不上 Redis
+
+```bash
+docker network inspect app-net
+docker exec -it api sh
+getent hosts redis
+nc -vz redis 6379
+docker logs redis
+```
+
+判断路径：
+
+- DNS 不通：检查 `api` 和 `redis` 是否在同一个自定义 network。
+- 端口不通：检查 Redis 是否启动、是否监听 `6379`。
+- 地址写错：容器间应使用 `redis:6379`，不是 `localhost:6379`。
+- 写死 IP：删除 `172.x.x.x` 这类配置，改用服务名或别名。
+
+### 宿主机访问 API 失败
+
+```bash
+docker ps
+docker port api
+docker logs api
+docker exec -it api sh
+ss -lntp
+```
+
+判断路径：
+
+- 没有监听：应用没启动或启动后退出。
+- 监听 `127.0.0.1:8080`：应用只绑定容器 loopback，应改成 `0.0.0.0:8080`。
+- 端口映射错误：检查 `-p` 或 Compose `ports` 左右是否写反。
+- 绑定到 `127.0.0.1`：只能宿主机本机访问，局域网访问失败是预期行为。
+- 防火墙阻断：检查宿主机防火墙、安全组或公司网络策略。
+
+### 容器访问宿主机失败
+
+```bash
+docker exec -it api sh
+getent hosts host.docker.internal
+curl http://host.docker.internal:8080
+```
+
+如果 Linux 上解析失败，给容器加：
+
+```yaml
+extra_hosts:
+  - "host.docker.internal:host-gateway"
+```
+
+同时确认宿主机服务不是只绑定某个不可达地址，并检查本机防火墙。
+
+## 常见坑
+
+第一，容器内访问宿主机服务直接写 `localhost`。这会访问容器自己。
+
+第二，后端服务只监听 `127.0.0.1`。容器内进程如果只绑定 loopback，端口映射后外部仍可能访问不到。
+
+第三，把数据库、Redis 默认发布到所有网卡：
+
+```yaml
+ports:
+  - "6379:6379"
+```
+
+本地开发更推荐：
+
+```yaml
+ports:
+  - "127.0.0.1:16379:6379"
+```
+
+或者完全不发布：
+
+```yaml
+expose:
+  - "6379"
+```
+
+第四，使用默认 bridge 期待复杂服务互联。真实项目建议创建自定义网络。
+
+第五，写死容器 IP。容器重建后 IP 可能变化，稳定入口应该是服务名、别名或服务发现。
+
+第六，只检查 Docker，忘了宿主机防火墙、安全组和云厂商网络策略。`docker ps` 显示端口映射正常，不代表公网一定可访问。
+
+## 后端开发者检查清单
+
+- [ ] 能说清 `-p 127.0.0.1:8080:8080` 三段分别代表什么。
+- [ ] 服务在容器内监听 `0.0.0.0`，而不是只监听 `127.0.0.1`。
+- [ ] API、Redis、MySQL 等相关容器放在同一个自定义网络。
+- [ ] 容器间连接使用服务名或网络别名，不写死容器 IP。
+- [ ] 数据库、Redis、MQ 只给容器访问时不发布 `ports`。
+- [ ] 本地开发端口优先绑定 `127.0.0.1`。
+- [ ] Linux 下需要访问宿主机时，知道 `host-gateway` 写法。
+- [ ] 会使用 `getent hosts`、`nc -vz`、`ss -lntp`、`docker network inspect` 排查。
+- [ ] 知道 `nicolaka/netshoot` 适合临时排障，不适合作为业务镜像。
+- [ ] 对外访问失败时同时检查 Docker 映射、防火墙和安全组。

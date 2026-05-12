@@ -1,0 +1,138 @@
+---
+slug: "kubernetes-deployment-backend-service"
+title: "Deployment：后端服务的副本、滚动发布与回滚入口"
+description: "讲清 Deployment 如何管理 ReplicaSet 和 Pod，并用后端服务示例解释副本数、标签选择器、滚动更新和常用 kubectl 命令。"
+date: "2026-05-17"
+tag: "Cloud Native"
+readTime: "20 min"
+top: false
+featured: false
+---
+
+## 这篇解决什么问题
+
+后端服务上线后，最基本的要求不是“能启动一个容器”，而是能稳定运行多个副本、发布新版本时不中断、出问题时可以回滚。直接创建 Pod 做不到这些，Deployment 才是无状态后端服务最常用的管理对象。
+
+Deployment 管理 ReplicaSet，ReplicaSet 管理 Pod。你声明期望副本数和 Pod 模板，Kubernetes 会持续确保集群里有符合模板的 Pod。更新镜像时，Deployment 会创建新的 ReplicaSet，逐步替换旧 Pod，从而实现滚动发布。
+
+## 架构位置
+
+关系可以理解为：
+
+```txt
+Deployment
+  -> ReplicaSet v1
+    -> Pod v1
+  -> ReplicaSet v2
+    -> Pod v2
+```
+
+当你把镜像从 `v1.0.0` 改成 `v1.0.1`，Deployment 不会原地修改旧 Pod，而是创建新 Pod，等待它们就绪，再逐步减少旧 Pod。这个过程让发布具备可观察和可回滚能力。
+
+## 核心名词
+
+- `Deployment`：管理无状态服务发布和副本。
+- `ReplicaSet`：保证某个版本 Pod 的副本数。
+- `replicas`：期望副本数量。
+- `selector`：Deployment 用来选择自己管理哪些 Pod。
+- `template`：Pod 模板，新 Pod 都按它创建。
+- `rollout`：发布过程。
+- `revision`：发布版本记录。
+- `strategy`：更新策略，默认是 RollingUpdate。
+
+## 最小可运行示例
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+        - name: api
+          image: registry.example.com/team/api:v1.0.0
+          ports:
+            - containerPort: 8080
+```
+
+应用配置：
+
+```bash
+kubectl apply -f deployment.yaml
+kubectl get deploy
+kubectl get rs
+kubectl get pod -l app=api -o wide
+kubectl rollout status deploy/api
+```
+
+如果只是本地练习，可以把镜像换成 `nginx:1.27`，端口改为 `80`。真实后端服务要使用团队构建并推送到镜像仓库的镜像。
+
+## 字段解释
+
+`replicas: 3` 表示期望 3 个 Pod 副本。某个 Pod 被删除或节点故障时，控制器会创建新的 Pod 补足数量。
+
+`selector.matchLabels` 是 Deployment 选择 Pod 的规则。它必须和 `template.metadata.labels` 匹配，否则 Deployment 无法正确管理自己创建的 Pod。这个字段创建后通常不能随意修改。
+
+`template` 是 Pod 模板。镜像、端口、环境变量、探针、资源限制等都写在这里。只要模板变化，Deployment 就会触发新一轮发布。
+
+`containerPort` 声明容器内服务端口，但不负责集群访问。让其他服务访问它，还需要创建 Service。
+
+## 高频命令
+
+```bash
+kubectl apply -f deployment.yaml
+kubectl get deploy
+kubectl describe deploy api
+kubectl rollout status deploy/api
+kubectl rollout history deploy/api
+kubectl set image deploy/api api=registry.example.com/team/api:v1.0.1
+kubectl rollout undo deploy/api
+kubectl scale deploy/api --replicas=5
+kubectl logs -f deploy/api
+```
+
+`rollout status` 用来看发布是否完成。`rollout history` 看历史版本。`rollout undo` 回滚到上一个版本。`scale` 临时调整副本数，适合压测或流量高峰，但长期配置仍应回写 YAML。
+
+## 滚动更新策略
+
+可以显式声明滚动更新参数：
+
+```yaml
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+```
+
+`maxSurge: 1` 表示更新过程中最多额外创建 1 个 Pod。`maxUnavailable: 0` 表示更新时不允许减少可用副本数。对后端 API 来说，这通常比“先停旧再启新”更平滑，但也要求集群有足够资源容纳额外 Pod。
+
+## 常见问题
+
+第一，selector 和 template labels 不匹配。结果是 Deployment 创建或接管 Pod 异常，后续 Service 也可能选不中 Pod。
+
+第二，只改了镜像 tag 但 tag 内容漂移。生产发布应使用明确版本，避免多个环境的 `v1` 指向不同镜像内容。
+
+第三，没有 readinessProbe。Deployment 可能认为 Pod 已经 Running，但服务还没准备好接流量。后端服务应该配置就绪检查，让滚动更新更稳。
+
+第四，发布失败只看 Deployment。要继续看 ReplicaSet、Pod、Events 和容器日志，才能判断是调度、拉镜像、启动崩溃还是探针失败。
+
+## 后端开发者检查清单
+
+- [ ] 生产无状态服务是否使用 Deployment，而不是裸 Pod。
+- [ ] `selector.matchLabels` 是否和 Pod 模板 labels 匹配。
+- [ ] 镜像 tag 是否明确、可追踪、可回滚。
+- [ ] 是否知道 `replicas` 只是期望状态，控制器会持续修正。
+- [ ] 发布前是否配置 readinessProbe。
+- [ ] 是否会用 `rollout status` 观察发布过程。
+- [ ] 是否会用 `rollout undo` 快速回滚。
+- [ ] 扩缩容后是否把长期副本数写回 YAML。

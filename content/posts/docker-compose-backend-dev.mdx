@@ -1,0 +1,517 @@
+---
+slug: "docker-compose-backend-dev"
+title: "Docker Compose 管理后端开发环境：从能跑到可靠可维护"
+description: "面向后端开发者系统讲解 Compose 如何组织 API、MySQL、Redis，本地端口、healthcheck、.env、热更新、初始化脚本和排障路径如何设计。"
+date: "2026-05-12"
+tag: "Cloud Native"
+readTime: "28 min"
+top: false
+featured: false
+---
+
+## 这篇解决什么问题
+
+很多后端项目不是一个进程就能跑起来的。API 需要 MySQL，登录态依赖 Redis，异步任务可能还要消息队列。新人接手项目时，常见流程是：先装数据库，再改端口，再导测试数据，最后卡在“我这里能跑，你那里不行”。
+
+Docker Compose 解决的是**本地多容器开发环境的编排问题**。它把“需要哪些服务、用什么镜像、暴露哪些端口、注入哪些环境变量、数据放在哪里、依赖是否健康”写进一个 `compose.yaml`，团队成员执行同一组命令，就能启动近似一致的开发环境。
+
+但高质量 Compose 文档不应该只停在“把容器跑起来”。后端工程真正关心的是：
+
+- 数据库和缓存什么时候算可用？
+- API 应该怎样等待依赖？
+- 端口如何避免和本机服务冲突？
+- `.env`、`env_file`、`environment` 应该怎么分工？
+- 热更新开发和镜像真实运行如何兼顾？
+- 数据库初始化脚本为什么没有再次执行？
+- `down`、`down -v`、`prune` 到底会删什么？
+- Compose 适合本地开发，什么时候不该当生产编排平台？
+
+## 架构位置
+
+Compose 不替代 Dockerfile。Dockerfile 描述一个后端服务镜像如何构建，Compose 描述一组容器如何协作。
+
+典型链路是：
+
+```txt
+源代码 + Dockerfile
+  -> 构建 api 镜像
+  -> docker compose 启动 api、mysql、redis
+  -> api 通过服务名 mysql、redis 访问依赖
+  -> 宿主机通过 127.0.0.1:8080 访问 api
+```
+
+在 Compose 创建的项目网络里，服务名会成为 DNS 名称。后端代码里不应该写 `127.0.0.1:3306` 访问 MySQL，而应该写 `mysql:3306`。因为从 `api` 容器内部看，`127.0.0.1` 指的是 `api` 容器自己，不是宿主机，也不是 `mysql` 容器。
+
+## 核心名词
+
+- `service`：一个可运行组件，例如 `api`、`mysql`、`redis`。
+- `image`：直接使用已有镜像，例如 `mysql:8.4`、`redis:7.4`。
+- `build`：从当前项目的 Dockerfile 构建镜像。
+- `ports`：把容器端口发布到宿主机，宿主机或外部才能访问。
+- `expose`：只声明容器网络内端口，不发布到宿主机。
+- `environment`：显式给某个服务注入环境变量。
+- `env_file`：批量读取环境变量文件。
+- `volumes`：挂载数据卷或本地目录，避免数据库数据随容器删除而丢失。
+- `depends_on`：声明启动依赖；配合 `condition: service_healthy` 才能等待健康状态。
+- `healthcheck`：让 Compose 判断容器内服务是否真的可用。
+- `networks`：声明服务之间的网络边界。
+
+## 入门版 compose.yaml
+
+假设后端服务监听 `8080`，需要连接 MySQL 和 Redis，最小版本可以这样写：
+
+```yaml
+services:
+  api:
+    build: .
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      APP_ENV: dev
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_USER: root
+      DB_PASSWORD: root
+      REDIS_ADDR: redis:6379
+    depends_on:
+      - mysql
+      - redis
+
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: app
+    ports:
+      - "127.0.0.1:13306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+
+  redis:
+    image: redis:7.4
+    ports:
+      - "127.0.0.1:16379:6379"
+
+volumes:
+  mysql-data:
+```
+
+启动：
+
+```bash
+docker compose up -d --build
+docker compose ps
+docker compose logs -f api
+```
+
+这里有三个工程化细节：
+
+- API 对宿主机暴露 `127.0.0.1:8080`，避免绑定到所有网卡。
+- MySQL 宿主机端口用 `13306`，Redis 用 `16379`，降低和本机服务冲突的概率。
+- 容器之间仍然使用 `mysql:3306`、`redis:6379`，不受宿主机端口影响。
+
+## 增强版开发环境模板
+
+入门版能跑，但还不够稳。更推荐的后端开发模板应该包含 healthcheck、依赖健康判断、`.env`、初始化脚本、显式网络和 Linux 访问宿主机兼容。
+
+```yaml
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: dev
+    env_file:
+      - .env
+    environment:
+      APP_ENV: dev
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      REDIS_ADDR: redis:6379
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - .:/app
+    working_dir: /app
+    command: sh -c "go run ./cmd/server"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - frontend
+      - backend
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-app}
+    ports:
+      - "127.0.0.1:${MYSQL_PORT:-13306}:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./docker/mysql/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -p$${MYSQL_ROOT_PASSWORD} || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+    networks:
+      - backend
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-16379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - backend
+    restart: unless-stopped
+
+networks:
+  frontend:
+  backend:
+
+volumes:
+  mysql-data:
+```
+
+这个版本解决了几个真实团队问题：
+
+- `api` 等待 `mysql`、`redis` 健康后再启动。
+- MySQL 和 Redis 使用非默认宿主机端口。
+- 数据库初始化 SQL 放在 `./docker/mysql/init`。
+- API 使用源码挂载，适合本地热更新。
+- `extra_hosts` 兼容 Linux 原生 Docker 中访问宿主机服务。
+- 显式声明网络，后续拆分前端入口和后端依赖更清晰。
+
+如果 MySQL、Redis 只给 API 容器访问，宿主机不需要直连，可以进一步减少暴露面：
+
+```yaml
+services:
+  mysql:
+    image: mysql:8.4
+    expose:
+      - "3306"
+
+  redis:
+    image: redis:7.4
+    expose:
+      - "6379"
+```
+
+`expose` 只表达容器网络内端口，不发布到宿主机。只有需要本机客户端调试时，才使用 `ports`。
+
+## healthcheck 与 depends_on
+
+很多文档只写：
+
+```yaml
+depends_on:
+  - mysql
+  - redis
+```
+
+这只能保证容器启动顺序，不能保证 MySQL 已经完成初始化，也不能保证 Redis 已经能响应命令。更可靠的写法是：
+
+```yaml
+depends_on:
+  mysql:
+    condition: service_healthy
+  redis:
+    condition: service_healthy
+```
+
+配套的依赖服务必须有 `healthcheck`：
+
+```yaml
+mysql:
+  image: mysql:8.4
+  healthcheck:
+    test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -p$${MYSQL_ROOT_PASSWORD} || exit 1"]
+    interval: 5s
+    timeout: 3s
+    retries: 20
+    start_period: 20s
+
+redis:
+  image: redis:7.4
+  healthcheck:
+    test: ["CMD", "redis-cli", "ping"]
+    interval: 5s
+    timeout: 3s
+    retries: 10
+```
+
+但要注意：healthcheck 解决的是**容器启动阶段的依赖可用性**；应用层连接重试解决的是**运行期依赖短暂不可用**。两者不是替代关系。数据库重启、网络抖动、连接池失效时，后端服务仍然需要超时、重试和连接池恢复机制。
+
+## .env、env_file 与 environment
+
+Compose 会读取当前目录的 `.env`，常用于变量替换：
+
+```env
+APP_ENV=dev
+MYSQL_ROOT_PASSWORD=root
+MYSQL_DATABASE=app
+MYSQL_PORT=13306
+REDIS_PORT=16379
+```
+
+可以提交一份 `.env.example`：
+
+```env
+APP_ENV=dev
+MYSQL_ROOT_PASSWORD=root
+MYSQL_DATABASE=app
+MYSQL_PORT=13306
+REDIS_PORT=16379
+```
+
+但不要提交真实 `.env`。仓库 `.gitignore` 应包含：
+
+```gitignore
+.env
+.env.local
+```
+
+`env_file` 和 `environment` 的分工可以这样理解：
+
+```yaml
+services:
+  api:
+    env_file:
+      - .env
+    environment:
+      DB_HOST: mysql
+      REDIS_ADDR: redis:6379
+```
+
+- `env_file`：批量读取环境变量文件，适合本地开发变量。
+- `environment`：显式声明服务运行必须依赖的关键变量，可读性更强。
+- 敏感配置不要硬编码进 `compose.yaml`。
+- 生产密钥不应该来自开发机 `.env`，应由部署平台、CI/CD 或密钥系统注入。
+
+## 热更新与镜像构建缓存
+
+后端开发常见两种模式。
+
+第一种是镜像构建模式，适合验证 Dockerfile：
+
+```yaml
+services:
+  api:
+    build: .
+    ports:
+      - "127.0.0.1:8080:8080"
+```
+
+第二种是源码挂载模式，适合本地快速开发：
+
+```yaml
+services:
+  api:
+    build:
+      context: .
+      target: dev
+    volumes:
+      - .:/app
+    working_dir: /app
+    command: air
+```
+
+团队可以用覆盖文件维护开发差异：
+
+```bash
+docker compose -f compose.yaml -f compose.dev.yaml up -d --build
+```
+
+Go 后端 Dockerfile 应注意构建缓存：
+
+```dockerfile
+FROM golang:1.22 AS builder
+
+WORKDIR /app
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN go build -o server ./cmd/server
+
+FROM debian:bookworm-slim
+
+WORKDIR /app
+COPY --from=builder /app/server /app/server
+
+EXPOSE 8080
+CMD ["./server"]
+```
+
+关键点是先 `COPY go.mod go.sum`，再下载依赖，最后复制源码。这样业务代码变化不会导致依赖层缓存全部失效。
+
+Node.js 项目同理：
+
+```dockerfile
+COPY package.json pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile
+COPY . .
+```
+
+## 数据库初始化与数据卷
+
+MySQL 官方镜像支持初始化目录：
+
+```yaml
+mysql:
+  image: mysql:8.4
+  volumes:
+    - mysql-data:/var/lib/mysql
+    - ./docker/mysql/init:/docker-entrypoint-initdb.d:ro
+```
+
+`/docker-entrypoint-initdb.d` 只会在数据库首次初始化时执行。如果 `mysql-data` 已经存在，init SQL 不会重复执行。想重新初始化，需要删除 volume：
+
+```bash
+docker compose down -v
+docker compose up -d
+```
+
+这条命令会清空本地数据库数据，适合重置开发环境，不适合在有重要数据时随手执行。
+
+## 资源限制与重启策略
+
+本地同时跑 MySQL、Redis、Kafka、Elasticsearch 时，很容易把 Docker Desktop 内存吃满。开发环境可以给重型服务加资源限制：
+
+```yaml
+services:
+  mysql:
+    mem_limit: 1g
+    cpus: 1.0
+```
+
+重启策略也要分场景：
+
+```yaml
+restart: unless-stopped
+```
+
+MySQL、Redis 这类基础设施服务可以设置 `restart: unless-stopped`。开发中的 API 服务不建议盲目自动重启，因为代码错误时反复重启会掩盖第一现场日志。
+
+## 高频命令
+
+```bash
+docker compose up -d
+docker compose up -d --build
+docker compose -f compose.yaml -f compose.dev.yaml up -d --build
+docker compose ps
+docker compose logs -f api
+docker compose exec api sh
+docker compose exec mysql mysql -uroot -proot app
+docker compose restart api
+docker compose config
+docker compose down
+docker compose down -v
+```
+
+`docker compose config` 很适合排查多文件覆盖后的最终配置。你以为生效的是 `compose.dev.yaml`，实际启动的可能是另一个端口、旧镜像或旧环境变量。
+
+清理命令要谨慎区分：
+
+```bash
+docker compose down      # 停止并删除当前项目容器和网络，默认保留 volume
+docker compose down -v   # 同时删除 volume，会清空数据库
+docker compose rm        # 删除已停止的服务容器
+docker image prune       # 清理悬空镜像
+docker system prune      # 大范围清理，执行前要确认影响
+```
+
+## 问题导向排障
+
+### API 连不上 MySQL
+
+先看服务状态和日志：
+
+```bash
+docker compose ps
+docker compose logs mysql
+docker compose logs api
+docker compose exec api sh
+```
+
+进入 API 容器后检查：
+
+```bash
+echo $DB_HOST
+getent hosts mysql
+nc -vz mysql 3306
+```
+
+判断路径：
+
+- DNS 不通：检查 `api` 和 `mysql` 是否在同一个 network。
+- 端口不通：检查 MySQL 是否 healthy，监听端口是否正确。
+- 认证失败：检查 `MYSQL_USER`、`MYSQL_ROOT_PASSWORD`、应用连接串。
+- 初始化失败：检查 volume 是否已经存在，init SQL 是否只在首次执行。
+
+### 宿主机访问 API 失败
+
+```bash
+docker compose ps
+docker compose logs api
+docker port <api-container>
+docker compose exec api sh
+ss -lntp
+```
+
+判断路径：
+
+- 没有监听：应用没启动。
+- 监听 `127.0.0.1:8080`：需要改成监听 `0.0.0.0:8080`。
+- 端口映射错误：检查 `ports` 左右是否写反。
+- 绑定地址限制：如果写了 `127.0.0.1:8080:8080`，局域网其他机器无法访问是正常的。
+
+### 容器启动了但旧代码还在运行
+
+```bash
+docker compose build --no-cache api
+docker compose up -d api
+docker image ls
+docker compose config
+```
+
+重点检查：
+
+- Dockerfile 的 `COPY` 顺序是否导致缓存误判。
+- volume 挂载是否覆盖了镜像内代码。
+- 启动的是不是旧镜像 tag。
+- 是否用了多个 Compose 覆盖文件，最终配置不是你以为的那份。
+
+## Compose 的生产边界
+
+Docker Compose 非常适合本地开发、集成测试、单机演示和教学环境。它不应该被误解为 Kubernetes 的替代品。
+
+当你需要多节点调度、跨机器服务发现、滚动发布、声明式自愈、弹性伸缩、细粒度权限和集群级观测时，应交给 Kubernetes 或其他编排系统。Compose 可以帮后端工程师建立容器化思维，但生产编排还需要更完整的平台能力。
+
+## 后端开发者检查清单
+
+- [ ] API 容器内连接 MySQL 使用 `mysql:3306`，不是 `localhost:3306`。
+- [ ] 宿主机访问 API 使用 `127.0.0.1:8080` 这类显式绑定。
+- [ ] MySQL、Redis 默认不占用宿主机 `3306`、`6379`。
+- [ ] 依赖服务配置了 healthcheck。
+- [ ] `depends_on` 使用 `condition: service_healthy`，但应用仍有连接重试。
+- [ ] `.env.example` 可提交，真实 `.env` 不提交。
+- [ ] 初始化 SQL 放在 `/docker-entrypoint-initdb.d`，并理解它只首次执行。
+- [ ] 开发热更新和镜像构建验证有不同 Compose 文件或不同 profile。
+- [ ] 能用 `docker compose config` 查看最终配置。
+- [ ] 知道 `down -v` 会删除数据库 volume。
+- [ ] 知道 Compose 适合本地开发，不等于生产编排平台。

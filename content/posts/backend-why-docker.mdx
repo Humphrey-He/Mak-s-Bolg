@@ -1,0 +1,112 @@
+---
+slug: "backend-why-docker"
+title: "后端为什么需要 Docker：从环境一致性到可交付运行单元"
+description: "面向后端开发者解释 Docker 解决的真实工程问题：环境差异、依赖封装、容器运行、镜像交付与基础命令。"
+date: "2026-05-12"
+tag: "Cloud Native"
+readTime: "18 min"
+top: false
+featured: false
+---
+
+## 这篇解决什么问题
+
+后端开发最熟悉的一句话是：“我本地能跑。”它通常不是借口，而是事实：本地有正确的 JDK、Node、Go 版本，有某个系统库，有配置文件，有一个恰好没被占用的端口，还有一份没写进文档的启动顺序。到了测试机或生产机，任何一个条件变化，服务都可能启动失败。
+
+Docker 的价值不是把命令变酷，而是把“运行一个服务需要什么”打包成可重复的运行单元。对后端来说，这意味着代码、运行时、系统依赖、启动命令、默认端口可以被描述、构建、分发和复现。
+
+## 架构位置
+
+传统部署常常是“服务器先准备环境，再把应用放上去”。Docker 把顺序反过来：先构建一个镜像，镜像里声明运行环境；服务器只需要有 Docker runtime，就可以从镜像启动容器。
+
+```txt
+源代码
+  -> Dockerfile
+  -> Image
+  -> Registry
+  -> docker run
+  -> Container
+  -> 后端进程
+```
+
+容器不是虚拟机。它共享宿主机内核，通过 namespace 隔离进程、网络、文件系统视图，通过 cgroup 限制 CPU、内存等资源。镜像也不是简单压缩包，它由多层只读 layer 组成，容器启动后会在上面叠加一个可写层。
+
+## 核心名词
+
+- Image：镜像，后端服务的运行模板，包含文件系统、依赖和启动信息。
+- Container：容器，镜像启动后的运行实例。
+- Registry：镜像仓库，用来分发镜像，例如私有仓库或 Docker Hub。
+- Dockerfile：镜像构建说明书。
+- Layer：镜像层，影响构建缓存、体积和复用。
+- Runtime：真正创建和运行容器的底层组件。
+- Namespace：隔离进程、网络、挂载点等视图。
+- Cgroup：限制和统计资源使用。
+
+## 最小可运行示例
+
+先用现成的 nginx 镜像感受 Docker 的工作方式：
+
+```bash
+docker pull nginx:1.27
+docker run -d --name web-demo -p 8080:80 nginx:1.27
+docker ps
+curl http://127.0.0.1:8080
+docker stop web-demo
+docker rm web-demo
+```
+
+`docker pull` 从仓库拉取镜像；`docker run` 基于镜像创建并启动容器；`-p 8080:80` 表示把宿主机 8080 端口转发到容器内 80 端口。浏览器或 curl 访问的是宿主机端口，真正处理请求的是容器里的 nginx 进程。
+
+## 高频命令
+
+```bash
+docker version
+docker info
+docker pull nginx
+docker images
+docker run nginx
+docker ps
+docker ps -a
+docker logs <container>
+docker stop <container>
+docker rm <container>
+```
+
+`docker version` 用来确认客户端和服务端版本；`docker info` 看 Docker daemon、存储驱动、运行时和资源信息；`docker images` 查看本地镜像；`docker ps` 只看运行中的容器，`docker ps -a` 会包含已退出容器；`docker logs` 是后端排查启动失败的第一入口之一。
+
+## 参数意义
+
+```bash
+docker run -d \
+  --name api \
+  -p 8080:8080 \
+  -e APP_ENV=dev \
+  -v api-logs:/app/logs \
+  my-api:local
+```
+
+- `-d`：后台运行容器。没有它，日志会直接占用当前终端。
+- `--name`：给容器固定名字，后续 `logs`、`stop`、`exec` 都更好操作。
+- `-p`：端口映射，格式是 `宿主机端口:容器端口`。
+- `-e`：注入环境变量，适合传入非敏感运行配置。
+- `-v`：挂载 volume 或宿主机路径，适合持久化数据和配置文件。
+
+## 常见坑
+
+第一个坑是把容器当虚拟机用。容器里不应该手动登录后安装依赖再长期保存状态，依赖应该写进 Dockerfile，状态应该放到 volume、数据库或对象存储。
+
+第二个坑是端口理解错。后端服务在容器内监听 `8080`，并不代表宿主机也自动暴露 `8080`。需要显式使用 `-p`。
+
+第三个坑是进程退出。容器的生命周期跟主进程绑定，后端进程一退出，容器就退出。排查时先看 `docker ps -a` 和 `docker logs <container>`。
+
+第四个坑是把配置和密钥打进镜像。镜像会被分发、缓存和扫描，生产密码、`.env`、私钥不应该进入镜像层。
+
+## 后端开发者检查清单
+
+- [ ] 服务能通过一条 `docker run` 启动。
+- [ ] 启动端口、环境变量、数据目录都写清楚。
+- [ ] 日志输出到 stdout/stderr，而不是只写容器内部文件。
+- [ ] 依赖安装写进 Dockerfile，不靠手工进容器修补。
+- [ ] 镜像里没有 `.env`、私钥、生产配置和测试数据。
+- [ ] 能用 `docker logs` 看到启动错误。
+- [ ] 能解释 Image、Container、Registry、Layer 的区别。

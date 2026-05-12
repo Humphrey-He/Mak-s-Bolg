@@ -1,0 +1,588 @@
+---
+slug: "dockerfile-backend-service"
+title: "Dockerfile 如何描述一个后端服务：可重复构建、安全运行与生产模板"
+description: "从后端服务视角讲清 Dockerfile、BuildKit 缓存、多阶段构建、secret mount、非 root 用户、OCI label、ENTRYPOINT、优雅退出和健康检查。"
+date: "2026-05-14"
+tag: "Cloud Native"
+readTime: "32 min"
+top: false
+featured: false
+---
+
+## 这篇解决什么问题
+
+Dockerfile 不是“把本机环境打包一下”的脚本，而是定义一个后端服务如何从源码变成可重复构建、可分发、可运行镜像的过程。
+
+如果 Dockerfile 写得随意，后续会出现：
+
+- 镜像巨大，拉取慢，漏洞多。
+- 构建缓存频繁失效，CI 时间变长。
+- 密钥进入镜像层或构建历史。
+- 生产镜像里混入源码、编译器、测试数据。
+- 容器默认 root 运行，安全边界过宽。
+- `ENTRYPOINT` 信号处理不清晰，发布时无法优雅退出。
+- 线上无法追踪镜像对应的代码版本。
+- Apple 芯片构建后到 Linux x86 节点无法运行。
+
+这篇文章从后端服务角度讲 Dockerfile：先能构建，再可缓存、可审计、可扫描、可安全运行。
+
+## 架构解释
+
+一个典型后端镜像构建链路如下：
+
+```txt
+源代码 + Dockerfile + .dockerignore
+  -> docker build / buildx build
+  -> builder 阶段安装依赖和编译
+  -> runtime 阶段只保留必要产物
+  -> 镜像 tag + digest
+  -> registry
+  -> runtime pull
+  -> container start
+```
+
+构建阶段和运行阶段最好分离。构建需要编译器、包管理器、源码和缓存；运行通常只需要二进制、运行时库、配置入口、CA 证书和时区数据。多阶段构建可以把前者留在 builder 里，只把产物复制到最终镜像。
+
+## 核心名词
+
+- Build context：发送给 Docker daemon 的构建上下文。
+- `.dockerignore`：从构建上下文中排除文件。
+- Base image：基础镜像，例如 `golang:1.24-bookworm`、`node:22-bookworm-slim`。
+- Multi-stage build：多阶段构建，用多个 `FROM` 分离构建与运行。
+- Layer cache：基于 Dockerfile 指令和文件内容的层缓存。
+- BuildKit cache mount：构建时缓存依赖下载目录或编译缓存。
+- Secret mount：构建时临时挂载密钥，不写进镜像层。
+- `ARG`：构建期变量。
+- `ENV`：构建期和运行期环境变量。
+- `ENTRYPOINT`：容器启动入口。
+- `CMD`：默认参数或默认命令。
+- `HEALTHCHECK`：容器运行时健康信号。
+
+## Build context 与 .dockerignore
+
+`docker build -t my-api:local .` 最后的 `.` 是构建上下文。Dockerfile 只能 `COPY` 构建上下文里的文件。上下文越大，构建越慢，也越容易误把密钥、日志、缓存、测试数据带进镜像。
+
+推荐 `.dockerignore` 模板：
+
+```dockerignore
+.git
+.gitignore
+Dockerfile*
+compose*.yaml
+docker-compose*.yml
+
+.env
+.env.*
+!.env.example
+
+node_modules
+dist
+build
+coverage
+
+*.log
+tmp
+.cache
+
+.idea
+.vscode
+
+__pycache__
+.pytest_cache
+.mypy_cache
+
+target
+bin
+obj
+
+*.pem
+*.key
+*.crt
+*.p12
+*.sqlite
+*.db
+```
+
+不要盲目忽略 `dist` 或 `build`。如果你的 Dockerfile 需要复制宿主机构建好的产物，就不能忽略它们。更推荐在镜像内完成构建，而不是依赖本机产物。
+
+## 指令含义：ARG、ENV、CMD、ENTRYPOINT
+
+常见指令：
+
+- `FROM`：指定基础镜像，也开启一个构建阶段。
+- `WORKDIR`：设置后续指令的工作目录。
+- `COPY`：把构建上下文里的文件复制进镜像。
+- `RUN`：构建镜像时执行命令，例如安装依赖、编译。
+- `EXPOSE`：声明容器内端口，不等于自动映射宿主机端口。
+- `CMD`：默认参数或默认命令。
+- `ENTRYPOINT`：容器启动入口，服务镜像通常用它固定主进程。
+
+`ARG` 与 `ENV` 的区别：
+
+| 指令 | 作用阶段 | 是否进入最终镜像 |
+| --- | --- | --- |
+| `ARG` | 构建期变量 | 默认不作为运行时环境变量，但可能出现在历史元数据中 |
+| `ENV` | 构建期和运行期 | 会进入镜像，容器运行时可见 |
+
+示例：
+
+```dockerfile
+ARG VERSION=dev
+ENV APP_ENV=production
+```
+
+构建：
+
+```bash
+docker build \
+  --build-arg VERSION=$(git rev-parse --short HEAD) \
+  -t api:local .
+```
+
+`ARG` 和 `ENV` 都不适合放敏感密钥。
+
+## 构建缓存：layer cache 与 BuildKit cache mount
+
+指令顺序会影响 layer cache。依赖文件变化频率通常低于源码，所以先复制 `go.mod`、`package-lock.json`、`pom.xml` 这类文件安装依赖，再复制完整源码，可以减少无意义的依赖重装。
+
+BuildKit 的 cache mount 可以进一步缓存包管理器下载目录和编译缓存。
+
+Go 示例：
+
+```dockerfile
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
+
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    go build -o /out/app ./cmd/server
+```
+
+Node.js 示例：
+
+```dockerfile
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci
+```
+
+pnpm 示例：
+
+```dockerfile
+RUN corepack enable
+RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
+    pnpm install --frozen-lockfile
+```
+
+Layer cache 依赖指令和文件内容；BuildKit cache mount 适合缓存包管理器下载目录和编译缓存。两者互补。
+
+## Secret mount：构建期密钥不要进镜像
+
+错误写法：
+
+```dockerfile
+ARG NPM_TOKEN
+RUN npm config set //registry.npmjs.org/:_authToken=$NPM_TOKEN
+```
+
+风险是 token 可能进入镜像层、构建历史或 CI 日志。
+
+BuildKit 推荐：
+
+```dockerfile
+RUN --mount=type=secret,id=npmrc,target=/root/.npmrc \
+    npm ci
+```
+
+构建时：
+
+```bash
+docker build \
+  --secret id=npmrc,src=$HOME/.npmrc \
+  -t my-api:local .
+```
+
+原则：
+
+- 密钥不要进 build context。
+- 密钥不要用 `COPY`。
+- 密钥不要写入 `ARG` 或 `ENV`。
+- 需要构建期密钥时使用 BuildKit secret mount。
+
+Go 私有模块也类似，可以通过 secret mount 注入 `.netrc`、git config 或 token，而不是复制到镜像里。
+
+## Go 后端生产级 Dockerfile
+
+先看一个偏生产的 Go 服务模板：
+
+```dockerfile
+# syntax=docker/dockerfile:1.7
+
+ARG GO_VERSION=1.24
+ARG APP_NAME=my-api
+ARG VERSION=dev
+ARG GIT_COMMIT=unknown
+
+FROM golang:${GO_VERSION}-bookworm AS builder
+
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
+
+COPY . .
+
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux go build \
+    -trimpath \
+    -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${GIT_COMMIT}" \
+    -o /out/app \
+    ./cmd/server
+
+FROM gcr.io/distroless/static-debian12:nonroot AS runtime
+
+ARG VERSION=dev
+ARG GIT_COMMIT=unknown
+
+LABEL org.opencontainers.image.title="my-api" \
+      org.opencontainers.image.description="Backend API service" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${GIT_COMMIT}"
+
+WORKDIR /app
+
+COPY --from=builder /out/app /app/app
+
+EXPOSE 8080
+
+USER nonroot:nonroot
+
+ENTRYPOINT ["/app/app"]
+```
+
+构建：
+
+```bash
+docker build \
+  --build-arg VERSION=v1.2.3 \
+  --build-arg GIT_COMMIT=$(git rev-parse HEAD) \
+  -t registry.example.com/team/my-api:v1.2.3 \
+  -t registry.example.com/team/my-api:git-$(git rev-parse --short HEAD) \
+  .
+```
+
+推送：
+
+```bash
+docker push registry.example.com/team/my-api:v1.2.3
+docker push registry.example.com/team/my-api:git-$(git rev-parse --short HEAD)
+```
+
+获取 digest：
+
+```bash
+docker buildx imagetools inspect registry.example.com/team/my-api:v1.2.3
+```
+
+这个模板的特点：
+
+- 使用多阶段构建。
+- 使用 BuildKit cache mount。
+- `CGO_ENABLED=0` 生成静态二进制。
+- `-trimpath` 和 `-ldflags="-s -w"` 减少路径泄漏和体积。
+- 最终镜像使用 distroless nonroot。
+- 默认非 root 运行。
+- 通过 OCI label 记录版本和 commit。
+
+distroless 的优点是小、攻击面低、不带 shell。缺点是排障不方便，不能 `docker exec` 进去 `sh`。生产环境应该通过日志、metrics、debug endpoint、临时 debug 容器来排查。
+
+如果你需要 CA 证书、时区或临时 curl 排障，可以选择 `debian:bookworm-slim` 作为运行镜像：
+
+```dockerfile
+FROM debian:bookworm-slim AS runtime
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates tzdata curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /out/app /app/app
+
+EXPOSE 8080
+USER 65532:65532
+ENTRYPOINT ["/app/app"]
+```
+
+不要机械追求最小镜像。生产镜像要在体积、安全和可运维之间做权衡。
+
+## Node.js 后端生产级 Dockerfile
+
+pnpm + 多阶段示例：
+
+```dockerfile
+# syntax=docker/dockerfile:1.7
+
+FROM node:22-bookworm-slim AS deps
+WORKDIR /app
+RUN corepack enable
+COPY package.json pnpm-lock.yaml ./
+RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
+    pnpm install --frozen-lockfile
+
+FROM node:22-bookworm-slim AS build
+WORKDIR /app
+RUN corepack enable
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+RUN pnpm build
+RUN pnpm prune --prod
+
+FROM node:22-bookworm-slim AS runner
+WORKDIR /app
+
+ENV NODE_ENV=production
+
+RUN useradd --system --uid 10001 appuser
+
+COPY --from=build /app/package.json ./package.json
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/dist ./dist
+
+USER appuser
+EXPOSE 3000
+ENTRYPOINT ["node", "dist/server.js"]
+```
+
+包管理器原则：
+
+- npm 用 `npm ci`。
+- pnpm 用 `pnpm install --frozen-lockfile`。
+- yarn 用 `yarn install --immutable`。
+- 生产镜像只保留 production dependencies 和构建产物。
+
+## 安全基线：非 root 与最小运行时
+
+容器不是强安全边界。服务进程不应默认 root 运行。即使容器逃逸风险很低，root 进程也会放大挂载目录、宿主机资源和运行时配置错误的影响。
+
+Alpine 自建用户：
+
+```dockerfile
+RUN addgroup -S app && adduser -S app -G app
+USER app
+```
+
+Debian 自建用户：
+
+```dockerfile
+RUN useradd --system --uid 10001 appuser
+USER appuser
+```
+
+distroless：
+
+```dockerfile
+USER nonroot:nonroot
+```
+
+最终镜像应尽量不包含源码、编译器、包管理器、测试数据、密钥和不必要的调试工具。
+
+## ENTRYPOINT、CMD 与信号处理
+
+推荐 exec form：
+
+```dockerfile
+ENTRYPOINT ["/app/app"]
+CMD ["--config", "/app/config.yaml"]
+```
+
+运行时可以覆盖参数：
+
+```bash
+docker run my-api:local --config /tmp/dev.yaml
+```
+
+不推荐 shell form：
+
+```dockerfile
+ENTRYPOINT ./app
+```
+
+exec form 能让应用进程直接成为 PID 1，信号传递更明确，避免 shell 吞信号或变量展开带来的意外行为。
+
+容器停止时 Docker 默认发送 `SIGTERM`，等待超时后发送 `SIGKILL`。后端服务应正确处理 `SIGTERM`，停止接收新请求，关闭连接池，完成正在处理的请求，然后退出。
+
+Go 示例：
+
+```go
+srv := &http.Server{Addr: ":8080", Handler: handler}
+
+go func() {
+    _ = srv.ListenAndServe()
+}()
+
+ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+defer stop()
+
+<-ctx.Done()
+
+shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+defer cancel()
+
+_ = srv.Shutdown(shutdownCtx)
+```
+
+这比单纯“容器能启动”更接近生产实践。
+
+## HEALTHCHECK 与健康语义
+
+Dockerfile 可以声明健康检查：
+
+```dockerfile
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+  CMD ["/app/app", "healthcheck"]
+```
+
+如果镜像有 curl：
+
+```dockerfile
+HEALTHCHECK --interval=30s --timeout=3s --retries=3 \
+  CMD curl -fsS http://127.0.0.1:8080/healthz || exit 1
+```
+
+但要知道边界：
+
+- `HEALTHCHECK` 不等于完整业务可用性保障。
+- 它只是容器运行时的一种健康信号。
+- Docker Compose 中可以配合 `depends_on.condition: service_healthy`。
+- Kubernetes 中通常使用 `readinessProbe` 和 `livenessProbe`。
+- distroless 没有 shell 或 curl，可以让应用内置 healthcheck 子命令，或者在编排层做 HTTP probe。
+
+## 镜像体积、扫描与排障
+
+查看体积和层：
+
+```bash
+docker images my-api
+docker history my-api:local
+docker image inspect my-api:local
+```
+
+高级工具：
+
+```txt
+dive
+docker scout
+trivy image
+```
+
+常见减小体积方法：
+
+- 多阶段构建。
+- 减少运行镜像里的包管理器和编译器。
+- 清理 apt/apk 缓存。
+- 只复制必要产物。
+- 避免 `COPY . .` 带入无关文件。
+- 合理使用 `.dockerignore`。
+- Go 使用 `-ldflags="-s -w"` 减小二进制。
+- 选择 distroless 或 slim 镜像。
+
+镜像不是越小越好。过小导致没有 CA 证书、时区数据或调试工具，也会影响运维体验。
+
+## 问题导向排障
+
+### 改了代码，镜像里还是旧代码
+
+```bash
+docker build --no-cache -t my-api:test .
+docker history my-api:test
+docker run --rm my-api:test
+```
+
+重点看：
+
+- Dockerfile `COPY` 顺序。
+- 构建上下文是否正确。
+- `.dockerignore` 是否误排除了文件。
+- Compose 是否使用了旧镜像。
+- 运行的容器是否没有重建。
+- volume 是否覆盖了镜像内文件。
+
+### 镜像为什么很大
+
+```bash
+docker images my-api
+docker history my-api:local
+```
+
+常见原因：
+
+- `COPY . .` 带入 `node_modules`、`.git`、日志。
+- 最终镜像使用 builder 镜像。
+- apt/apk 缓存未清理。
+- 安装了调试工具或编译器。
+- 没有多阶段构建。
+- 把测试数据、覆盖率报告打进镜像。
+
+### 容器启动后马上退出
+
+```bash
+docker logs <container>
+docker inspect <container>
+docker run --rm -it --entrypoint sh my-api:local
+```
+
+常见原因：
+
+- `ENTRYPOINT` 路径错误。
+- 二进制没有执行权限。
+- 架构不匹配。
+- 缺少动态链接库。
+- 配置文件不存在。
+- 服务以前台进程退出。
+- 应用监听端口失败。
+
+如果是 distroless 没有 shell，可以用 debug 版本镜像，或者临时换成 slim runtime 排查。
+
+### Apple 芯片构建后 Linux 服务器不能跑
+
+典型错误：
+
+```txt
+exec format error
+```
+
+原因是构建架构和运行架构不一致。解决：
+
+```bash
+docker buildx build \
+  --platform linux/amd64 \
+  -t registry.example.com/team/api:linux-amd64 \
+  --push .
+```
+
+或者发布多架构：
+
+```bash
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -t registry.example.com/team/api:v1.0.0 \
+  --push .
+```
+
+## 后端开发者检查清单
+
+- [ ] Dockerfile 能从干净环境完整构建。
+- [ ] 使用多阶段构建区分 builder 和 runtime。
+- [ ] `.dockerignore` 排除了无关文件和敏感文件。
+- [ ] 依赖安装步骤能充分利用 layer cache。
+- [ ] 使用 BuildKit cache mount 加速依赖下载和编译。
+- [ ] 构建期密钥通过 secret mount 注入，不进入镜像层。
+- [ ] 最终镜像不包含源码、编译器、包管理器和测试数据。
+- [ ] 容器使用非 root 用户运行。
+- [ ] `ENTRYPOINT` 使用 exec form。
+- [ ] 应用能正确处理 `SIGTERM`，实现优雅退出。
+- [ ] 服务监听 `0.0.0.0`。
+- [ ] 镜像包含必要的 CA 证书 / 时区数据，或应用不依赖它们。
+- [ ] 镜像有 OCI label，能追踪源码版本。
+- [ ] 镜像经过漏洞扫描和体积检查。
+- [ ] 支持目标运行平台架构。

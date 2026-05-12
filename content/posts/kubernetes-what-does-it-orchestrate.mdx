@@ -1,0 +1,147 @@
+---
+slug: "kubernetes-what-does-it-orchestrate"
+title: "Kubernetes 到底在编排什么：从单机容器到集群期望状态"
+description: "面向后端开发者解释 Kubernetes 解决的真实问题、核心对象和控制面组件，帮助建立集群编排视角。"
+date: "2026-05-15"
+tag: "Cloud Native"
+readTime: "19 min"
+top: false
+featured: false
+---
+
+## 这篇解决什么问题
+
+学 Kubernetes 最容易卡在 YAML。很多后端开发者第一次看到 Pod、Deployment、Service、Ingress，会觉得它们只是更复杂的启动脚本。实际上 Kubernetes 不是帮你执行一串命令，而是在集群里持续维护“期望状态”。
+
+Docker 解决单机上如何运行容器的问题。Kubernetes 解决多机器、多副本、服务发现、滚动发布、自愈和资源调度的问题。你告诉它“我希望 api 有 3 个副本，使用这个镜像，对外通过这个 Service 访问”，它会不断检查真实状态，并尝试把真实状态拉回期望状态。
+
+## 架构位置
+
+一个后端请求进入 Kubernetes 后，通常会经历：
+
+```txt
+用户请求
+  -> Ingress / LoadBalancer
+  -> Service
+  -> Pod
+  -> Container
+  -> 后端进程
+```
+
+这里 Pod 承载容器，Deployment 管理 Pod 副本，Service 提供稳定访问入口，Ingress 处理 HTTP/HTTPS 入口规则。它们不是互相替代，而是各自负责一段职责。
+
+## 核心名词
+
+- `Cluster`：集群，由控制面和多个节点组成。
+- `Node`：运行 Pod 的机器，可以是虚拟机或物理机。
+- `Pod`：Kubernetes 最小调度单位，内部可以有一个或多个容器。
+- `Deployment`：管理无状态服务副本、滚动更新和回滚。
+- `ReplicaSet`：保证指定数量的 Pod 副本存在，通常由 Deployment 创建。
+- `Service`：为一组 Pod 提供稳定访问入口。
+- `Ingress`：声明 HTTP/HTTPS 的域名和路径路由。
+- `Namespace`：资源隔离空间，常用于区分环境或团队。
+- `ConfigMap`：普通配置。
+- `Secret`：敏感配置，如密码、Token、证书。
+
+## 控制面和节点侧
+
+控制面负责决策和记录状态：
+
+```txt
+kube-apiserver
+  -> 统一 API 入口
+etcd
+  -> 保存集群状态
+scheduler
+  -> 决定 Pod 放到哪个 Node
+controller-manager
+  -> 持续协调真实状态和期望状态
+```
+
+节点侧负责真正运行工作负载：
+
+```txt
+kubelet
+  -> 管理本节点 Pod 生命周期
+kube-proxy
+  -> 维护 Service 转发规则
+container runtime
+  -> 拉镜像并运行容器
+```
+
+后端开发者不一定每天维护控制面，但必须理解：`kubectl apply` 不是把服务“启动一下”就结束，而是把期望状态写进 API Server。之后控制器会持续工作。
+
+## 最小示例
+
+下面的 Pod 只是演示对象，不建议生产直接管理裸 Pod：
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: api-demo
+  labels:
+    app: api
+spec:
+  containers:
+    - name: api
+      image: nginx:1.27
+      ports:
+        - containerPort: 80
+```
+
+应用它：
+
+```bash
+kubectl apply -f pod.yaml
+kubectl get pod -o wide
+kubectl describe pod api-demo
+kubectl logs api-demo
+```
+
+`apply` 把配置提交给集群。`get pod -o wide` 可以看到 Pod IP 和调度节点。`describe` 能看到事件，例如镜像拉取、调度失败、探针失败。
+
+## 高频命令
+
+```bash
+kubectl cluster-info
+kubectl get nodes
+kubectl get ns
+kubectl get all
+kubectl get deploy,rs,pod,svc,ingress
+kubectl describe node <node>
+kubectl get events --sort-by=.lastTimestamp
+```
+
+`kubectl get all` 适合快速查看当前命名空间的主要资源，但它并不包含所有资源类型。排查时更推荐明确查看 `deploy,rs,pod,svc,ingress`。
+
+## 参数意义
+
+`-n` 指定命名空间，例如 `kubectl get pod -n prod`。如果查不到资源，先确认是不是在错误命名空间。
+
+`-A` 查看所有命名空间，例如 `kubectl get pod -A`。它适合查全局问题，但输出较多。
+
+`-o wide` 显示更多字段，例如 Pod IP、Node、镜像等。网络和调度问题经常要看这些字段。
+
+`--sort-by=.lastTimestamp` 常用于事件排序，帮助你看到最近发生的调度、拉镜像、探针和挂载问题。
+
+## 常见问题
+
+第一，把 Kubernetes 当作“远程 Docker”。Kubernetes 管的是对象和期望状态，不建议直接登录节点手动改容器。
+
+第二，只关注 Pod，不看控制器。生产服务通常由 Deployment 管理，删除单个 Pod 后控制器会重新拉起，这不是异常，而是自愈机制。
+
+第三，忽略命名空间。同名资源可以存在于不同 Namespace，排查时必须确认上下文。
+
+第四，认为 Service 就是一个真实进程。Service 更像稳定虚拟入口和转发规则，它通过 selector 找到后端 Pod。
+
+## 后端开发者检查清单
+
+- [ ] 能说清 Docker 单机运行和 Kubernetes 集群编排的差别。
+- [ ] 知道 Pod、Deployment、Service、Ingress 分别负责什么。
+- [ ] 排查资源前会确认当前 context 和 namespace。
+- [ ] 知道 `kubectl apply` 写入的是期望状态。
+- [ ] 遇到问题会先看 `get` 状态，再看 `describe` 事件。
+- [ ] 明白生产服务通常不直接创建裸 Pod。
+- [ ] 知道 Service 通过 label selector 选择 Pod。
+- [ ] 能画出请求从 Ingress 到后端进程的大致路径。

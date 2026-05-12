@@ -1,0 +1,474 @@
+---
+slug: "kubernetes-backend-deploy-chain"
+title: "Kubernetes 后端服务部署完整链路：从镜像到线上请求"
+description: "串起镜像 digest、Deployment、探针、Service、EndpointSlice、IngressClass、ConfigMap、Secret、PDB、HPA、调度分布和排障链路。"
+date: "2026-05-15"
+tag: "Cloud Native"
+readTime: "32 min"
+top: false
+featured: false
+---
+
+## 这篇解决什么问题
+
+很多后端开发者第一次接触 Kubernetes 时，会把部署理解成“把 YAML apply 一下”。但线上请求真正命中服务，中间至少经过镜像仓库、Deployment、ReplicaSet、Pod、Service、EndpointSlice、Ingress Controller 和探针。任何一环不对，表现都可能是“接口不通”。
+
+这篇把完整链路串起来。目的不是替代 CI/CD 平台，而是让你能从代码变更一路追到用户请求，知道每一步该看什么对象、用什么命令、如何判断问题发生在哪一层。
+
+更重要的是，生产级后端服务不能只有最小 Deployment。它还需要不可变镜像、探针语义、资源约束、安全上下文、优雅退出、PDB、HPA、拓扑分布和可回滚边界。
+
+## 后端请求进入 K8s 的完整链路
+
+后端服务从提交到对外可访问，通常是这条链路：
+
+```txt
+Git Commit
+  -> CI 构建镜像
+  -> 推送 tag
+  -> 获取 image digest
+  -> 更新 Deployment
+  -> ReplicaSet 创建新 Pod
+  -> Pod 拉取镜像并启动容器
+  -> startupProbe 通过
+  -> readinessProbe 通过
+  -> Service 选择 Ready Pod
+  -> EndpointSlice 记录后端地址
+  -> Ingress Controller 接入外部流量
+  -> 用户请求命中后端进程
+```
+
+Deployment 维护期望副本和发布过程，Pod 承载真实进程，Service 提供稳定入口，EndpointSlice 记录可用后端地址，Ingress 处理 HTTP 入口。后端开发者排查时不要只盯日志，要顺着链路逐层确认。
+
+## 镜像不可变与 digest
+
+镜像 tag 方便人读，但它是可变引用。Digest 才是镜像内容身份。
+
+```txt
+registry.example.com/team/api:v1.0.1
+registry.example.com/team/api@sha256:xxxxxxxx
+```
+
+生产发布建议至少记录：
+
+```txt
+image tag: api:v1.0.1
+digest: sha256:xxxxxxxx
+git commit: abc1234
+build id: 20260512.001
+release revision: 42
+```
+
+Kubernetes 部署时可以用 tag，但发布审计和回滚必须能追溯到 digest。否则 tag 被覆盖后，历史版本就不再可靠。
+
+## 生产级 Deployment 模板
+
+最小 Deployment 能帮助入门，但生产后端服务至少应该理解下面这些字段：
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  labels:
+    app.kubernetes.io/name: api
+    app.kubernetes.io/part-of: backend
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: api
+        app.kubernetes.io/part-of: backend
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: api
+          image: registry.example.com/team/api:v1.0.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: APP_ENV
+              value: "prod"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"
+          startupProbe:
+            httpGet:
+              path: /startup
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 10"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            capabilities:
+              drop:
+                - ALL
+```
+
+关键点：
+
+- `maxUnavailable: 0` 避免滚动更新时主动降低可用副本数。
+- `startupProbe` 避免慢启动服务被 `livenessProbe` 误杀。
+- `readinessProbe` 控制是否进入流量。
+- `livenessProbe` 判断进程是否需要重启。
+- `resources` 让调度器知道资源需求。
+- `securityContext` 建立最小权限运行基线。
+- `preStop` 和 `terminationGracePeriodSeconds` 配合优雅退出。
+
+## 探针语义
+
+探针不要混用。
+
+| 探针 | 作用 | 是否应该检查外部依赖 | 失败后结果 |
+| --- | --- | --- | --- |
+| `startupProbe` | 判断应用是否完成启动 | 可以检查启动必要条件 | 未通过前不会执行 liveness/readiness |
+| `readinessProbe` | 判断是否可以接流量 | 可以检查关键依赖，但要轻量 | 从 Service 后端移除 |
+| `livenessProbe` | 判断进程是否卡死、需要重启 | 通常不要检查 DB/Redis | kubelet 重启容器 |
+
+不要把数据库、Redis、下游 HTTP 全部塞进 `livenessProbe`。依赖短暂不可用不代表进程应该重启。依赖不可用更适合影响 readiness，让 Pod 暂时不接流量。
+
+错误示例：
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /health-that-checks-db
+    port: 8080
+```
+
+可能导致：
+
+```txt
+数据库抖动
+  -> 所有 Pod liveness 失败
+  -> kubelet 大量重启容器
+  -> 服务雪崩
+```
+
+## Service 与 EndpointSlice
+
+Service 本身不直接保存 Pod IP。Service 通过 selector 选中 Ready Pod，然后由 EndpointSlice 记录实际后端地址。
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+spec:
+  selector:
+    app.kubernetes.io/name: api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+```
+
+排查：
+
+```bash
+kubectl get svc api
+kubectl describe svc api
+kubectl get endpoints api
+kubectl get endpointslice -l kubernetes.io/service-name=api -o wide
+kubectl get pod -l app.kubernetes.io/name=api -o wide
+```
+
+如果 Pod `Running` 但 readiness 未通过，它不会进入 Service 的可用后端。这正是 readiness 和 EndpointSlice 的价值。
+
+## Ingress、IngressClass 与 Controller
+
+Ingress 只是规则，真正接流量的是 Ingress Controller。生产集群里可能同时存在多个 Controller：
+
+```txt
+nginx
+alb
+traefik
+apisix
+kong
+istio gateway
+gateway api controller
+```
+
+建议显式指定 `ingressClassName`：
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 80
+```
+
+没有指定 `ingressClassName`，可能出现：
+
+- 没有 Controller 接管这个 Ingress。
+- 被默认 Controller 接管，但不是你预期的。
+- 多个 Controller 的 annotation 行为不一致。
+
+排查：
+
+```bash
+kubectl get ingressclass
+kubectl describe ingress api
+kubectl logs -n ingress-nginx deploy/ingress-nginx-controller
+```
+
+云厂商 ALB / CLB / ELB 还需要看对应 Controller 的事件和云资源状态。
+
+## ConfigMap 与 Secret
+
+Deployment 不应把所有配置硬编码在镜像里。镜像负责程序，配置负责环境差异。
+
+```yaml
+envFrom:
+  - configMapRef:
+      name: api-config
+  - secretRef:
+      name: api-secret
+```
+
+非敏感配置放 ConfigMap，敏感配置放 Secret。但 Kubernetes Secret 默认只是 base64 编码，不等于加密。生产环境应结合 KMS、External Secrets、Sealed Secrets、Vault 等方案。
+
+## 资源与调度
+
+没有 `resources.requests` 的后果：
+
+- 调度器不知道 Pod 需要多少资源。
+- 节点可能被过度调度。
+- HPA 基于 CPU 使用率时可能无法正确工作。
+- 服务容易在资源争抢时抖动。
+
+示例：
+
+```yaml
+resources:
+  requests:
+    cpu: "100m"
+    memory: "128Mi"
+  limits:
+    cpu: "1000m"
+    memory: "512Mi"
+```
+
+说明：
+
+- `requests` 用于调度和资源保障。
+- `limits` 用于资源上限。
+- CPU limit 过小可能导致 throttling。
+- Memory limit 超过会 OOMKilled。
+
+排查：
+
+```bash
+kubectl top pod
+kubectl describe pod <pod>
+kubectl get events --sort-by=.lastTimestamp
+```
+
+`replicas: 3` 不等于高可用。如果三个 Pod 都调度到同一个节点，节点故障时仍然全挂。可以使用拓扑分布：
+
+```yaml
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: api
+```
+
+跨可用区可以使用：
+
+```yaml
+topologyKey: topology.kubernetes.io/zone
+```
+
+## PDB 与节点维护
+
+如果只写 Deployment，节点 drain 时可能同时驱逐多个 Pod。PodDisruptionBudget 可以约束自愿中断：
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: api
+```
+
+PDB 不保证绝对高可用，但可以约束节点维护、集群升级、drain 这类自愿中断。
+
+这和集群升级直接相关：Deployment 的 PDB、readiness、topologySpreadConstraints 会直接影响节点 drain 的安全性。
+
+## HPA 与扩缩容链路
+
+Deployment 管理副本，HPA 根据指标调整 replicas，Service 自动接入 Ready Pod，Ingress 不需要感知 Pod 数量变化。
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+```
+
+注意：
+
+- HPA 依赖 metrics-server 或自定义指标。
+- HPA 通常需要设置 `resources.requests`。
+- 扩容速度、冷启动时间和 readiness 会影响流量承接。
+
+## 发布策略与回滚边界
+
+| 策略 | 适合场景 | 风险 |
+| --- | --- | --- |
+| RollingUpdate | 普通无状态服务 | 新旧版本短时间共存 |
+| Blue-Green | 需要快速切流和回滚 | 资源成本高 |
+| Canary | 高风险变更、小流量验证 | 需要流量治理能力 |
+| Shadow | 只复制流量验证，不影响用户 | 成本高，数据副作用要隔离 |
+
+原生 Deployment 的 Canary 能力有限。要做精细流量比例，通常需要：
+
+- Ingress Controller 支持 canary annotation。
+- Service Mesh，例如 Istio / Linkerd。
+- Argo Rollouts。
+- Flagger。
+- 网关层灰度能力。
+
+回滚命令：
+
+```bash
+kubectl rollout history deploy/api
+kubectl rollout undo deploy/api
+```
+
+但要记住：`rollout undo` 只能回滚 Deployment 模板，不能回滚数据库 schema、外部系统状态、消息副作用或已写入的数据。
+
+## 问题导向排障
+
+### 发布后访问不通
+
+```bash
+kubectl get deploy api
+kubectl rollout status deploy/api
+kubectl get rs -l app.kubernetes.io/name=api
+kubectl get pod -l app.kubernetes.io/name=api -o wide
+kubectl describe pod <pod>
+kubectl logs <pod>
+kubectl get svc api
+kubectl get endpointslice -l kubernetes.io/service-name=api
+kubectl describe ingress api
+```
+
+判断顺序：
+
+1. Deployment 是否更新。
+2. ReplicaSet 是否创建。
+3. Pod 是否 Running。
+4. 镜像是否拉取成功。
+5. 探针是否通过。
+6. EndpointSlice 是否有地址。
+7. Service `targetPort` 是否正确。
+8. Ingress 是否绑定正确 Service。
+9. Ingress Controller 是否有错误日志。
+
+### Rollout 卡住
+
+```bash
+kubectl rollout status deploy/api
+kubectl describe deploy api
+kubectl get pod -l app.kubernetes.io/name=api
+kubectl describe pod <new-pod>
+```
+
+常见原因：
+
+- `ImagePullBackOff`：镜像地址、tag、权限、架构错误。
+- `CrashLoopBackOff`：进程启动失败、配置错误、依赖不可用。
+- `Readiness failed`：探针路径、端口、启动时间、依赖检查错误。
+- `Unschedulable`：资源不足、nodeSelector、taint/toleration、亲和性不满足。
+- `CreateContainerConfigError`：ConfigMap/Secret 缺失。
+- `MountVolume failed`：PVC/CSI 问题。
+
+## 后端开发者检查清单
+
+- [ ] 镜像 tag 可追踪，发布系统记录 digest。
+- [ ] Deployment 设置 replicas、strategy、revisionHistoryLimit。
+- [ ] Pod 有 startupProbe、readinessProbe、livenessProbe。
+- [ ] readiness 语义正确，不接流量时不会进入 EndpointSlice。
+- [ ] liveness 不依赖数据库、Redis、第三方服务。
+- [ ] resources.requests / limits 已设置。
+- [ ] securityContext 符合非 root、最小权限要求。
+- [ ] terminationGracePeriodSeconds 与应用优雅退出匹配。
+- [ ] Service selector 与 Pod labels 一致。
+- [ ] Service targetPort 与容器端口一致，最好使用命名端口。
+- [ ] Ingress 指定 ingressClassName。
+- [ ] ConfigMap / Secret 与环境配置分离。
+- [ ] 有 PDB 保护节点维护和集群升级。
+- [ ] 副本跨节点或跨可用区分布。
+- [ ] HPA 依赖的 metrics 和 resources.requests 已配置。
+- [ ] 回滚方案理解数据库迁移边界。

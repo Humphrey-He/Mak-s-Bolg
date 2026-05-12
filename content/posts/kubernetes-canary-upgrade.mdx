@@ -1,51 +1,400 @@
 ---
 slug: "kubernetes-canary-upgrade"
-title: "Kubernetes 集群升级灰度方案设计"
-description: "围绕 kube-apiserver、kubelet、etcd、CNI、CSI 的生产级升级路径与回滚策略。"
+title: "Kubernetes 集群升级灰度方案设计：从兼容矩阵到节点池迁移"
+description: "围绕控制面、节点池、etcd、Webhook、CNI、CSI、CoreDNS、Ingress Controller、PDB、观测指标和回滚边界设计生产级集群升级方案。"
 date: "2026-04-12"
 tag: "Cloud Native"
-readTime: "16 min"
+readTime: "30 min"
 top: true
+featured: false
 ---
 
-## 问题不在“怎么升级”
+## 集群升级为什么不能只看命令
 
-集群升级最难的部分，通常不是命令，而是**回滚设计和风险边界**。
+Kubernetes 集群升级最难的部分，通常不是命令，而是**风险边界、兼容性和回滚设计**。
 
-如果没有灰度节奏，任何一个组件升级都可能把问题放大成全局故障。
+如果没有灰度节奏，任何一个组件升级都可能把问题放大成全局故障：CNI 不兼容导致 Pod 网络异常，CSI 行为变化导致挂盘失败，Admission Webhook 证书过期阻塞资源创建，Ingress Controller annotation 行为变化导致外部流量异常，旧 API 被移除导致控制器失效。
 
-## 升级顺序
+生产升级要回答的问题不是“怎么升级”，而是：
 
-我通常会把升级视为一个分层过程：
+- 升级范围包括哪些组件？
+- 哪些组件有版本 skew 约束？
+- etcd 是否能恢复？
+- Webhook 失败是否会阻塞关键路径？
+- CNI / CSI / Ingress / CoreDNS 是否兼容目标版本？
+- 节点池如何灰度？
+- 哪些业务可以先迁移？
+- 指标异常到什么程度必须停止？
+- 哪些变更可以回滚，哪些只能止损？
 
-1. 控制面前置验证
-2. 节点池灰度
-3. 插件兼容性复核
-4. 工作负载批次迁移
+## 升级范围定义
 
-## 关键检查项
+一次集群升级通常至少涉及：
 
-- kube-apiserver 与 admission webhook 兼容性
-- kubelet 与 CRI 版本组合
-- CNI / CSI 组件是否跟随升级
-- etcd 快照与恢复演练
+```txt
+控制面：kube-apiserver、scheduler、controller-manager、etcd
+节点侧：kubelet、container runtime、kube-proxy、节点 OS / 内核
+网络：CNI、NetworkPolicy、Pod sandbox
+存储：CSI、VolumeAttachment、StorageClass、PVC/PV
+入口：Ingress Controller、Gateway、云负载均衡 Controller
+基础组件：CoreDNS、metrics-server、autoscaler、Karpenter
+工作负载：Deployment、StatefulSet、DaemonSet、Job、CronJob
+扩展资源：CRD、Operator、Admission Webhook
+```
 
-## 回滚思路
+托管 K8s，例如 EKS / GKE / AKS，控制面升级通常由云厂商托管；但节点池、插件、工作负载兼容性仍然是用户责任。
 
-回滚不是“出了问题再想”，而是升级前就要明确：
+## 版本兼容与 API 弃用检查
 
-- 能回滚到哪一层
-- 哪些配置变更不可逆
-- 哪些状态迁移需要额外补偿
+升级前必须确认 kube-apiserver、kubelet、kubectl、controller、scheduler、CNI、CSI、CRI 的版本兼容关系。
 
-## 实战建议
+原则上：
 
-如果集群承载关键业务，建议把升级方案沉淀成固定模板：
+- kubelet 通常不能高于 kube-apiserver。
+- kubectl 与 apiserver 通常只允许有限版本偏差。
+- CNI / CSI / Ingress Controller 要看各自兼容矩阵。
+- Operator 和 CRD 需要确认目标 K8s 版本支持。
 
-- 变更单模板
-- 兼容性检查清单
-- 灰度比例策略
-- 回滚触发条件
-- 观测指标面板
+旧 API 被移除是升级事故高发点。升级控制面前，必须确认集群内没有仍依赖目标版本已移除 API 的对象和客户端。
 
-这样每次升级都不会从零开始。
+排查思路：
+
+```bash
+kubectl api-resources
+kubectl get --raw /metrics | grep apiserver_requested_deprecated_apis
+```
+
+也可以使用工具：
+
+```txt
+kubent
+pluto
+```
+
+重点关注：
+
+```txt
+extensions/v1beta1 Ingress
+policy/v1beta1 PodDisruptionBudget
+autoscaling/v2beta1 HPA
+batch/v1beta1 CronJob
+旧版本 CRD
+```
+
+## etcd 备份与恢复演练
+
+etcd 快照不是“有文件就安全”。备份文件存在不代表可恢复，必须在隔离环境中验证 snapshot restore。
+
+自建控制面可以参考：
+
+```bash
+ETCDCTL_API=3 etcdctl snapshot save snapshot.db \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key
+```
+
+恢复演练至少验证：
+
+- snapshot 文件完整。
+- 证书和密钥可用。
+- 恢复后的 etcd 能启动。
+- apiserver 能连接恢复后的 etcd。
+- 关键对象 Deployment、Service、Secret、CRD 存在。
+
+如果是托管 Kubernetes，也要确认云厂商控制面备份与恢复承诺，以及你的业务资源、CRD、GitOps 状态是否有独立备份。
+
+## Admission Webhook 风险治理
+
+Admission Webhook 是升级高风险点。原因是：
+
+- Webhook 不可用可能阻塞 Pod 创建、Deployment 更新、节点组件更新。
+- `failurePolicy: Fail` 会放大故障。
+- 证书过期会导致所有请求被拒绝。
+- Webhook 使用旧 API 版本可能在升级后异常。
+
+升级前检查：
+
+```bash
+kubectl get validatingwebhookconfiguration
+kubectl get mutatingwebhookconfiguration
+kubectl describe validatingwebhookconfiguration <name>
+```
+
+重点看：
+
+```txt
+failurePolicy
+timeoutSeconds
+namespaceSelector
+objectSelector
+rules.apiGroups/apiVersions
+caBundle
+```
+
+升级窗口前确认：
+
+- Webhook 服务副本健康。
+- Webhook 证书未过期。
+- `timeoutSeconds` 不宜过长。
+- 关键路径 Webhook 有降级策略。
+- 不必要拦截 `kube-system`。
+
+## 插件兼容矩阵
+
+升级前建议列出组件兼容矩阵：
+
+| 组件 | 升级前检查 | 风险 |
+| --- | --- | --- |
+| CNI | 是否支持目标 K8s 版本、内核版本 | Pod 网络不可用、NetworkPolicy 失效 |
+| CSI | 是否支持目标版本、VolumeAttachment 行为 | 挂盘失败、Pod 卡 ContainerCreating |
+| CoreDNS | 插件配置是否兼容 | 服务发现异常 |
+| kube-proxy | iptables/ipvs 模式兼容 | Service 转发异常 |
+| Ingress Controller | Ingress API、annotation 行为 | 外部流量异常 |
+| metrics-server | metrics API 可用 | HPA 失效 |
+| Cluster Autoscaler / Karpenter | 版本兼容 | 节点扩缩容异常 |
+
+不要只看 Kubernetes 版本号。很多升级事故来自插件、Webhook、Operator 和云厂商 Controller 的兼容问题。
+
+## 控制面升级流程
+
+标准执行顺序可以拆成：
+
+1. 阅读目标版本 release notes 和 deprecated API 变更。
+2. 检查所有 CRD、Webhook、Controller 与目标版本兼容性。
+3. 备份 etcd，并完成恢复演练。
+4. 升级或验证 CNI、CSI、Ingress、CoreDNS、metrics-server、autoscaler。
+5. 升级控制面组件。
+6. 验证 API Server、Scheduler、Controller Manager 状态。
+7. 新建目标版本节点池。
+8. 将低风险工作负载迁移到新节点池。
+9. 扩大灰度比例。
+10. 迁移核心业务。
+11. drain 老节点池。
+12. 删除或保留老节点池作为短期回滚池。
+
+控制面升级后先观察控制面指标，不要立刻大规模迁移业务。
+
+## 节点池灰度策略
+
+节点池灰度比原地升级更容易止损。建议节奏：
+
+```txt
+第一批：1 个新版本节点，只承载测试 / 低风险 workload。
+第二批：5% 节点容量，承载非核心服务。
+第三批：20% 节点容量，承载部分核心服务。
+第四批：50% 容量。
+第五批：全量迁移。
+```
+
+常用命令：
+
+```bash
+kubectl cordon <old-node>
+kubectl drain <old-node> --ignore-daemonsets --delete-emptydir-data
+```
+
+drain 前必须检查 PDB，否则可能驱逐失败或影响可用性：
+
+```bash
+kubectl get pdb -A
+kubectl describe pdb <name>
+```
+
+也要检查节点上的 Pod：
+
+```bash
+kubectl get pod -A -o wide --field-selector spec.nodeName=<node>
+```
+
+常见 drain 失败原因：
+
+- PDB 不允许驱逐。
+- 单副本服务没有冗余。
+- Pod 使用 local PV。
+- DaemonSet 无法驱逐。
+- Pod 带有特殊 finalizer。
+- Job / CronJob 正在运行。
+
+## 工作负载迁移策略
+
+不同 workload 迁移风险不同。
+
+无状态服务：
+
+- 依赖 Deployment + PDB + readiness。
+- 可以滚动迁移。
+- 需要资源 requests 和跨节点分布。
+
+有状态服务：
+
+- 依赖 StatefulSet、PVC、CSI。
+- 需要更谨慎，逐副本迁移。
+- 重点观察挂盘、恢复、主从切换和数据一致性。
+
+DaemonSet：
+
+- 每个节点都会跑。
+- 节点升级会触发系统组件变化。
+- CNI、日志采集、监控 agent 都属于高关注对象。
+
+Job / CronJob：
+
+- 注意升级窗口内是否有批任务。
+- 避免关键 Job 被驱逐或重复执行。
+
+集群升级前要检查关键业务 Deployment 是否具备 readinessProbe、PDB、资源 requests 和跨节点分布，否则节点池灰度会影响业务可用性。
+
+## 观测指标与失败判定
+
+升级期间必须提前准备观测面板。
+
+控制面：
+
+```txt
+apiserver request latency
+apiserver 5xx
+apiserver inflight requests
+etcd leader changes
+etcd fsync latency
+etcd db size
+scheduler scheduling latency
+controller-manager workqueue depth
+```
+
+节点：
+
+```txt
+Node Ready 状态
+kubelet error
+container runtime error
+Pod sandbox creation failure
+image pull latency
+CNI error
+CSI mount error
+```
+
+业务：
+
+```txt
+HTTP 5xx
+P95/P99 latency
+QPS
+错误率
+Pod restart count
+readiness failure
+HPA replica count
+Ingress upstream error
+```
+
+核心命令：
+
+```bash
+kubectl get nodes
+kubectl get pods -A --field-selector=status.phase!=Running
+kubectl get events -A --sort-by=.lastTimestamp
+kubectl top nodes
+kubectl top pods -A
+```
+
+失败判定要提前写进变更单，例如：
+
+- API Server 5xx 持续超过阈值。
+- 核心业务 5xx 或 P99 延迟超过阈值。
+- 新节点池 Pod sandbox 创建失败持续出现。
+- CNI / CSI 错误持续增长。
+- readiness failure 大面积出现。
+- drain 影响核心服务可用性。
+
+## 回滚边界和止损策略
+
+集群升级回滚不是单个命令。多数情况下，最实用的回滚是保留旧节点池和旧插件版本，快速把流量迁回已验证路径。
+
+可回滚：
+
+- 工作负载镜像版本。
+- Deployment 配置。
+- 节点池迁移，前提是老节点池仍保留。
+- 某些插件版本，前提是状态格式兼容。
+
+难回滚或不可直接回滚：
+
+- etcd 数据写入后的状态变化。
+- CRD schema 升级后的对象转换。
+- 数据库 schema 破坏性变更。
+- CSI 迁移导致的卷状态变化。
+- CNI 数据面变更。
+- 已删除的旧节点池。
+- 已被新 controller 修改过的资源状态。
+
+因此升级方案里必须明确：
+
+- 能回滚到哪一层。
+- 哪些配置变更不可逆。
+- 哪些状态迁移需要补偿。
+- 老节点池保留多久。
+- 失败时是回滚、暂停、扩容旧池，还是切走流量。
+
+## 变更单模板
+
+可以把集群升级沉淀为固定模板：
+
+```txt
+升级目标：
+- 当前版本：
+- 目标版本：
+- 涉及集群：
+- 涉及节点池：
+- 涉及插件：
+
+兼容性检查：
+- deprecated API：
+- CRD / Operator：
+- Admission Webhook：
+- CNI / CSI / Ingress / CoreDNS：
+
+备份与恢复：
+- etcd 快照时间：
+- 恢复演练结果：
+- GitOps / YAML 备份：
+
+灰度计划：
+- 第一批节点：
+- 低风险 workload：
+- 扩大比例：
+- 核心业务迁移窗口：
+
+观测指标：
+- 控制面：
+- 节点：
+- 业务：
+
+失败阈值：
+- 停止条件：
+- 回滚条件：
+- 通知对象：
+
+回滚与止损：
+- 旧节点池保留时间：
+- 回滚步骤：
+- 不可逆变更：
+```
+
+## 集群升级检查清单
+
+- [ ] 明确升级范围：控制面、节点、CNI、CSI、Ingress、CoreDNS、kube-proxy。
+- [ ] 阅读目标版本 release notes 和 deprecated API 变更。
+- [ ] 检查 CRD、Webhook、Controller 兼容性。
+- [ ] 检查 kubelet / apiserver / kubectl / CRI 版本 skew。
+- [ ] etcd 已备份，并完成恢复演练。
+- [ ] Admission Webhook 可用，证书未过期，failurePolicy 合理。
+- [ ] CNI / CSI / Ingress Controller 有兼容矩阵。
+- [ ] 关键业务有 PDB、readiness、资源 requests。
+- [ ] 节点池灰度比例明确。
+- [ ] 低风险 workload 先迁移。
+- [ ] drain 策略已验证。
+- [ ] 控制面和业务观测面板准备完成。
+- [ ] 明确失败阈值和停止条件。
+- [ ] 老节点池保留到观察期结束。
+- [ ] 明确哪些变更不能直接回滚。
