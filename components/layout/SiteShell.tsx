@@ -1,7 +1,6 @@
 import { copy } from "@/data/copy";
 import { BackgroundGrid } from "@/components/layout/BackgroundGrid";
 import { Header } from "@/components/layout/Header";
-import { MascotCompanion } from "@/components/layout/MascotCompanion";
 import { ScanLine } from "@/components/layout/ScanLine";
 
 export function SiteShell({ children }: { children: React.ReactNode }) {
@@ -15,7 +14,6 @@ export function SiteShell({ children }: { children: React.ReactNode }) {
         <Header t={t} />
         {children}
       </div>
-      <MascotCompanion />
     </main>
   );
 }
