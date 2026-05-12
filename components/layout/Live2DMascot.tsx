@@ -5,6 +5,7 @@ import type { Live2DMascotModel } from "@/data/mascot";
 
 type Live2DMascotProps = {
   model: Live2DMascotModel;
+  tapSignal?: number;
   onReady?: () => void;
   onError?: (message: string) => void;
 };
@@ -39,6 +40,10 @@ type PixiModule = {
     width?: number;
     height?: number;
   }) => PixiApplication;
+};
+
+type PixiImportModule = PixiModule & {
+  default?: PixiModule;
 };
 
 type Live2DDisplayModule = {
@@ -88,11 +93,18 @@ function loadCubismCore() {
   return cubismCorePromise;
 }
 
-export function Live2DMascot({ model, onReady, onError }: Live2DMascotProps) {
+export function Live2DMascot({ model, tapSignal = 0, onReady, onError }: Live2DMascotProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const appRef = useRef<PixiApplication | null>(null);
   const modelRef = useRef<Live2DModelInstance | null>(null);
+  const onReadyRef = useRef(onReady);
+  const onErrorRef = useRef(onError);
   const [active, setActive] = useState(false);
+
+  useEffect(() => {
+    onReadyRef.current = onReady;
+    onErrorRef.current = onError;
+  }, [onReady, onError]);
 
   useEffect(() => {
     let cancelled = false;
@@ -107,16 +119,15 @@ export function Live2DMascot({ model, onReady, onError }: Live2DMascotProps) {
       try {
         await loadCubismCore();
 
-        const [{ default: PIXI }, live2dDisplay] = await Promise.all([
-          import("pixi.js") as Promise<{ default: PixiModule }>,
-          import("pixi-live2d-display/cubism4") as Promise<Live2DDisplayModule>
-        ]);
+        const pixiModule = (await import("pixi.js")) as PixiImportModule;
+        const PIXI = pixiModule.default ?? pixiModule;
 
         if (cancelled) {
           return;
         }
 
         window.PIXI = PIXI;
+        const live2dDisplay = (await import("pixi-live2d-display/cubism4")) as Live2DDisplayModule;
 
         const width = canvas.clientWidth || 260;
         const height = canvas.clientHeight || 320;
@@ -149,10 +160,10 @@ export function Live2DMascot({ model, onReady, onError }: Live2DMascotProps) {
         appRef.current = app;
         modelRef.current = live2dModel;
         setActive(true);
-        onReady?.();
+        onReadyRef.current?.();
       } catch (error) {
         const message = error instanceof Error ? error.message : "Live2D 模型加载失败";
-        onError?.(message);
+        onErrorRef.current?.(message);
       }
     }
 
@@ -179,7 +190,7 @@ export function Live2DMascot({ model, onReady, onError }: Live2DMascotProps) {
       appRef.current = null;
       setActive(false);
     };
-  }, [model, onReady, onError]);
+  }, [model]);
 
   useEffect(() => {
     if (!active) {
@@ -200,20 +211,13 @@ export function Live2DMascot({ model, onReady, onError }: Live2DMascotProps) {
     return () => window.removeEventListener("pointermove", handlePointerMove);
   }, [active]);
 
-  function playTapMotion() {
+  useEffect(() => {
     const live2dModel = modelRef.current;
 
-    if (model.tapMotionGroup && live2dModel?.motion) {
+    if (tapSignal > 0 && model.tapMotionGroup && live2dModel?.motion) {
       live2dModel.motion(model.tapMotionGroup);
     }
-  }
+  }, [model.tapMotionGroup, tapSignal]);
 
-  return (
-    <canvas
-      ref={canvasRef}
-      className="h-full w-full"
-      onClick={playTapMotion}
-      aria-label={`${model.name} Live2D 模型`}
-    />
-  );
+  return <canvas ref={canvasRef} className="pointer-events-none h-full w-full" aria-label={`${model.name} Live2D 模型`} />;
 }

@@ -33,11 +33,12 @@ export const mascotConfig = {
   defaultModelId: "hiyori",
   storageKeys: {
     hidden: "juno-mascot-hidden",
-    modelId: "juno-mascot-model-id"
+    modelId: "juno-mascot-model-id",
+    position: "juno-mascot-position"
   },
   messages: [
     "哇，你终于回来啦～",
-    "Live2D 模型还没接入，我先收起大号占位角色。",
+    "拖住我就能换个位置，我会记住这里。",
     "把合法模型放到 public/live2d/models/ 后，就可以在这里换装啦。",
     "代码和文字，都慢慢变清楚。",
     "需要灵感的时候，点点我。"
