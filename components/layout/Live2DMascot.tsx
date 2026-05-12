@@ -33,6 +33,11 @@ type Live2DModelInstance = {
   };
   motion?: (group: string) => void;
   focus?: (x: number, y: number) => void;
+  internalModel?: {
+    coreModel?: {
+      setParameterValueById?: (id: string, value: number, weight?: number) => void;
+    };
+  };
 };
 
 type PixiModule = {
@@ -58,6 +63,8 @@ type Live2DDisplayModule = {
 
 const CUBISM_CORE_SRC = "/live2d/runtime/live2dcubismcore.min.js";
 let cubismCorePromise: Promise<void> | null = null;
+
+const FOLLOW_SMOOTHING = 0.12;
 
 declare global {
   interface Window {
@@ -118,12 +125,31 @@ function placeModelInCanvas(live2dModel: Live2DModelInstance, model: Live2DMasco
   live2dModel.y = model.y ?? height - 2;
 }
 
+function setParameter(live2dModel: Live2DModelInstance, id: string, value: number) {
+  try {
+    live2dModel.internalModel?.coreModel?.setParameterValueById?.(id, value);
+  } catch {
+    // Some models do not expose every common Cubism parameter.
+  }
+}
+
+function applyPointerFocus(live2dModel: Live2DModelInstance, x: number, y: number) {
+  live2dModel.focus?.(x, y);
+  setParameter(live2dModel, "ParamAngleX", x * 22);
+  setParameter(live2dModel, "ParamAngleY", y * 18);
+  setParameter(live2dModel, "ParamBodyAngleX", x * 8);
+  setParameter(live2dModel, "ParamEyeBallX", x);
+  setParameter(live2dModel, "ParamEyeBallY", y);
+}
+
 export function Live2DMascot({ model, tapSignal = 0, onReady, onError }: Live2DMascotProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const appRef = useRef<PixiApplication | null>(null);
   const modelRef = useRef<Live2DModelInstance | null>(null);
   const onReadyRef = useRef(onReady);
   const onErrorRef = useRef(onError);
+  const pointerTargetRef = useRef({ x: 0, y: 0 });
+  const pointerCurrentRef = useRef({ x: 0, y: 0 });
   const [active, setActive] = useState(false);
 
   useEffect(() => {
@@ -223,18 +249,37 @@ export function Live2DMascot({ model, tapSignal = 0, onReady, onError }: Live2DM
       return;
     }
 
-    const handlePointerMove = (event: PointerEvent) => {
-      const live2dModel = modelRef.current;
+    let animationFrame = 0;
 
-      if (!live2dModel?.focus) {
-        return;
+    const updateFocus = () => {
+      const live2dModel = modelRef.current;
+      const current = pointerCurrentRef.current;
+      const target = pointerTargetRef.current;
+
+      current.x += (target.x - current.x) * FOLLOW_SMOOTHING;
+      current.y += (target.y - current.y) * FOLLOW_SMOOTHING;
+
+      if (live2dModel) {
+        applyPointerFocus(live2dModel, current.x, current.y);
       }
 
-      live2dModel.focus(event.clientX, event.clientY);
+      animationFrame = window.requestAnimationFrame(updateFocus);
+    };
+
+    const handlePointerMove = (event: PointerEvent) => {
+      pointerTargetRef.current = {
+        x: Math.max(-1, Math.min(1, (event.clientX / window.innerWidth - 0.5) * 2)),
+        y: Math.max(-1, Math.min(1, -(event.clientY / window.innerHeight - 0.5) * 2))
+      };
     };
 
     window.addEventListener("pointermove", handlePointerMove, { passive: true });
-    return () => window.removeEventListener("pointermove", handlePointerMove);
+    animationFrame = window.requestAnimationFrame(updateFocus);
+
+    return () => {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.cancelAnimationFrame(animationFrame);
+    };
   }, [active]);
 
   useEffect(() => {

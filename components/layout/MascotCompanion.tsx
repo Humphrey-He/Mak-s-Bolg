@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { Live2DMascot } from "@/components/layout/Live2DMascot";
 import { mascotConfig, type MascotModel } from "@/data/mascot";
 
@@ -281,7 +282,7 @@ export function MascotCompanion() {
   }
 
   if (hidden) {
-    return (
+    return createPortal(
       <button
         type="button"
         onClick={restoreMascot}
@@ -291,11 +292,12 @@ export function MascotCompanion() {
         <span aria-hidden="true" className="text-lg leading-none">
           ✦
         </span>
-      </button>
+      </button>,
+      document.body
     );
   }
 
-  return (
+  return createPortal(
     <aside
       className="juno-mascot fixed z-30 hidden select-none md:block"
       style={{
@@ -386,6 +388,7 @@ export function MascotCompanion() {
           <PlaceholderMascot />
         )}
       </button>
-    </aside>
+    </aside>,
+    document.body
   );
 }
