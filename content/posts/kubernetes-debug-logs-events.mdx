@@ -1,168 +1,320 @@
 ---
 slug: "kubernetes-debug-logs-events"
-title: "Kubernetes 调试：日志、事件与临时调试容器"
-description: "从应用日志、Kubernetes Events 到 kubectl debug，建立后端服务在集群中的日常观察和临时排查方法。"
+title: "Kubernetes 调试：从日志、事件到分层排障链路"
+description: "从 logs、events、describe、EndpointSlice、Ingress、Node、DNS、NetworkPolicy 到 kubectl debug，建立后端服务生产级排障方法。"
 date: "2026-05-14"
 tag: "Cloud Native"
-readTime: "19 min"
+readTime: "30 min"
 top: false
 featured: false
 ---
 
-在 Kubernetes 中排障，最怕只盯着应用日志。日志能告诉你代码发生了什么，但它不一定告诉你镜像为什么拉不下来、Pod 为什么调度失败、探针为什么失败、volume 为什么挂载不上。真正高效的排查路径，是把日志、事件和临时调试工具一起用。
+## 为什么不能只看应用日志
 
-对后端开发者来说，`kubectl logs` 负责看应用输出，`kubectl describe` 和 Events 负责看 Kubernetes 对象生命周期，`kubectl debug` 或临时 Pod 负责补齐网络和系统工具。
+在 Kubernetes 中排障，最怕只盯着应用日志。日志能告诉你代码发生了什么，但它不一定告诉你镜像为什么拉不下来、Pod 为什么调度失败、探针为什么失败、volume 为什么挂载不上、Service 为什么没有后端、Ingress Controller 为什么没有接管规则。
 
-## 问题场景
-
-一个用户服务从本地迁移到集群后，调用订单服务一直超时。用户服务日志只显示 `connection timeout`，订单服务日志没有请求进来。这个时候继续翻业务日志意义有限，因为请求可能根本没有到达目标 Pod。
-
-正确排查应该从调用链路出发：用户服务 Pod 内 DNS 是否能解析订单 Service，Service 是否有 endpoints，targetPort 是否正确，网络策略是否拦截，订单服务是否 Ready。
-
-## 架构解释
-
-一次集群内服务调用大致经过：
+对后端开发者来说：
 
 ```txt
-应用代码
-  -> Pod 网络命名空间
-  -> CoreDNS 解析 Service 名
-  -> Service 虚拟入口
-  -> endpoints 后端 Pod
-  -> 目标容器端口
+kubectl logs       -> 看应用和容器输出
+kubectl describe   -> 看对象生命周期和事件
+kubectl get events -> 看调度、拉镜像、探针、挂载、配置错误
+kubectl debug      -> 补齐临时工具和网络视角
 ```
 
-应用日志只能覆盖最上层。Events 覆盖 Kubernetes 控制面和 kubelet 的动作。临时调试容器则让你进入同一个网络环境，实际执行 `nslookup`、`wget`、`curl` 等命令。
+生产排障不是命令集合，而是分层链路。
 
-## 核心名词
+## K8s 排障分层模型
 
-- `stdout/stderr`：容器日志的标准输出和错误输出，Kubernetes 默认采集这里。
-- `Events`：Kubernetes 对资源变化、调度、拉镜像、探针、挂载等行为的记录。
-- `ephemeral container`：临时调试容器，可附加到已有 Pod。
-- `target container`：调试容器要靠近观察的目标容器。
-- `debug Pod`：临时启动的工具 Pod，适合从集群内模拟访问。
-- `--previous`：查看上一次崩溃容器的日志。
+一个请求从外部进入后端服务，可能经过：
 
-## 最小示例
-
-先部署一个普通 API：
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: api
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: api
-  template:
-    metadata:
-      labels:
-        app: api
-    spec:
-      containers:
-        - name: api
-          image: registry.example.com/team/api:v1.0.0
-          ports:
-            - containerPort: 8080
+```txt
+入口层：Ingress / Gateway / LoadBalancer
+服务层：Service / EndpointSlice
+工作负载层：Deployment / ReplicaSet
+实例层：Pod / Container / initContainer / sidecar
+节点层：Node / kubelet / container runtime
+网络层：CoreDNS / CNI / NetworkPolicy
+存储层：PVC / PV / CSI
+配置层：ConfigMap / Secret / ServiceAccount
 ```
 
-从日志开始看：
+固定排查顺序可以从上到下，也可以从 Deployment 向流量入口走：
 
 ```bash
-kubectl logs deploy/api
-kubectl logs -f deploy/api --tail=200
-```
-
-如果应用没有明显错误，再看事件：
-
-```bash
-kubectl describe deploy api
+kubectl get deploy api
+kubectl rollout status deploy/api
+kubectl get rs -l app=api
+kubectl get pod -l app=api -o wide
 kubectl describe pod <pod>
+kubectl logs <pod> -c api --previous
+kubectl get svc api
+kubectl get endpointslice -l kubernetes.io/service-name=api -o wide
+kubectl describe ingress api
 kubectl get events --sort-by=.lastTimestamp
 ```
 
-如果怀疑网络，再启动临时工具：
+如果问题是“用户服务调用订单服务超时”，不要只看用户服务日志。还要确认 DNS、Service、EndpointSlice、readiness、targetPort、NetworkPolicy 和目标 Pod 状态。
 
-```bash
-kubectl run debug --rm -it --image=busybox -- sh
-```
+## kubectl logs：单容器、多容器、previous
 
-进入后可以执行：
-
-```bash
-nslookup api
-wget -qO- http://api.default.svc.cluster.local
-```
-
-## 高频命令
-
-日志相关：
+基础日志命令：
 
 ```bash
 kubectl logs <pod>
 kubectl logs -f <pod>
 kubectl logs deploy/api --tail=200
-kubectl logs <pod> -c <container>
-kubectl logs <pod> --previous
 kubectl logs -n prod -l app=api --tail=100
 ```
 
-事件相关：
+多容器 Pod 必须明确容器名：
+
+```bash
+kubectl logs <pod> -c api
+kubectl logs <pod> --all-containers=true
+kubectl logs deploy/api --all-containers=true --tail=100
+```
+
+生产 Pod 里常见多个容器：
+
+```txt
+业务容器
+sidecar，例如 envoy、filebeat、oauth2-proxy
+initContainer，例如 migrate、init-config、wait-db
+debug / ephemeral container
+```
+
+很多问题不在业务容器里。例如 initContainer 失败导致业务容器根本没启动，service mesh sidecar 未就绪导致流量不通，日志采集 sidecar 报错导致日志平台没有数据。
+
+查看容器名：
+
+```bash
+kubectl get pod <pod> -o jsonpath='{.spec.initContainers[*].name}'
+kubectl get pod <pod> -o jsonpath='{.spec.containers[*].name}'
+```
+
+CrashLoopBackOff 时要看上一次容器日志：
+
+```bash
+kubectl logs <pod> -c <container> --previous
+```
+
+`kubectl logs` 适合即时排障，不适合长期日志分析。生产环境应接入集中日志系统，例如 Loki、Elasticsearch、OpenSearch、Cloud Logging、Datadog、Splunk 等。应用日志要包含 `request_id` / `trace_id` / `user_id` / `tenant_id`，并对敏感字段脱敏。
+
+## Events：对象生命周期视角
+
+应用日志不能解释调度失败、镜像拉取失败、探针失败、挂载失败、Secret 缺失等 Kubernetes 生命周期问题。Events 是这些问题的第一入口。
+
+常用命令：
 
 ```bash
 kubectl describe pod <pod>
 kubectl describe deploy api
 kubectl get events --sort-by=.lastTimestamp
+kubectl get events -A --sort-by=.metadata.creationTimestamp
+kubectl get events -A --field-selector type=Warning
 kubectl get events --field-selector involvedObject.name=<pod>
 ```
 
-调试容器相关：
+Events 的边界：
+
+- Events 是 Kubernetes 资源生命周期事件，不是长期审计日志。
+- Events 通常有 TTL，保留时间有限，集群不同配置可能不同。
+- Events 可能被合并、限流、过期。
+- 生产环境应把 Events 采集到日志或事件平台。
+
+按现象看 Events：
+
+| 现象 | 优先看哪里 | 常见 Events |
+| --- | --- | --- |
+| Pod Pending | `describe pod` / events | `FailedScheduling` |
+| 镜像拉不下来 | `describe pod` | `ErrImagePull` / `ImagePullBackOff` |
+| 容器反复重启 | logs + events | `BackOff` |
+| 探针失败 | `describe pod` | `Unhealthy` |
+| 卷挂载失败 | `describe pod` | `FailedMount` |
+| Secret/ConfigMap 缺失 | `describe pod` | `CreateContainerConfigError` |
+| 节点异常 | `describe node` | `NodeNotReady` |
+| DNS 失败 | debug pod + CoreDNS logs | 业务日志通常只表现为 timeout |
+
+## Service 与 EndpointSlice 排查
+
+Service 通过 selector 匹配 Pod，只有 Ready 的 Pod 才会进入可用 EndpointSlice。如果 Pod `Running` 但 readinessProbe 没通过，Service 后面可能没有可用后端。
+
+排查命令：
 
 ```bash
-kubectl debug -it <pod> --image=busybox --target=<container>
-kubectl debug -it <pod> --image=nicolaka/netshoot --target=<container>
-kubectl run debug --rm -it --image=busybox -- sh
-kubectl run netshoot --rm -it --image=nicolaka/netshoot -- bash
+kubectl get svc api
+kubectl describe svc api
+kubectl get endpoints api
+kubectl get endpointslice -l kubernetes.io/service-name=api -o wide
+kubectl describe endpointslice -l kubernetes.io/service-name=api
+kubectl get pod -l app=api -o wide
 ```
 
-`netshoot` 这类镜像内置了大量网络工具，适合临时排查 DNS、路由、TLS 和 TCP 连接。但生产环境使用前要确认团队安全规范。
+常见问题：
 
-## 参数意义
+- Service selector 和 Pod label 不匹配。
+- `targetPort` 写错。
+- Pod readiness 未通过。
+- Pod 在另一个 namespace。
+- NetworkPolicy 拦截。
 
-`--tail=200` 表示只看最后 200 行。线上服务日志量很大时，直接拉全量日志既慢又容易淹没重点。
+## Debug Pod 与 Ephemeral Container
 
-`-f` 表示持续跟随日志。发布、重启或压测时常用它观察错误是否持续出现。
+临时 debug Pod 适合从集群内部模拟访问：
 
-`-l app=api` 表示按 label 选择一组 Pod。Deployment 多副本时，单看一个 Pod 可能漏掉部分副本的问题。
+```bash
+kubectl run netshoot -n prod --rm -it --image=nicolaka/netshoot -- bash
+```
 
-`--previous` 用于查看上一次容器实例日志。容器重启后，当前日志可能只有启动过程，真正的异常栈在 previous 中。
+进入后：
 
-`--target=<container>` 表示临时调试容器要面向哪个容器。多容器 Pod 中尤其重要，因为你希望进入尽量接近业务容器的命名空间。
+```bash
+dig order.prod.svc.cluster.local
+nslookup order
+curl -v http://order:8080/ready
+nc -vz order 8080
+ip addr
+ip route
+cat /etc/resolv.conf
+```
 
-`--rm -it` 常用于一次性 debug Pod。`--rm` 会在退出后删除 Pod，`-it` 提供交互式终端。
+debug Pod 必须放在与源服务相同 namespace，最好还带相同 labels。很多 NetworkPolicy 是基于 namespaceSelector 和 podSelector 的，只放同 namespace 还不够。
 
-## 常见坑
+Ephemeral Container 可以附加到已有 Pod：
 
-第一，应用日志没有输出到 stdout/stderr。容器化应用应把日志打到标准输出，由平台统一采集。写到容器本地文件会增加采集复杂度，也容易随容器重建丢失。
+```bash
+kubectl debug -it <pod> --image=nicolaka/netshoot --target=api
+```
 
-第二，只看 Deployment 日志，不看具体 Pod。Deployment 日志会聚合匹配的 Pod，但某些版本、节点或副本特有问题需要定位到具体 Pod。
+它不是普通业务容器：
 
-第三，忽略 Events。镜像拉取、调度失败、探针失败、挂载失败，很多不会出现在应用日志中，却会出现在 Events 中。
+- 不能声明 ports、resources、probes。
+- 通常不能被删除，只能随 Pod 生命周期结束。
+- 会修改 Pod 的 `ephemeralcontainers` 子资源。
+- 需要对应 RBAC 权限。
+- 生产环境应审计使用记录。
 
-第四，在生产 Pod 里安装工具。不可变镜像是基本原则。排查工具应该通过临时容器或临时 Pod 引入，而不是临场修改业务容器。
+常见 RBAC 权限点：
 
-第五，debug Pod 的命名空间不对。Service DNS、NetworkPolicy、RBAC 都可能和命名空间相关。排查 prod 服务时，debug Pod 最好也启动在相同命名空间。
+```txt
+pods/ephemeralcontainers update
+pods get/list
+pods/log get
+```
 
-## 后端开发者检查清单
+普通开发者不能随便使用 `kubectl debug` 是合理的。
 
-- [ ] 应用日志输出到 stdout/stderr，不依赖容器内本地文件。
-- [ ] CrashLoopBackOff 时使用 `kubectl logs --previous`。
-- [ ] 发布问题同时查看 `kubectl rollout status`、Pod 日志和 Events。
-- [ ] 网络问题从相同 namespace 的 debug Pod 发起请求。
-- [ ] 检查 Service DNS、endpoints、targetPort 和 readinessProbe。
-- [ ] 临时调试镜像符合团队安全规范，用完即删。
-- [ ] 排查结论写回 runbook，沉淀成下次可复用命令。
+## 网络排障：DNS、TCP、HTTP、NetworkPolicy
 
+DNS 问题：
+
+```bash
+kubectl logs -n kube-system -l k8s-app=kube-dns --tail=100
+kubectl get svc -n kube-system kube-dns
+```
+
+debug 容器内：
+
+```bash
+dig order.prod.svc.cluster.local
+cat /etc/resolv.conf
+```
+
+TCP 端口：
+
+```bash
+nc -vz order 8080
+```
+
+HTTP：
+
+```bash
+curl -v http://order:8080/ready
+```
+
+NetworkPolicy：
+
+```bash
+kubectl get networkpolicy -n prod
+kubectl describe networkpolicy <name> -n prod
+```
+
+NetworkPolicy 排查一定要关注 source Pod 的 namespace 和 labels，否则 debug Pod 的测试结果可能和真实业务 Pod 不一致。
+
+## CrashLoopBackOff 专项排查
+
+完整流程：
+
+```bash
+kubectl get pod <pod>
+kubectl describe pod <pod>
+kubectl logs <pod> -c <container> --previous
+kubectl logs <pod> -c <container>
+kubectl get pod <pod> -o jsonpath='{.status.containerStatuses[*].lastState}'
+```
+
+常见原因：
+
+- 配置缺失或格式错误。
+- Secret / ConfigMap key 不存在。
+- 应用启动后立即退出。
+- livenessProbe 过早杀死容器。
+- OOMKilled。
+- 文件权限错误。
+- 镜像架构不匹配。
+
+OOMKilled 排查：
+
+```bash
+kubectl describe pod <pod>
+kubectl top pod <pod>
+```
+
+## 节点级问题排查
+
+如果问题在节点层，例如 CNI 异常、kubelet 异常、container runtime 异常、磁盘压力、DNS 配置异常，Pod 内 debug 不一定够。
+
+```bash
+kubectl describe node <node>
+kubectl get node <node> -o yaml
+kubectl top node
+kubectl get pods -A -o wide --field-selector spec.nodeName=<node>
+```
+
+如果集群允许节点调试：
+
+```bash
+kubectl debug node/<node> -it --image=nicolaka/netshoot
+```
+
+节点级 debug 权限很高，生产环境应严格限制，并保留审计记录。
+
+## 生产安全边界
+
+排障能力越强，权限风险越大。
+
+生产建议：
+
+- 普通开发者默认只给 namespace 级只读权限。
+- `pods/log` 可以按团队边界授权。
+- `pods/exec`、`pods/ephemeralcontainers` 应更严格。
+- debug 镜像来源要受控，避免随意拉未知镜像。
+- 临时 debug 操作应有审计。
+- 不要在 debug 过程中输出 Secret、Token、用户隐私。
+
+## 排障检查清单
+
+- [ ] 应用日志输出到 stdout/stderr。
+- [ ] 日志包含 request_id / trace_id，敏感字段已脱敏。
+- [ ] 多副本服务使用 label 查询日志，而不是只看单个 Pod。
+- [ ] 多容器 Pod 明确使用 `-c` 或 `--all-containers`。
+- [ ] CrashLoopBackOff 使用 `--previous` 查看上一次容器日志。
+- [ ] Pod Pending / ImagePull / Mount / Probe 问题优先看 Events。
+- [ ] 知道 Events 有 TTL，生产环境应集中采集。
+- [ ] 网络问题从相同 namespace 和相同策略标签的 debug Pod 发起。
+- [ ] Service 问题检查 selector、EndpointSlice、targetPort、readiness。
+- [ ] DNS 问题检查 CoreDNS、`resolv.conf`、FQDN。
+- [ ] NetworkPolicy 问题检查 namespaceSelector / podSelector。
+- [ ] `kubectl debug` 权限受 RBAC 控制，生产使用需审计。
+- [ ] 节点级问题检查 Node、kubelet、CNI、container runtime。
