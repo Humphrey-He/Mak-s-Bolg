@@ -484,11 +484,11 @@ export function MascotCompanion() {
                 {model.name}
               </button>
             ))}
+            <div className="mt-1 border-t border-white/10 px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.16em] text-slate-500">
+              表情 / 配件
+            </div>
             {activeModel.type === "live2d" && activeModel.expressions?.length ? (
               <>
-                <div className="mt-1 border-t border-white/10 px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.16em] text-slate-500">
-                  表情 / 配件
-                </div>
                 <button
                   type="button"
                   data-mascot-expression="default"
@@ -513,7 +513,9 @@ export function MascotCompanion() {
                   </button>
                 ))}
               </>
-            ) : null}
+            ) : (
+              <p className="px-3 py-2 text-xs leading-5 text-slate-400">切换到神宫白子后可用。</p>
+            )}
           </div>
         )}
 
@@ -522,9 +524,9 @@ export function MascotCompanion() {
           onClick={() => setMenuOpen((open) => !open)}
           className="rounded-full border border-cyan-200/25 bg-[#0d1024]/85 px-3 py-1.5 text-xs font-bold tracking-[0.14em] text-cyan-100 shadow-[0_0_20px_rgba(34,211,238,.18)] backdrop-blur-xl transition hover:border-cyan-200/55 hover:bg-cyan-300/10"
           aria-expanded={menuOpen}
-          aria-label="切换看板娘模型"
+          aria-label="切换看板娘模型和表情"
         >
-          换装
+          角色/表情
         </button>
       </div>
 
