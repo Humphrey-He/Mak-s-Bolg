@@ -35,7 +35,7 @@ function getModelById(modelId: string | null): MascotModel {
 
 function getStageSize(model: MascotModel) {
   return model.type === "live2d"
-    ? { width: DEFAULT_STAGE_WIDTH, height: LIVE2D_STAGE_HEIGHT }
+    ? { width: model.stageWidth ?? DEFAULT_STAGE_WIDTH, height: model.stageHeight ?? LIVE2D_STAGE_HEIGHT }
     : { width: PLACEHOLDER_STAGE_SIZE, height: PLACEHOLDER_STAGE_SIZE };
 }
 
@@ -309,11 +309,11 @@ export function MascotCompanion() {
       onPointerEnter={() => showMessage(0)}
     >
       <div
-        className={`absolute left-0 min-w-[210px] max-w-[260px] rounded-xl border border-amber-200/70 bg-[#fff7ea]/95 px-4 py-3 text-sm text-[#765436] shadow-[0_14px_34px_rgba(15,23,42,.18)] transition duration-300 ${
+        className={`absolute left-0 min-w-[210px] max-w-[280px] rounded-xl border border-amber-200/70 bg-[#fff7ea]/95 px-4 py-3 text-sm text-[#765436] shadow-[0_14px_34px_rgba(15,23,42,.18)] transition duration-300 ${
           visible ? "translate-y-0 opacity-100" : "translate-y-2 opacity-0"
         }`}
         style={{
-          bottom: stageSize.height - 22
+          bottom: stageSize.height - 8
         }}
       >
         <button
@@ -329,7 +329,7 @@ export function MascotCompanion() {
         <p className="pr-4 leading-6">{mascotConfig.messages[messageIndex]}</p>
       </div>
 
-      <div className="absolute left-20 z-10" style={{ top: stageSize.height - 22 }}>
+      <div className="absolute z-10" style={{ left: Math.max(20, stageSize.width * 0.34), top: stageSize.height - 20 }}>
         {menuOpen && (
           <div className="absolute bottom-full mb-2 w-40 overflow-hidden rounded-xl border border-white/10 bg-[#0d1024]/95 p-1 text-sm text-slate-100 shadow-[0_18px_40px_rgba(0,0,0,.28)] backdrop-blur-xl">
             {mascotConfig.models.map((model) => (

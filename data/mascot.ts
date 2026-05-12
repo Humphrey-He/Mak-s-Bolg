@@ -20,6 +20,8 @@ export type Live2DMascotModel = {
   modelPath: string;
   idleMotionGroup?: string;
   tapMotionGroup?: string;
+  stageWidth?: number;
+  stageHeight?: number;
   scale?: number;
   x?: number;
   y?: number;
@@ -67,7 +69,9 @@ export const mascotConfig = {
       name: "神宫白子",
       type: "live2d",
       modelPath: "/live2d/models/shiroko/shiroko.model3.json",
-      scale: 0.86
+      stageWidth: 420,
+      stageHeight: 620,
+      scale: 1.02
     },
     {
       id: "svg-default",
