@@ -66,6 +66,15 @@ export const mascotConfig = {
       y: 292
     },
     {
+      id: "shiroko",
+      name: "神宫白子",
+      type: "live2d",
+      modelPath: "/live2d/models/shiroko/shiroko.model3.json",
+      scale: 0.12,
+      x: 125,
+      y: 292
+    },
+    {
       id: "svg-default",
       name: "等待模型",
       type: "placeholder"
