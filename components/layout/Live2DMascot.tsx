@@ -47,10 +47,45 @@ type Live2DDisplayModule = {
   };
 };
 
+const CUBISM_CORE_SRC = "/live2d/runtime/live2dcubismcore.min.js";
+let cubismCorePromise: Promise<void> | null = null;
+
 declare global {
   interface Window {
     PIXI?: PixiModule;
+    Live2DCubismCore?: unknown;
   }
+}
+
+function loadCubismCore() {
+  if (typeof window === "undefined") {
+    return Promise.resolve();
+  }
+
+  if (window.Live2DCubismCore) {
+    return Promise.resolve();
+  }
+
+  if (!cubismCorePromise) {
+    cubismCorePromise = new Promise((resolve, reject) => {
+      const existing = document.querySelector<HTMLScriptElement>(`script[src="${CUBISM_CORE_SRC}"]`);
+
+      if (existing) {
+        existing.addEventListener("load", () => resolve(), { once: true });
+        existing.addEventListener("error", () => reject(new Error("Live2D Cubism Core 加载失败")), { once: true });
+        return;
+      }
+
+      const script = document.createElement("script");
+      script.src = CUBISM_CORE_SRC;
+      script.async = true;
+      script.onload = () => resolve();
+      script.onerror = () => reject(new Error("Live2D Cubism Core 加载失败"));
+      document.head.appendChild(script);
+    });
+  }
+
+  return cubismCorePromise;
 }
 
 export function Live2DMascot({ model, onReady, onError }: Live2DMascotProps) {
@@ -70,6 +105,8 @@ export function Live2DMascot({ model, onReady, onError }: Live2DMascotProps) {
       }
 
       try {
+        await loadCubismCore();
+
         const [{ default: PIXI }, live2dDisplay] = await Promise.all([
           import("pixi.js") as Promise<{ default: PixiModule }>,
           import("pixi-live2d-display/cubism4") as Promise<Live2DDisplayModule>

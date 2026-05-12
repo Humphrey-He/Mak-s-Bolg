@@ -40,3 +40,4 @@ public/live2d/models/haru/
 - 不要从其他网站直接抓取模型资源。
 - 模型入口文件必须是 `.model3.json`，并且里面引用的 `.moc3`、贴图、动作路径要相对当前模型目录可访问。
 - 如果模型动作组名称不是 `Idle` / `TapBody`，请以模型的 `model3.json` 为准。
+- Cubism 3/4 模型需要 Cubism Core runtime。当前项目已本地托管到 `public/live2d/runtime/live2dcubismcore.min.js`。

@@ -30,7 +30,7 @@ export type MascotModel = SvgMascotModel | Live2DMascotModel;
 
 export const mascotConfig = {
   enabled: true,
-  defaultModelId: "svg-default",
+  defaultModelId: "hiyori",
   storageKeys: {
     hidden: "juno-mascot-hidden",
     modelId: "juno-mascot-model-id"
@@ -43,6 +43,28 @@ export const mascotConfig = {
     "需要灵感的时候，点点我。"
   ],
   models: [
+    {
+      id: "hiyori",
+      name: "Hiyori",
+      type: "live2d",
+      modelPath: "/live2d/models/hiyori/hiyori_pro_jp.model3.json",
+      idleMotionGroup: "Idle",
+      tapMotionGroup: "Tap",
+      scale: 0.24,
+      x: 125,
+      y: 292
+    },
+    {
+      id: "wanko",
+      name: "Wanko",
+      type: "live2d",
+      modelPath: "/live2d/models/wanko/wanko_touch_t02.model3.json",
+      idleMotionGroup: "Idle",
+      tapMotionGroup: "Tap",
+      scale: 0.28,
+      x: 125,
+      y: 292
+    },
     {
       id: "svg-default",
       name: "等待模型",
