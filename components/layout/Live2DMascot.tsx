@@ -35,7 +35,6 @@ type PixiModule = {
     view: HTMLCanvasElement;
     autoStart?: boolean;
     backgroundAlpha?: number;
-    transparent?: boolean;
     antialias?: boolean;
     width?: number;
     height?: number;
@@ -93,6 +92,14 @@ function loadCubismCore() {
   return cubismCorePromise;
 }
 
+function destroyPixiApp(app: PixiApplication | null) {
+  if (!app) {
+    return;
+  }
+
+  app.destroy(false, { children: true, texture: true, baseTexture: true });
+}
+
 export function Live2DMascot({ model, tapSignal = 0, onReady, onError }: Live2DMascotProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const appRef = useRef<PixiApplication | null>(null);
@@ -129,13 +136,16 @@ export function Live2DMascot({ model, tapSignal = 0, onReady, onError }: Live2DM
         window.PIXI = PIXI;
         const live2dDisplay = (await import("pixi-live2d-display/cubism4")) as Live2DDisplayModule;
 
+        if (cancelled) {
+          return;
+        }
+
         const width = canvas.clientWidth || 260;
         const height = canvas.clientHeight || 320;
         const app = new PIXI.Application({
           view: canvas,
           autoStart: true,
           backgroundAlpha: 0,
-          transparent: true,
           antialias: true,
           width,
           height
@@ -144,7 +154,7 @@ export function Live2DMascot({ model, tapSignal = 0, onReady, onError }: Live2DM
         const live2dModel = await live2dDisplay.Live2DModel.from(model.modelPath);
 
         if (cancelled) {
-          app.destroy(true, { children: true, texture: true, baseTexture: true });
+          destroyPixiApp(app);
           return;
         }
 
@@ -186,7 +196,7 @@ export function Live2DMascot({ model, tapSignal = 0, onReady, onError }: Live2DM
       cancelled = true;
       window.removeEventListener("resize", handleResize);
       modelRef.current = null;
-      appRef.current?.destroy(true, { children: true, texture: true, baseTexture: true });
+      destroyPixiApp(appRef.current);
       appRef.current = null;
       setActive(false);
     };

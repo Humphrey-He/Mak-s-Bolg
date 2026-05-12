@@ -18,7 +18,6 @@ type DragState = {
   moved: boolean;
 };
 
-const DESKTOP_BREAKPOINT = 768;
 const DEFAULT_STAGE_WIDTH = 260;
 const LIVE2D_STAGE_HEIGHT = 320;
 const PLACEHOLDER_STAGE_SIZE = 64;
