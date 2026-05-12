@@ -21,6 +21,8 @@ type PixiApplication = {
 };
 
 type Live2DModelInstance = {
+  width: number;
+  height: number;
   x: number;
   y: number;
   anchor?: {
@@ -103,6 +105,19 @@ function destroyPixiApp(app: PixiApplication | null) {
   app.destroy(false, { children: true, texture: true, baseTexture: true });
 }
 
+function placeModelInCanvas(live2dModel: Live2DModelInstance, model: Live2DMascotModel, width: number, height: number) {
+  live2dModel.anchor?.set(0.5, 1);
+  live2dModel.scale.set(1);
+
+  const naturalWidth = Math.max(1, Math.abs(live2dModel.width));
+  const naturalHeight = Math.max(1, Math.abs(live2dModel.height));
+  const fitScale = Math.min((width * 0.86) / naturalWidth, (height * 0.9) / naturalHeight);
+
+  live2dModel.scale.set(fitScale * (model.scale ?? 1));
+  live2dModel.x = model.x ?? width / 2;
+  live2dModel.y = model.y ?? height - 2;
+}
+
 export function Live2DMascot({ model, tapSignal = 0, onReady, onError }: Live2DMascotProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const appRef = useRef<PixiApplication | null>(null);
@@ -162,10 +177,7 @@ export function Live2DMascot({ model, tapSignal = 0, onReady, onError }: Live2DM
         }
 
         app.stage.addChild(live2dModel);
-        live2dModel.anchor?.set(0.5, 1);
-        live2dModel.scale.set(model.scale ?? 0.18);
-        live2dModel.x = model.x ?? width / 2;
-        live2dModel.y = model.y ?? height;
+        placeModelInCanvas(live2dModel, model, width, height);
 
         if (model.idleMotionGroup && live2dModel.motion) {
           live2dModel.motion(model.idleMotionGroup);
