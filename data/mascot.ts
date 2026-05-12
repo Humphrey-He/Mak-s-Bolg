@@ -1,7 +1,7 @@
 export type SvgMascotModel = {
   id: string;
   name: string;
-  type: "svg";
+  type: "placeholder";
 };
 
 export type Live2DOutfit = {
@@ -37,16 +37,16 @@ export const mascotConfig = {
   },
   messages: [
     "哇，你终于回来啦～",
-    "今天也要把复杂问题拆小一点。",
-    "我在左下角守着你的文章。",
+    "Live2D 模型还没接入，我先收起大号占位角色。",
+    "把合法模型放到 public/live2d/models/ 后，就可以在这里换装啦。",
     "代码和文字，都慢慢变清楚。",
     "需要灵感的时候，点点我。"
   ],
   models: [
     {
       id: "svg-default",
-      name: "默认助手",
-      type: "svg"
+      name: "等待模型",
+      type: "placeholder"
     }
   ] satisfies MascotModel[]
 } as const;
