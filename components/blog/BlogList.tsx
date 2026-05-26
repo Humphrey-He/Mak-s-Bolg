@@ -152,11 +152,6 @@ function ArticleListItem({ post, index }: { post: BlogPostSummary; index: number
   );
 }
 
-function getPageNumbers(page: number, totalPages: number) {
-  const pages = new Set([1, totalPages, page - 1, page, page + 1].filter((item) => item >= 1 && item <= totalPages));
-  return Array.from(pages).sort((a, b) => a - b);
-}
-
 function PaginationControls({
   page,
   totalPages,
@@ -166,66 +161,61 @@ function PaginationControls({
   totalPages: number;
   setPage: (page: number) => void;
 }) {
-  const pageNumbers = getPageNumbers(page, totalPages);
+  const progress = totalPages <= 1 ? 100 : Math.round((page / totalPages) * 100);
 
   return (
-    <div className="mt-7 rounded-3xl border border-white/10 bg-white/[0.035] p-3 backdrop-blur-xl">
-      <div className="flex flex-col items-center justify-between gap-3 md:flex-row">
+    <div className="mt-7 overflow-hidden rounded-3xl border border-white/10 bg-white/[0.035] p-3 backdrop-blur-xl">
+      <div className="grid gap-3 md:grid-cols-[minmax(112px,auto)_minmax(0,1fr)_minmax(112px,auto)] md:items-center">
         <button
           onClick={() => setPage(Math.max(1, page - 1))}
           disabled={page === 1}
-          className="inline-flex w-full items-center justify-center rounded-2xl border border-white/10 bg-black/20 px-4 py-2 text-sm font-semibold text-slate-300 transition hover:border-cyan-200/30 hover:text-cyan-100 disabled:opacity-35 md:w-auto"
+          className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-2xl border border-white/10 bg-black/20 px-4 text-sm font-semibold text-slate-300 transition hover:border-cyan-200/30 hover:text-cyan-100 disabled:cursor-not-allowed disabled:opacity-35"
         >
-          ← 上一页
+          <span aria-hidden="true">←</span>
+          <span>上一页</span>
         </button>
 
-        <div className="flex w-full min-w-0 flex-col items-center justify-center gap-3 sm:flex-row md:w-auto">
-          <div className="hidden items-center justify-center gap-2 lg:flex">
-            {pageNumbers.map((pageNumber, index) => {
-              const previous = pageNumbers[index - 1];
+        <div className="min-w-0 rounded-2xl border border-white/10 bg-black/20 px-4 py-3">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div className="min-w-0">
+              <p className="text-xs uppercase tracking-[0.24em] text-slate-500">PAGE</p>
+              <p className="mt-1 text-sm font-semibold text-white">
+                第 <span className="font-mono text-cyan-100">{page}</span> / <span className="font-mono text-slate-300">{totalPages}</span> 页
+              </p>
+            </div>
 
-              return (
-                <div key={pageNumber} className="flex items-center gap-2">
-                  {previous && pageNumber - previous > 1 && <span className="px-1 text-xs text-slate-600">...</span>}
-                  <button
-                    onClick={() => setPage(pageNumber)}
-                    className={`grid h-9 min-w-9 place-items-center rounded-xl border px-3 text-sm font-bold transition ${
-                      page === pageNumber ? "border-cyan-200/45 bg-cyan-300/15 text-cyan-100" : "border-white/10 bg-black/20 text-slate-400"
-                    }`}
-                  >
-                    {pageNumber}
-                  </button>
-                </div>
-              );
-            })}
+            <label className="flex shrink-0 items-center gap-2 text-xs text-slate-400">
+              <span className="whitespace-nowrap">跳转</span>
+              <select
+                value={page}
+                onChange={(event) => setPage(Number(event.target.value))}
+                aria-label="选择页码"
+                className="h-9 rounded-xl border border-white/10 bg-slate-950 px-3 font-mono text-sm text-cyan-100 outline-none transition focus:border-cyan-200/45"
+              >
+                {Array.from({ length: totalPages }).map((_, index) => {
+                  const pageNumber = index + 1;
+                  return (
+                    <option key={pageNumber} value={pageNumber}>
+                      {pageNumber}
+                    </option>
+                  );
+                })}
+              </select>
+            </label>
           </div>
 
-          <label className="flex w-full items-center justify-center gap-2 rounded-2xl border border-white/10 bg-black/20 px-3 py-2 text-xs text-slate-400 sm:w-auto">
-            <span className="whitespace-nowrap">第</span>
-            <select
-              value={page}
-              onChange={(event) => setPage(Number(event.target.value))}
-              className="h-8 rounded-xl border border-white/10 bg-slate-950 px-3 font-mono text-sm text-cyan-100 outline-none"
-            >
-              {Array.from({ length: totalPages }).map((_, index) => {
-                const pageNumber = index + 1;
-                return (
-                  <option key={pageNumber} value={pageNumber}>
-                    {pageNumber}
-                  </option>
-                );
-              })}
-            </select>
-            <span className="whitespace-nowrap">/ {totalPages} 页</span>
-          </label>
+          <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-white/8">
+            <div className="h-full rounded-full bg-cyan-200/70 transition-[width] duration-300" style={{ width: `${progress}%` }} />
+          </div>
         </div>
 
         <button
           onClick={() => setPage(Math.min(totalPages, page + 1))}
           disabled={page === totalPages}
-          className="inline-flex w-full items-center justify-center rounded-2xl border border-white/10 bg-black/20 px-4 py-2 text-sm font-semibold text-slate-300 transition hover:border-cyan-200/30 hover:text-cyan-100 disabled:opacity-35 md:w-auto"
+          className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-2xl border border-white/10 bg-black/20 px-4 text-sm font-semibold text-slate-300 transition hover:border-cyan-200/30 hover:text-cyan-100 disabled:cursor-not-allowed disabled:opacity-35"
         >
-          下一页 →
+          <span>下一页</span>
+          <span aria-hidden="true">→</span>
         </button>
       </div>
     </div>
