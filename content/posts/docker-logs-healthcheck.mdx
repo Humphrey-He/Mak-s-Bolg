@@ -1,14 +1,16 @@
 ---
-slug: "docker-logs-healthcheck"
-title: "容器日志与健康检查：结构化日志、探针语义与优雅退出"
-description: "讲清容器化后 stdout/stderr、logging driver、结构化日志、日志脱敏、Docker HEALTHCHECK、readiness/liveness/startup、优雅退出和排障路径。"
-date: "2026-05-14"
-tag: "Cloud Native"
-readTime: "29 min"
+slug: docker-logs-healthcheck
+title: 容器日志与健康检查：结构化日志、探针语义与优雅退出
+description: 讲清容器化后 stdout/stderr、logging driver、结构化日志、日志脱敏、Docker HEALTHCHECK、readiness/liveness/startup、优雅退出和排障路径。
+date: '2026-05-14'
+tag: Cloud Native
+readTime: 29 min
 top: false
 featured: false
+series: Docker
+seriesSlug: docker
+seriesOrder: 999
 ---
-
 ## 这篇解决什么问题
 
 容器跑起来不代表服务真的可用。后端进程可能已经启动，但数据库连不上；端口可能监听了，但依赖缓存不可用；接口可能返回 500，但容器状态仍然是 `Up`。

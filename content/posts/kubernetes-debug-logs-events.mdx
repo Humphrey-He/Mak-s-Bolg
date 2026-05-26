@@ -1,14 +1,16 @@
 ---
-slug: "kubernetes-debug-logs-events"
-title: "Kubernetes 调试：从日志、事件到分层排障链路"
-description: "从 logs、events、describe、EndpointSlice、Ingress、Node、DNS、NetworkPolicy 到 kubectl debug，建立后端服务生产级排障方法。"
-date: "2026-05-14"
-tag: "Cloud Native"
-readTime: "30 min"
+slug: kubernetes-debug-logs-events
+title: Kubernetes 调试：从日志、事件到分层排障链路
+description: 从 logs、events、describe、EndpointSlice、Ingress、Node、DNS、NetworkPolicy 到 kubectl debug，建立后端服务生产级排障方法。
+date: '2026-05-14'
+tag: Cloud Native
+readTime: 30 min
 top: false
 featured: false
+series: Kubernetes
+seriesSlug: kubernetes
+seriesOrder: 999
 ---
-
 ## 为什么不能只看应用日志
 
 在 Kubernetes 中排障，最怕只盯着应用日志。日志能告诉你代码发生了什么，但它不一定告诉你镜像为什么拉不下来、Pod 为什么调度失败、探针为什么失败、volume 为什么挂载不上、Service 为什么没有后端、Ingress Controller 为什么没有接管规则。

@@ -1,14 +1,16 @@
 ---
-slug: "backend-cloud-native-architecture"
-title: "从单体后端到云原生架构：Kubernetes 之后还要设计什么"
-description: "面向后端开发者梳理单体服务容器化、多服务拆分、配置、日志、监控、链路追踪、发布回滚与云原生架构边界。"
-date: "2026-05-17"
-tag: "Cloud Native"
-readTime: "22 min"
+slug: backend-cloud-native-architecture
+title: 从单体后端到云原生架构：Kubernetes 之后还要设计什么
+description: 面向后端开发者梳理单体服务容器化、多服务拆分、配置、日志、监控、链路追踪、发布回滚与云原生架构边界。
+date: '2026-05-17'
+tag: Cloud Native
+readTime: 22 min
 top: false
 featured: false
+series: 云原生架构随笔
+seriesSlug: cloud-native-notes
+seriesOrder: 1
 ---
-
 很多团队第一次接触 Kubernetes 时，会把它理解成“更高级的部署平台”。这没错，但不完整。Kubernetes 能编排容器、维持副本、暴露服务、滚动发布，却不能自动替你完成领域拆分、数据一致性、接口兼容、容量规划和故障治理。
 
 云原生架构不是把单体应用拆成很多服务，也不是把所有东西都塞进集群。它的核心是让后端系统在变化、故障和流量波动中保持可交付、可观察、可恢复。

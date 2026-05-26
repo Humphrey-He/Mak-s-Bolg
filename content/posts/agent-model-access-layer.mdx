@@ -1,14 +1,16 @@
 ---
-slug: "agent-model-access-layer"
-title: "Agent 模型接入层设计：从 SDK、MCP 到记忆系统"
-description: "从 OpenAI Agents SDK、Model Context Protocol、MCP Prompts 和 MemGPT 出发，系统分析 Agent 模型接入层的职责边界、工程抽象与架构设计。"
-date: "2026-05-09"
-tag: "AI Agent"
-readTime: "20 min"
+slug: agent-model-access-layer
+title: Agent 模型接入层设计：从 SDK、MCP 到记忆系统
+description: 从 OpenAI Agents SDK、Model Context Protocol、MCP Prompts 和 MemGPT 出发，系统分析 Agent 模型接入层的职责边界、工程抽象与架构设计。
+date: '2026-05-09'
+tag: AI Agent
+readTime: 20 min
 top: false
 featured: true
+series: AI Agent
+seriesSlug: ai-agent
+seriesOrder: 999
 ---
-
 很多 Agent 项目一开始都会把"模型接入"理解成一件很简单的事：封装一个 `callLLM()` 方法，把用户输入传给模型，再把模型输出返回给业务层。
 
 这在 Demo 阶段足够，但在真正的 Agent 系统里远远不够。

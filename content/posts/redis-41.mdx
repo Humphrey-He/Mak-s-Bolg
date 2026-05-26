@@ -1,12 +1,15 @@
 ---
-slug: "redis-41"
-title: "41 Redis变慢了应该先查什么"
-description: "Redis 变慢时，最容易犯的错是直接猜测“是不是大 key”“是不是网络抖了”“是不是 Redis 单线程扛不住”。真正可靠的做法，是先把延迟分层：客户端、网络、Redis 主线程、后台任务、持久化、内存回收、操作..."
-date: "2026-05-26"
-tag: "Go / Cache"
-readTime: "3 min"
+slug: redis-41
+title: 41 Redis变慢了应该先查什么
+description: Redis 变慢时，最容易犯的错是直接猜测“是不是大 key”“是不是网络抖了”“是不是 Redis 单线程扛不住”。真正可靠的做法，是先把延迟分层：客户端、网络、Redis 主线程、后台任务、持久化、内存回收、操作...
+date: '2026-05-26'
+tag: Go / Cache
+readTime: 3 min
 top: false
 featured: false
+series: Redis 核心原理与实战
+seriesSlug: redis-core
+seriesOrder: 41
 ---
 # 41 Redis变慢了应该先查什么
 

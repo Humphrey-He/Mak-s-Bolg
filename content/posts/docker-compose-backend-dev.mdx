@@ -1,14 +1,16 @@
 ---
-slug: "docker-compose-backend-dev"
-title: "Docker Compose 管理后端开发环境：从能跑到可靠可维护"
-description: "面向后端开发者系统讲解 Compose 如何组织 API、MySQL、Redis，本地端口、healthcheck、.env、热更新、初始化脚本和排障路径如何设计。"
-date: "2026-05-12"
-tag: "Cloud Native"
-readTime: "28 min"
+slug: docker-compose-backend-dev
+title: Docker Compose 管理后端开发环境：从能跑到可靠可维护
+description: 面向后端开发者系统讲解 Compose 如何组织 API、MySQL、Redis，本地端口、healthcheck、.env、热更新、初始化脚本和排障路径如何设计。
+date: '2026-05-12'
+tag: Cloud Native
+readTime: 28 min
 top: false
 featured: false
+series: Docker
+seriesSlug: docker
+seriesOrder: 999
 ---
-
 ## 这篇解决什么问题
 
 很多后端项目不是一个进程就能跑起来的。API 需要 MySQL，登录态依赖 Redis，异步任务可能还要消息队列。新人接手项目时，常见流程是：先装数据库，再改端口，再导测试数据，最后卡在“我这里能跑，你那里不行”。

@@ -1,12 +1,15 @@
 ---
-slug: "redis-48"
-title: "48 SDS：字符串为什么不用C原生char指针"
-description: "Redis 用 C 写成，却没有直接用 C 原生字符串表示所有字符串，而是设计了 SDS。原因很简单：Redis 需要高频拼接、二进制安全、快速取长度和减少内存浪费，C 字符串无法优雅满足这些要求。"
-date: "2026-05-26"
-tag: "Go / Cache"
-readTime: "3 min"
+slug: redis-48
+title: 48 SDS：字符串为什么不用C原生char指针
+description: Redis 用 C 写成，却没有直接用 C 原生字符串表示所有字符串，而是设计了 SDS。原因很简单：Redis 需要高频拼接、二进制安全、快速取长度和减少内存浪费，C 字符串无法优雅满足这些要求。
+date: '2026-05-26'
+tag: Go / Cache
+readTime: 3 min
 top: false
 featured: false
+series: Redis 核心原理与实战
+seriesSlug: redis-core
+seriesOrder: 48
 ---
 # 48 SDS：字符串为什么不用C原生char指针
 

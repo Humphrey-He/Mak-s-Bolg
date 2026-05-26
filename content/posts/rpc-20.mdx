@@ -1,12 +1,15 @@
 ---
-slug: "rpc-20"
-title: "20 详解时钟轮在 RPC 中的应用"
-description: "RPC 框架里有大量“将来要执行”的任务：请求超时、心跳检测、连接空闲关闭、重试调度、熔断半开探测。如果每个任务都直接交给普通定时器或优先队列，高并发下会产生明显的插入、删除和唤醒开销。时间轮就是为这类海量定时任务准..."
-date: "2026-05-26"
-tag: "Architecture"
-readTime: "3 min"
+slug: rpc-20
+title: 20 详解时钟轮在 RPC 中的应用
+description: RPC 框架里有大量“将来要执行”的任务：请求超时、心跳检测、连接空闲关闭、重试调度、熔断半开探测。如果每个任务都直接交给普通定时器或优先队列，高并发下会产生明显的插入、删除和唤醒开销。时间轮就是为这类海量定时任务准...
+date: '2026-05-26'
+tag: Architecture
+readTime: 3 min
 top: false
 featured: false
+series: RPC 核心原理与实战
+seriesSlug: rpc-core
+seriesOrder: 20
 ---
 # 20 详解时钟轮在 RPC 中的应用
 

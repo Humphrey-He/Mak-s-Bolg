@@ -1,12 +1,15 @@
 ---
-slug: "redis-15"
-title: "15 AOF：每条写命令都记录就安全吗"
-description: "AOF 看起来更可靠：每次写命令都追加到日志，宕机后重放即可恢复。但“记录了命令”不等于“一定不丢数据”，真正要理解的是写入缓冲、刷盘策略、AOF rewrite、文件损坏和恢复耗时之间的边界。"
-date: "2026-05-26"
-tag: "Go / Cache"
-readTime: "3 min"
+slug: redis-15
+title: 15 AOF：每条写命令都记录就安全吗
+description: AOF 看起来更可靠：每次写命令都追加到日志，宕机后重放即可恢复。但“记录了命令”不等于“一定不丢数据”，真正要理解的是写入缓冲、刷盘策略、AOF rewrite、文件损坏和恢复耗时之间的边界。
+date: '2026-05-26'
+tag: Go / Cache
+readTime: 3 min
 top: false
 featured: false
+series: Redis 核心原理与实战
+seriesSlug: redis-core
+seriesOrder: 15
 ---
 # 15 AOF：每条写命令都记录就安全吗
 

@@ -1,12 +1,15 @@
 ---
-slug: "distributed-cache-06"
-title: "缓存与数据库一致性方案：没有银弹，只有可解释的取舍"
-description: "引入缓存后，系统会多出一份数据副本。只要数据存在副本，就一定会遇到一致性问题：数据库已经更新，缓存还是旧值；缓存已经删除，另一个并发请求又把旧值写回；消息通知丢了，缓存一直不刷新；主从延迟导致读到旧数据。很多团队最初..."
-date: "2026-05-26"
-tag: "Go / Cache"
-readTime: "6 min"
+slug: distributed-cache-06
+title: 缓存与数据库一致性方案：没有银弹，只有可解释的取舍
+description: 引入缓存后，系统会多出一份数据副本。只要数据存在副本，就一定会遇到一致性问题：数据库已经更新，缓存还是旧值；缓存已经删除，另一个并发请求又把旧值写回；消息通知丢了，缓存一直不刷新；主从延迟导致读到旧数据。很多团队最初...
+date: '2026-05-26'
+tag: Go / Cache
+readTime: 6 min
 top: false
 featured: false
+series: 分布式缓存核心原理与实战
+seriesSlug: distributed-cache
+seriesOrder: 6
 ---
 # 缓存与数据库一致性方案：没有银弹，只有可解释的取舍
 

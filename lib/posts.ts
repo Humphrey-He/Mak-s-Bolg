@@ -1,6 +1,7 @@
-﻿import { readdirSync, readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import matter from "gray-matter";
+import { blogSeriesBySlug, blogSeriesDefinitions } from "@/data/blogSeries";
 
 const postsDirectory = join(process.cwd(), "content", "posts");
 
@@ -13,10 +14,22 @@ export type BlogPostSummary = {
   readTime: string;
   top: boolean;
   featured: boolean;
+  series: string;
+  seriesSlug: string;
+  seriesOrder: number;
 };
 
 export type BlogPost = BlogPostSummary & {
   content: string;
+};
+
+export type BlogSeriesSummary = {
+  slug: string;
+  name: string;
+  description: string;
+  accent: string;
+  count: number;
+  latestDate: string;
 };
 
 type Frontmatter = {
@@ -28,6 +41,9 @@ type Frontmatter = {
   readTime: string;
   top?: boolean;
   featured?: boolean;
+  series?: string;
+  seriesSlug?: string;
+  seriesOrder?: number;
 };
 
 function getPostFileNames() {
@@ -42,6 +58,8 @@ function readPostFile(fileName: string): BlogPost {
   const frontmatter = data as Frontmatter;
   const fileSlug = fileName.replace(/\.mdx$/, "");
   const slug = frontmatter.slug || fileSlug;
+  const seriesSlug = frontmatter.seriesSlug || "engineering-notes";
+  const seriesDefinition = blogSeriesBySlug.get(seriesSlug);
 
   return {
     slug,
@@ -52,6 +70,9 @@ function readPostFile(fileName: string): BlogPost {
     readTime: frontmatter.readTime,
     top: Boolean(frontmatter.top),
     featured: Boolean(frontmatter.featured),
+    series: frontmatter.series || seriesDefinition?.name || "工程实践随笔",
+    seriesSlug,
+    seriesOrder: Number(frontmatter.seriesOrder ?? 999),
     content,
   };
 }
@@ -66,7 +87,7 @@ function getAllPostFiles(): BlogPost[] {
 
 export function getAllPosts(): BlogPostSummary[] {
   return getAllPostFiles()
-    .sort(byDateDesc)
+    .sort((a, b) => byDateDesc(a, b) || a.seriesOrder - b.seriesOrder || a.title.localeCompare(b.title, "zh-Hans-CN"))
     .map(({ content, ...post }) => post);
 }
 
@@ -80,11 +101,34 @@ export function getPostBySlug(slug: string): BlogPost | null {
 }
 
 export function getRelatedPosts(currentPost: BlogPost, count: number = 3): BlogPostSummary[] {
-  return getAllPosts()
-    .filter((post) => post.slug !== currentPost.slug && post.tag === currentPost.tag)
-    .slice(0, count);
+  const posts = getAllPosts().filter((post) => post.slug !== currentPost.slug);
+  const sameSeries = posts.filter((post) => post.seriesSlug === currentPost.seriesSlug).sort((a, b) => a.seriesOrder - b.seriesOrder);
+
+  if (sameSeries.length >= count) {
+    return sameSeries.slice(0, count);
+  }
+
+  const sameTag = posts.filter((post) => post.seriesSlug !== currentPost.seriesSlug && post.tag === currentPost.tag);
+  return [...sameSeries, ...sameTag].slice(0, count);
 }
 
 export function getPostTags(): string[] {
   return ["All", ...Array.from(new Set(getAllPosts().map((post) => post.tag)))];
+}
+
+export function getPostSeries(): BlogSeriesSummary[] {
+  const posts = getAllPosts();
+
+  return blogSeriesDefinitions
+    .map((series) => {
+      const seriesPosts = posts.filter((post) => post.seriesSlug === series.slug);
+      const latestDate = seriesPosts.sort(byDateDesc)[0]?.date || "";
+
+      return {
+        ...series,
+        count: seriesPosts.length,
+        latestDate,
+      };
+    })
+    .filter((series) => series.count > 0);
 }

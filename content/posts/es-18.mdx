@@ -1,12 +1,15 @@
 ---
-slug: "es-18"
-title: "ES 写入文档流程详解"
-description: "写入 Elasticsearch 看起来只是一个简单请求：POST index/ doc/1。但在分布式系统里，一条文档从客户端到真正可搜索，需要经历协调节点、路由计算、主分片写入、副本复制、translog 追加、..."
-date: "2026-05-26"
-tag: "Architecture"
-readTime: "4 min"
+slug: es-18
+title: ES 写入文档流程详解
+description: 写入 Elasticsearch 看起来只是一个简单请求：POST index/ doc/1。但在分布式系统里，一条文档从客户端到真正可搜索，需要经历协调节点、路由计算、主分片写入、副本复制、translog 追加、...
+date: '2026-05-26'
+tag: Architecture
+readTime: 4 min
 top: false
 featured: false
+series: Elasticsearch 核心原理与实战
+seriesSlug: elasticsearch-core
+seriesOrder: 18
 ---
 # ES 写入文档流程详解
 

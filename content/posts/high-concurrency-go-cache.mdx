@@ -1,14 +1,16 @@
 ---
-slug: "high-concurrency-go-cache"
-title: "从零构建一个高并发 Go 缓存系统"
-description: "记录 HCache 的分片设计、W-TinyLFU 准入策略、内存控制与多核并发优化实践。"
-date: "2026-04-18"
-tag: "Go / Cache"
-readTime: "12 min"
+slug: high-concurrency-go-cache
+title: 从零构建一个高并发 Go 缓存系统
+description: 记录 HCache 的分片设计、W-TinyLFU 准入策略、内存控制与多核并发优化实践。
+date: '2026-04-18'
+tag: Go / Cache
+readTime: 12 min
 top: true
 featured: true
+series: 工程实践随笔
+seriesSlug: engineering-notes
+seriesOrder: 999
 ---
-
 ## 为什么要自己做缓存
 
 很多业务并不是缺一个 Redis，而是缺一个**贴近进程、延迟更低、可控性更强**的本地缓存层。

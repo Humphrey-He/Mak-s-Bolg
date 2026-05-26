@@ -1,12 +1,15 @@
 ---
-slug: "redis-44"
-title: "44 缓冲区：一个可能引发事故的地方"
-description: "Redis 的缓冲区平时很安静，一旦出事往往很凶：客户端输出缓冲区爆掉、复制积压缓冲区不足、Pub/Sub 客户端消费慢、主从断线全量同步。缓冲区不是附属细节，而是 Redis 高可用和稳定性的关键边界。"
-date: "2026-05-26"
-tag: "Go / Cache"
-readTime: "3 min"
+slug: redis-44
+title: 44 缓冲区：一个可能引发事故的地方
+description: Redis 的缓冲区平时很安静，一旦出事往往很凶：客户端输出缓冲区爆掉、复制积压缓冲区不足、Pub/Sub 客户端消费慢、主从断线全量同步。缓冲区不是附属细节，而是 Redis 高可用和稳定性的关键边界。
+date: '2026-05-26'
+tag: Go / Cache
+readTime: 3 min
 top: false
 featured: false
+series: Redis 核心原理与实战
+seriesSlug: redis-core
+seriesOrder: 44
 ---
 # 44 缓冲区：一个可能引发事故的地方
 

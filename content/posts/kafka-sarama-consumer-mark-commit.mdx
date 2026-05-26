@@ -1,14 +1,16 @@
 ---
-slug: "kafka-sarama-consumer-mark-commit"
-title: "Kafka 消费者：Mark 与 Commit 的边界、auto commit 与 manual commit 的对象模型"
-description: "深入解析 Sarama consumer offset 提交机制：Mark 只是改本地状态，Commit 才是发网络请求。以及为什么会出现'业务已处理但 offset 未提交'或反之的问题。"
-date: "2026-05-09"
-tag: "Go / Cache"
-readTime: "22 min"
+slug: kafka-sarama-consumer-mark-commit
+title: Kafka 消费者：Mark 与 Commit 的边界、auto commit 与 manual commit 的对象模型
+description: 深入解析 Sarama consumer offset 提交机制：Mark 只是改本地状态，Commit 才是发网络请求。以及为什么会出现'业务已处理但 offset 未提交'或反之的问题。
+date: '2026-05-09'
+tag: Go / Cache
+readTime: 22 min
 top: false
 featured: false
+series: Kafka / Sarama
+seriesSlug: kafka-sarama
+seriesOrder: 999
 ---
-
 > **核心一句话：** Sarama 里"提交 offset"分成了两层：业务线程先在内存里"标记进度"，offset manager 再在合适时机把这份进度发给 Kafka coordinator。所以"看起来提交了"通常只是 **Mark 成功了**，不等于 **Commit 已经成功落到 broker**。
 
 ---

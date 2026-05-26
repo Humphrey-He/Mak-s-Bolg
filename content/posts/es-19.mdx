@@ -1,12 +1,15 @@
 ---
-slug: "es-19"
-title: "ES 读取与搜索流程详解"
-description: "读取 Elasticsearch 有两类典型路径：按 id 获取单篇文档，以及通过 query DSL 搜索一批文档。前者更像 KV 读取，后者是分布式搜索和归并。很多线上问题都发生在这两者被混用的时候：写入后 GE..."
-date: "2026-05-26"
-tag: "Architecture"
-readTime: "4 min"
+slug: es-19
+title: ES 读取与搜索流程详解
+description: 读取 Elasticsearch 有两类典型路径：按 id 获取单篇文档，以及通过 query DSL 搜索一批文档。前者更像 KV 读取，后者是分布式搜索和归并。很多线上问题都发生在这两者被混用的时候：写入后 GE...
+date: '2026-05-26'
+tag: Architecture
+readTime: 4 min
 top: false
 featured: false
+series: Elasticsearch 核心原理与实战
+seriesSlug: elasticsearch-core
+seriesOrder: 19
 ---
 # ES 读取与搜索流程详解
 

@@ -1,14 +1,16 @@
 ---
-slug: "kubernetes-probes-backend-health"
-title: "Kubernetes Probe：让集群正确判断后端服务是否健康"
-description: "解释 livenessProbe、readinessProbe、startupProbe 的区别、参数含义、接口设计和排查方法。"
-date: "2026-05-16"
-tag: "Cloud Native"
-readTime: "19 min"
+slug: kubernetes-probes-backend-health
+title: Kubernetes Probe：让集群正确判断后端服务是否健康
+description: 解释 livenessProbe、readinessProbe、startupProbe 的区别、参数含义、接口设计和排查方法。
+date: '2026-05-16'
+tag: Cloud Native
+readTime: 19 min
 top: false
 featured: false
+series: Kubernetes
+seriesSlug: kubernetes
+seriesOrder: 999
 ---
-
 ## 这篇解决什么问题
 
 后端服务启动并不等于可用。进程可能还在加载配置、迁移缓存、建立数据库连接，也可能因为死锁、连接池耗尽而“进程还活着但请求处理不了”。Kubernetes 需要一种信号判断：该不该重启容器，该不该把流量打给这个 Pod。

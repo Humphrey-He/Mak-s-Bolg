@@ -1,14 +1,16 @@
 ---
-slug: "kubernetes-service-backend-networking"
-title: "Kubernetes Service：给后端服务一个稳定入口"
-description: "面向后端开发者理解 Service 如何屏蔽 Pod IP 变化，并完成集群内服务发现、端口转发和排查。"
-date: "2026-05-12"
-tag: "Cloud Native"
-readTime: "18 min"
+slug: kubernetes-service-backend-networking
+title: Kubernetes Service：给后端服务一个稳定入口
+description: 面向后端开发者理解 Service 如何屏蔽 Pod IP 变化，并完成集群内服务发现、端口转发和排查。
+date: '2026-05-12'
+tag: Cloud Native
+readTime: 18 min
 top: false
 featured: false
+series: Kubernetes
+seriesSlug: kubernetes
+seriesOrder: 999
 ---
-
 ## 这篇解决什么问题
 
 后端服务放进 Kubernetes 后，最先遇到的网络问题通常不是代码不能跑，而是“我该访问哪个 IP”。Pod 会随着发布、扩缩容、节点故障而被重建，Pod IP 也会变化。如果调用方把某个 Pod IP 写进配置，下一次滚动发布后链路就可能断掉。

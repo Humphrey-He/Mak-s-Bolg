@@ -1,14 +1,16 @@
 ---
-slug: "order-payment-id-generation"
-title: "电商订单号与支付单号生成方案"
-description: "覆盖雪花算法、号段模式、幂等、重试、补偿、退款与对账场景。"
-date: "2026-03-21"
-tag: "Architecture"
-readTime: "13 min"
+slug: order-payment-id-generation
+title: 电商订单号与支付单号生成方案
+description: 覆盖雪花算法、号段模式、幂等、重试、补偿、退款与对账场景。
+date: '2026-03-21'
+tag: Architecture
+readTime: 13 min
 top: true
 featured: true
+series: 工程实践随笔
+seriesSlug: engineering-notes
+seriesOrder: 999
 ---
-
 ## 编号系统不是一个工具函数
 
 订单号和支付单号一开始看起来只是“生成字符串”，但一旦涉及支付、退款、对账和补偿，它就会变成系统级能力。

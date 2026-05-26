@@ -1,12 +1,15 @@
 ---
-slug: "rpc-17"
-title: "17 异步 RPC：压榨单机吞吐量"
-description: "同步 RPC 的编程模型很直观：发起调用，阻塞等待，拿到结果继续执行。但在高并发场景里，大量线程其实不是在计算，而是在等待网络响应。异步 RPC 的核心价值，就是把线程从等待中释放出来，让单机资源更多用于真正的调度、..."
-date: "2026-05-26"
-tag: "Architecture"
-readTime: "3 min"
+slug: rpc-17
+title: 17 异步 RPC：压榨单机吞吐量
+description: 同步 RPC 的编程模型很直观：发起调用，阻塞等待，拿到结果继续执行。但在高并发场景里，大量线程其实不是在计算，而是在等待网络响应。异步 RPC 的核心价值，就是把线程从等待中释放出来，让单机资源更多用于真正的调度、...
+date: '2026-05-26'
+tag: Architecture
+readTime: 3 min
 top: false
 featured: false
+series: RPC 核心原理与实战
+seriesSlug: rpc-core
+seriesOrder: 17
 ---
 # 17 异步 RPC：压榨单机吞吐量
 

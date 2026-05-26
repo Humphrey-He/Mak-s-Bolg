@@ -1,14 +1,16 @@
 ---
-slug: "kafka-async-producer-broker-batch"
-title: "Kafka 异步生产者源码：broker 层批量聚合与 flush 机制"
-description: "深入解析 Sarama async producer 的 broker 层：批量如何积攒、flush 何时触发、重试时如何维持 partition 顺序。"
-date: "2026-05-09"
-tag: "Go / Cache"
-readTime: "20 min"
+slug: kafka-async-producer-broker-batch
+title: Kafka 异步生产者源码：broker 层批量聚合与 flush 机制
+description: 深入解析 Sarama async producer 的 broker 层：批量如何积攒、flush 何时触发、重试时如何维持 partition 顺序。
+date: '2026-05-09'
+tag: Go / Cache
+readTime: 20 min
 top: false
 featured: false
+series: Kafka / Sarama
+seriesSlug: kafka-sarama
+seriesOrder: 999
 ---
-
 > **Summary:** `brokerProducer.run()` 是"按 broker 聚合、择机 flush、接收响应并驱动重试/解锁"的调度器；`produceSet.buildRequest()` 则是"把当前积攒的 topic-partition 批次编码成一个 Kafka `ProduceRequest`" 的序列化入口。`brokerProducer` 初始化时就带着一个 `accumulatingBatch: newProduceSet(p)`，而网络侧 bridge goroutine 会对每个待发送的 `produceSet` 调 `set.buildRequest()` 后再真正发往 Broker。
 
 ---

@@ -1,14 +1,16 @@
 ---
-slug: "kubernetes-resource-requests-limits"
-title: "Kubernetes 资源限制：CPU、内存与 OOM 排查"
-description: "面向后端开发者理解 requests、limits、CPU throttling、OOMKilled，以及服务在 Kubernetes 中如何合理申请和限制资源。"
-date: "2026-05-12"
-tag: "Cloud Native"
-readTime: "18 min"
+slug: kubernetes-resource-requests-limits
+title: Kubernetes 资源限制：CPU、内存与 OOM 排查
+description: 面向后端开发者理解 requests、limits、CPU throttling、OOMKilled，以及服务在 Kubernetes 中如何合理申请和限制资源。
+date: '2026-05-12'
+tag: Cloud Native
+readTime: 18 min
 top: false
 featured: false
+series: Kubernetes
+seriesSlug: kubernetes
+seriesOrder: 999
 ---
-
 后端服务迁移到 Kubernetes 之后，很多问题不再表现为“机器负载高”，而是变成了 Pod Pending、接口突然变慢、容器被 OOMKilled、发布后部分副本一直不 Ready。资源配置就是这些问题背后的第一层地基。
 
 在虚拟机时代，一个 Java、Go 或 Node 服务通常独占一台机器的一部分资源；在 Kubernetes 中，同一台 Node 上会运行很多 Pod。调度器需要知道每个 Pod 至少需要多少资源，运行时也需要知道容器最多能用多少资源。`requests` 和 `limits` 就分别回答这两个问题。

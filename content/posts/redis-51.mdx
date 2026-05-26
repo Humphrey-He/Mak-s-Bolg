@@ -1,12 +1,15 @@
 ---
-slug: "redis-51"
-title: "51 skiplist rax与范围查询结构"
-description: "Redis 中 ZSet 和 Stream 都需要高效范围查询，但它们选择了不同结构：ZSet 使用 skiplist，Stream 使用 rax。为什么不是统一用一种树？答案在访问模式和编码目标里。"
-date: "2026-05-26"
-tag: "Go / Cache"
-readTime: "3 min"
+slug: redis-51
+title: 51 skiplist rax与范围查询结构
+description: Redis 中 ZSet 和 Stream 都需要高效范围查询，但它们选择了不同结构：ZSet 使用 skiplist，Stream 使用 rax。为什么不是统一用一种树？答案在访问模式和编码目标里。
+date: '2026-05-26'
+tag: Go / Cache
+readTime: 3 min
 top: false
 featured: false
+series: Redis 核心原理与实战
+seriesSlug: redis-core
+seriesOrder: 51
 ---
 # 51 skiplist rax与范围查询结构
 

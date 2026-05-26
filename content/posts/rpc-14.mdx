@@ -1,12 +1,15 @@
 ---
-slug: "rpc-14"
-title: "14 优雅启动：如何避免流量打到没有启动完成的节点"
-description: "进程启动成功，不代表服务已经准备好接收 RPC 流量。类加载完成、端口监听成功、健康检查通过、缓存预热完成、连接池建立、配置加载、下游依赖可用，这些条件之间有明显差别。"
-date: "2026-05-26"
-tag: "Architecture"
-readTime: "3 min"
+slug: rpc-14
+title: 14 优雅启动：如何避免流量打到没有启动完成的节点
+description: 进程启动成功，不代表服务已经准备好接收 RPC 流量。类加载完成、端口监听成功、健康检查通过、缓存预热完成、连接池建立、配置加载、下游依赖可用，这些条件之间有明显差别。
+date: '2026-05-26'
+tag: Architecture
+readTime: 3 min
 top: false
 featured: false
+series: RPC 核心原理与实战
+seriesSlug: rpc-core
+seriesOrder: 14
 ---
 # 14 优雅启动：如何避免流量打到没有启动完成的节点
 

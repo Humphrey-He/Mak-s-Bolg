@@ -1,14 +1,16 @@
 ---
-slug: "kubernetes-pod-troubleshooting"
-title: "Kubernetes 常见故障排查：Pod 为什么起不来"
-description: "从 Pending、ImagePullBackOff、CrashLoopBackOff、CreateContainerConfigError 到 Running 但访问不通，建立后端服务的 Pod 排查路径。"
-date: "2026-05-13"
-tag: "Cloud Native"
-readTime: "20 min"
+slug: kubernetes-pod-troubleshooting
+title: Kubernetes 常见故障排查：Pod 为什么起不来
+description: 从 Pending、ImagePullBackOff、CrashLoopBackOff、CreateContainerConfigError 到 Running 但访问不通，建立后端服务的 Pod 排查路径。
+date: '2026-05-13'
+tag: Cloud Native
+readTime: 20 min
 top: false
 featured: false
+series: Kubernetes
+seriesSlug: kubernetes
+seriesOrder: 999
 ---
-
 后端服务在 Kubernetes 里出问题时，最常见的一句话是：“Pod 起不来。”但 Pod 起不来只是表象，它可能是资源不足、镜像拉取失败、配置缺失、启动命令错误、健康检查失败，也可能是服务已经 Running 但没有 Ready。
 
 排查 Pod 的关键不是背状态名，而是把问题拆成三个层次：Kubernetes 有没有把 Pod 调度出去，容器运行时有没有把镜像拉下来并启动进程，应用进程启动后有没有准备好接流量。

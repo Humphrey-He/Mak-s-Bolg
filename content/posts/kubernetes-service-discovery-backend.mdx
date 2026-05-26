@@ -1,14 +1,16 @@
 ---
-slug: "kubernetes-service-discovery-backend"
-title: "Kubernetes 服务发现：Service、DNS 与后端调用链路"
-description: "面向后端开发者解释 Kubernetes 中服务名、DNS、Service、Endpoints 和负载均衡如何影响服务间调用。"
-date: "2026-05-16"
-tag: "Cloud Native"
-readTime: "18 min"
+slug: kubernetes-service-discovery-backend
+title: Kubernetes 服务发现：Service、DNS 与后端调用链路
+description: 面向后端开发者解释 Kubernetes 中服务名、DNS、Service、Endpoints 和负载均衡如何影响服务间调用。
+date: '2026-05-16'
+tag: Cloud Native
+readTime: 18 min
 top: false
 featured: false
+series: Kubernetes
+seriesSlug: kubernetes
+seriesOrder: 999
 ---
-
 在 Kubernetes 里，后端服务之间通常不再写固定 IP，而是调用服务名。比如用户服务访问订单服务，可以请求 `http://order-api.default.svc.cluster.local`。这背后不是魔法，而是 Service、DNS、Endpoints 和 kube-proxy 等组件共同完成的服务发现。
 
 理解服务发现很重要，因为“服务调用超时”经常不是代码问题，而是 DNS 解析、Service selector、targetPort、Pod readiness、NetworkPolicy 或连接池配置中的某一环出了问题。

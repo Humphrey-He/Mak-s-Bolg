@@ -1,14 +1,16 @@
 ---
-slug: "go-mvs-design-philosophy"
-title: "第 6 章：为什么 Go 的 MVS 看起来反直觉，却更适合大规模工程"
-description: "深入理解 Go Module 的版本选择算法 MVS（Minimal Version Selection），以及它与 Java、C#、C++ 版本选择模型的根本差异。"
-date: "2026-05-08"
-tag: "Go"
-readTime: "15 min"
+slug: go-mvs-design-philosophy
+title: 第 6 章：为什么 Go 的 MVS 看起来反直觉，却更适合大规模工程
+description: 深入理解 Go Module 的版本选择算法 MVS（Minimal Version Selection），以及它与 Java、C#、C++ 版本选择模型的根本差异。
+date: '2026-05-08'
+tag: Go
+readTime: 15 min
 top: false
 featured: false
+series: Go Modules
+seriesSlug: go-modules
+seriesOrder: 6
 ---
-
 ## 章节目标
 
 在 Go Module 体系里，最容易让开发者产生"工具链不够聪明"错觉的，往往不是下载、缓存，也不是 `replace`、`vendor`，而是版本选择。

@@ -1,12 +1,15 @@
 ---
-slug: "redis-16"
-title: "16 混合持久化：为什么 RDB 和 AOF 要组合"
-description: "RDB 恢复快但丢数据窗口大，AOF 数据更完整但重放慢。混合持久化尝试把两者组合：AOF 文件前半段使用 RDB 格式保存基线，后半段追加增量写命令，让恢复速度和数据完整性同时更可控。"
-date: "2026-05-26"
-tag: "Go / Cache"
-readTime: "3 min"
+slug: redis-16
+title: 16 混合持久化：为什么 RDB 和 AOF 要组合
+description: RDB 恢复快但丢数据窗口大，AOF 数据更完整但重放慢。混合持久化尝试把两者组合：AOF 文件前半段使用 RDB 格式保存基线，后半段追加增量写命令，让恢复速度和数据完整性同时更可控。
+date: '2026-05-26'
+tag: Go / Cache
+readTime: 3 min
 top: false
 featured: false
+series: Redis 核心原理与实战
+seriesSlug: redis-core
+seriesOrder: 16
 ---
 # 16 混合持久化：为什么 RDB 和 AOF 要组合
 

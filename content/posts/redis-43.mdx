@@ -1,12 +1,15 @@
 ---
-slug: "redis-43"
-title: "43 删除数据后为什么内存还是很高"
-description: "很多人看到 DEL 后 DBSIZE 降了，但 top 或 INFO memory 里的内存仍然很高，就会怀疑 Redis 泄漏。实际上，这常常是 allocator、内存碎片、RSS 回收、后台释放和操作系统页管理..."
-date: "2026-05-26"
-tag: "Go / Cache"
-readTime: "3 min"
+slug: redis-43
+title: 43 删除数据后为什么内存还是很高
+description: 很多人看到 DEL 后 DBSIZE 降了，但 top 或 INFO memory 里的内存仍然很高，就会怀疑 Redis 泄漏。实际上，这常常是 allocator、内存碎片、RSS 回收、后台释放和操作系统页管理...
+date: '2026-05-26'
+tag: Go / Cache
+readTime: 3 min
 top: false
 featured: false
+series: Redis 核心原理与实战
+seriesSlug: redis-core
+seriesOrder: 43
 ---
 # 43 删除数据后为什么内存还是很高
 

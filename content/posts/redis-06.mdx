@@ -1,12 +1,15 @@
 ---
-slug: "redis-06"
-title: "Pipeline 为什么能提升吞吐"
-description: "单条 Redis 命令很快，但应用一次次同步发送命令仍可能很慢。Pipeline 的价值在于减少网络往返，而不是让 Redis 并行执行命令。本章解释它的收益、边界和风险。"
-date: "2026-05-26"
-tag: "Go / Cache"
-readTime: "3 min"
+slug: redis-06
+title: Pipeline 为什么能提升吞吐
+description: 单条 Redis 命令很快，但应用一次次同步发送命令仍可能很慢。Pipeline 的价值在于减少网络往返，而不是让 Redis 并行执行命令。本章解释它的收益、边界和风险。
+date: '2026-05-26'
+tag: Go / Cache
+readTime: 3 min
 top: false
 featured: false
+series: Redis 核心原理与实战
+seriesSlug: redis-core
+seriesOrder: 6
 ---
 # Pipeline 为什么能提升吞吐
 

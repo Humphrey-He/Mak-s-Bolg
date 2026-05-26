@@ -1,14 +1,16 @@
 ---
-slug: "kubernetes-deployment-backend-service"
-title: "Kubernetes Deployment：生产级后端服务发布模型"
-description: "从 Deployment、ReplicaSet、Pod 的控制关系出发，讲清滚动发布、三类探针、资源约束、优雅退出、安全上下文、PDB、拓扑分布和镜像不可变发布。"
-date: "2026-05-17"
-tag: "Cloud Native"
-readTime: "32 min"
+slug: kubernetes-deployment-backend-service
+title: Kubernetes Deployment：生产级后端服务发布模型
+description: 从 Deployment、ReplicaSet、Pod 的控制关系出发，讲清滚动发布、三类探针、资源约束、优雅退出、安全上下文、PDB、拓扑分布和镜像不可变发布。
+date: '2026-05-17'
+tag: Cloud Native
+readTime: 32 min
 top: false
 featured: false
+series: Kubernetes
+seriesSlug: kubernetes
+seriesOrder: 999
 ---
-
 ## 为什么后端服务需要 Deployment
 
 后端服务上线后，最基本的要求不是“能启动一个容器”，而是能稳定运行多个副本、发布新版本时不中断、出问题时可以回滚。直接创建裸 Pod 做不到这些，Deployment 才是无状态后端服务最常用的管理对象。

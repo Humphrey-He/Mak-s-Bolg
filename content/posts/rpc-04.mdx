@@ -1,12 +1,15 @@
 ---
-slug: "rpc-04"
-title: "04 网络通信：RPC 框架在网络通信上更倾向于哪种网络 IO 模型"
-description: "RPC 最终要通过网络发送字节。协议和序列化解决了“发什么”，网络通信解决的是“怎么高效地发”。在低并发场景，一个连接一个线程也能跑；到了高并发、长连接、多服务调用的场景，IO 模型就会直接影响吞吐、延迟和资源成本。"
-date: "2026-05-26"
-tag: "Architecture"
-readTime: "4 min"
+slug: rpc-04
+title: 04 网络通信：RPC 框架在网络通信上更倾向于哪种网络 IO 模型
+description: RPC 最终要通过网络发送字节。协议和序列化解决了“发什么”，网络通信解决的是“怎么高效地发”。在低并发场景，一个连接一个线程也能跑；到了高并发、长连接、多服务调用的场景，IO 模型就会直接影响吞吐、延迟和资源成本。
+date: '2026-05-26'
+tag: Architecture
+readTime: 4 min
 top: false
 featured: false
+series: RPC 核心原理与实战
+seriesSlug: rpc-core
+seriesOrder: 4
 ---
 # 04 网络通信：RPC 框架在网络通信上更倾向于哪种网络 IO 模型
 

@@ -1,14 +1,16 @@
 ---
-slug: "kubernetes-canary-upgrade"
-title: "Kubernetes 集群升级灰度方案设计：从兼容矩阵到节点池迁移"
-description: "围绕控制面、节点池、etcd、Webhook、CNI、CSI、CoreDNS、Ingress Controller、PDB、观测指标和回滚边界设计生产级集群升级方案。"
-date: "2026-04-12"
-tag: "Cloud Native"
-readTime: "30 min"
+slug: kubernetes-canary-upgrade
+title: Kubernetes 集群升级灰度方案设计：从兼容矩阵到节点池迁移
+description: 围绕控制面、节点池、etcd、Webhook、CNI、CSI、CoreDNS、Ingress Controller、PDB、观测指标和回滚边界设计生产级集群升级方案。
+date: '2026-04-12'
+tag: Cloud Native
+readTime: 30 min
 top: true
 featured: false
+series: Kubernetes
+seriesSlug: kubernetes
+seriesOrder: 999
 ---
-
 ## 集群升级为什么不能只看命令
 
 Kubernetes 集群升级最难的部分，通常不是命令，而是**风险边界、兼容性和回滚设计**。

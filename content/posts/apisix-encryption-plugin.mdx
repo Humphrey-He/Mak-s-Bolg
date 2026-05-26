@@ -1,13 +1,16 @@
 ---
-slug: "apisix-encryption-plugin"
-title: "APISIX 网关加解密插件设计笔记"
-description: "基于 apisix-go-plugin-runner 实现请求加密、响应解密、策略选择和多版本密钥管理。"
-date: "2026-04-08"
-tag: "Gateway"
-readTime: "14 min"
+slug: apisix-encryption-plugin
+title: APISIX 网关加解密插件设计笔记
+description: 基于 apisix-go-plugin-runner 实现请求加密、响应解密、策略选择和多版本密钥管理。
+date: '2026-04-08'
+tag: Gateway
+readTime: 14 min
 top: true
+series: 网关与 APISIX
+seriesSlug: gateway-apisix
+seriesOrder: 1
+featured: false
 ---
-
 ## 为什么要把能力放在网关层
 
 加解密如果分散在每个服务里，维护成本会很快失控。把它放到 APISIX 这一层，最大的收益是：

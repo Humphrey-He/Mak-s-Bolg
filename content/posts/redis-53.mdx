@@ -1,12 +1,15 @@
 ---
-slug: "redis-53"
-title: "53 LRU LFU和LazyFree的源码实现"
-description: "Redis 的淘汰和删除机制看似简单：内存满了淘汰，删除 key 就释放。但源码里为了性能做了大量近似和异步化设计。本章解释 LRU、LFU、Lazy Free 的实现思路。"
-date: "2026-05-26"
-tag: "Go / Cache"
-readTime: "3 min"
+slug: redis-53
+title: 53 LRU LFU和LazyFree的源码实现
+description: Redis 的淘汰和删除机制看似简单：内存满了淘汰，删除 key 就释放。但源码里为了性能做了大量近似和异步化设计。本章解释 LRU、LFU、Lazy Free 的实现思路。
+date: '2026-05-26'
+tag: Go / Cache
+readTime: 3 min
 top: false
 featured: false
+series: Redis 核心原理与实战
+seriesSlug: redis-core
+seriesOrder: 53
 ---
 # 53 LRU LFU和LazyFree的源码实现
 

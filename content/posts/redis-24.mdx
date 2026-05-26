@@ -1,12 +1,15 @@
 ---
-slug: "redis-24"
-title: "24 脑裂与数据丢失：Redis 高可用中的危险边界"
-description: "Redis 主从和哨兵能自动切换，但网络分区可能让旧主继续接收写入，新主也开始服务，形成脑裂。本章讨论脑裂如何发生、为什么会丢数据，以及 Redis 能提供哪些防护边界。"
-date: "2026-05-26"
-tag: "Go / Cache"
-readTime: "3 min"
+slug: redis-24
+title: 24 脑裂与数据丢失：Redis 高可用中的危险边界
+description: Redis 主从和哨兵能自动切换，但网络分区可能让旧主继续接收写入，新主也开始服务，形成脑裂。本章讨论脑裂如何发生、为什么会丢数据，以及 Redis 能提供哪些防护边界。
+date: '2026-05-26'
+tag: Go / Cache
+readTime: 3 min
 top: false
 featured: false
+series: Redis 核心原理与实战
+seriesSlug: redis-core
+seriesOrder: 24
 ---
 # 24 脑裂与数据丢失：Redis 高可用中的危险边界
 

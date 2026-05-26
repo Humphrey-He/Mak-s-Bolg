@@ -1,12 +1,15 @@
 ---
-slug: "redis-11"
-title: "ZSet 为什么能同时支持点查和范围查"
-description: "ZSet 能做排行榜、延迟队列、权重排序和时间线。它为什么既能按 member 快速查 score，又能按 score 做范围查询？答案在 dict + skiplist 的双结构设计。"
-date: "2026-05-26"
-tag: "Go / Cache"
-readTime: "3 min"
+slug: redis-11
+title: ZSet 为什么能同时支持点查和范围查
+description: ZSet 能做排行榜、延迟队列、权重排序和时间线。它为什么既能按 member 快速查 score，又能按 score 做范围查询？答案在 dict + skiplist 的双结构设计。
+date: '2026-05-26'
+tag: Go / Cache
+readTime: 3 min
 top: false
 featured: false
+series: Redis 核心原理与实战
+seriesSlug: redis-core
+seriesOrder: 11
 ---
 # ZSet 为什么能同时支持点查和范围查
 

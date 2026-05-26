@@ -1,14 +1,16 @@
 ---
-slug: "kubernetes-release-strategies"
-title: "Kubernetes 发布策略：滚动发布、蓝绿发布与灰度发布"
-description: "从 Deployment RollingUpdate 出发，理解后端服务如何在 Kubernetes 中发布、观察、回滚，并设计蓝绿和灰度发布链路。"
-date: "2026-05-15"
-tag: "Cloud Native"
-readTime: "21 min"
+slug: kubernetes-release-strategies
+title: Kubernetes 发布策略：滚动发布、蓝绿发布与灰度发布
+description: 从 Deployment RollingUpdate 出发，理解后端服务如何在 Kubernetes 中发布、观察、回滚，并设计蓝绿和灰度发布链路。
+date: '2026-05-15'
+tag: Cloud Native
+readTime: 21 min
 top: false
 featured: false
+series: Kubernetes
+seriesSlug: kubernetes
+seriesOrder: 999
 ---
-
 后端服务上线不是把镜像 tag 改掉这么简单。一次可靠发布至少包含镜像构建、配置变更、数据库兼容、流量切换、监控观察和失败回滚。Kubernetes 提供了 Deployment 的滚动更新能力，但蓝绿发布和灰度发布还需要配合 Service、Ingress、网关或服务网格。
 
 发布策略的目标不是追求复杂，而是在“变更速度”和“故障半径”之间做权衡。内部后台服务可能用默认滚动发布就足够，核心交易链路则需要更细的灰度和回滚控制。

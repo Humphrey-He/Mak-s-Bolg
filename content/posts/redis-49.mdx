@@ -1,12 +1,15 @@
 ---
-slug: "redis-49"
-title: "49 dict与渐进式rehash"
-description: "Redis 的 key 空间、Hash 对象、Set 对象都大量依赖哈希表。哈希表扩容如果一次性搬迁所有元素，会阻塞主线程。Redis 通过双哈希表和渐进式 rehash，把大搬迁拆成很多小步。"
-date: "2026-05-26"
-tag: "Go / Cache"
-readTime: "3 min"
+slug: redis-49
+title: 49 dict与渐进式rehash
+description: Redis 的 key 空间、Hash 对象、Set 对象都大量依赖哈希表。哈希表扩容如果一次性搬迁所有元素，会阻塞主线程。Redis 通过双哈希表和渐进式 rehash，把大搬迁拆成很多小步。
+date: '2026-05-26'
+tag: Go / Cache
+readTime: 3 min
 top: false
 featured: false
+series: Redis 核心原理与实战
+seriesSlug: redis-core
+seriesOrder: 49
 ---
 # 49 dict与渐进式rehash
 

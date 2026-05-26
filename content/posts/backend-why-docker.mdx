@@ -1,14 +1,16 @@
 ---
-slug: "backend-why-docker"
-title: "后端为什么需要 Docker：从环境一致性到可交付运行单元"
-description: "面向后端开发者解释 Docker 解决的真实工程问题：环境差异、依赖封装、容器运行、镜像交付与基础命令。"
-date: "2026-05-12"
-tag: "Cloud Native"
-readTime: "18 min"
+slug: backend-why-docker
+title: 后端为什么需要 Docker：从环境一致性到可交付运行单元
+description: 面向后端开发者解释 Docker 解决的真实工程问题：环境差异、依赖封装、容器运行、镜像交付与基础命令。
+date: '2026-05-12'
+tag: Cloud Native
+readTime: 18 min
 top: false
 featured: false
+series: Docker
+seriesSlug: docker
+seriesOrder: 999
 ---
-
 ## 这篇解决什么问题
 
 后端开发最熟悉的一句话是：“我本地能跑。”它通常不是借口，而是事实：本地有正确的 JDK、Node、Go 版本，有某个系统库，有配置文件，有一个恰好没被占用的端口，还有一份没写进文档的启动顺序。到了测试机或生产机，任何一个条件变化，服务都可能启动失败。

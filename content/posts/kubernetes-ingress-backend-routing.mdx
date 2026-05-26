@@ -1,14 +1,16 @@
 ---
-slug: "kubernetes-ingress-backend-routing"
-title: "Kubernetes Ingress：后端服务的 HTTP 入口和路由"
-description: "从后端视角理解 Ingress、Ingress Controller、域名、路径、TLS 与 Service 之间的关系。"
-date: "2026-05-13"
-tag: "Cloud Native"
-readTime: "19 min"
+slug: kubernetes-ingress-backend-routing
+title: Kubernetes Ingress：后端服务的 HTTP 入口和路由
+description: 从后端视角理解 Ingress、Ingress Controller、域名、路径、TLS 与 Service 之间的关系。
+date: '2026-05-13'
+tag: Cloud Native
+readTime: 19 min
 top: false
 featured: false
+series: Kubernetes
+seriesSlug: kubernetes
+seriesOrder: 999
 ---
-
 ## 这篇解决什么问题
 
 Service 解决的是集群内部访问，但真实业务还需要从浏览器、网关、移动端或第三方系统进入集群。你当然可以把每个服务都做成 LoadBalancer，但这样会让公网入口、证书、域名、转发规则分散在很多地方，后续很难治理。

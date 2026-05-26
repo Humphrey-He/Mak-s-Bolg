@@ -1,12 +1,15 @@
 ---
-slug: "rpc-15"
-title: "15 熔断限流：业务如何实现自我保护"
-description: "在分布式系统里，故障很少停在原地。一个下游变慢，可能拖住上游线程池；上游线程池耗尽，又会影响更多入口请求；入口请求堆积后，用户继续刷新，流量进一步变大。最后真正压垮系统的，可能不是最初那个故障，而是系统没有及时自我保..."
-date: "2026-05-26"
-tag: "Architecture"
-readTime: "3 min"
+slug: rpc-15
+title: 15 熔断限流：业务如何实现自我保护
+description: 在分布式系统里，故障很少停在原地。一个下游变慢，可能拖住上游线程池；上游线程池耗尽，又会影响更多入口请求；入口请求堆积后，用户继续刷新，流量进一步变大。最后真正压垮系统的，可能不是最初那个故障，而是系统没有及时自我保...
+date: '2026-05-26'
+tag: Architecture
+readTime: 3 min
 top: false
 featured: false
+series: RPC 核心原理与实战
+seriesSlug: rpc-core
+seriesOrder: 15
 ---
 # 15 熔断限流：业务如何实现自我保护
 

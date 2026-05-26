@@ -60,6 +60,23 @@ export default defineConfig({
           },
           {
             type: "string",
+            name: "series",
+            label: "系列栏目",
+            description: "例如 Redis 核心原理与实战、Kubernetes、Go Modules",
+          },
+          {
+            type: "string",
+            name: "seriesSlug",
+            label: "系列 Slug",
+            description: "稳定英文标识，例如 redis-core、kubernetes、go-modules",
+          },
+          {
+            type: "number",
+            name: "seriesOrder",
+            label: "系列内排序",
+          },
+          {
+            type: "string",
             name: "readTime",
             label: "阅读时间",
           },

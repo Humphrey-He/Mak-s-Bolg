@@ -1,14 +1,16 @@
 ---
-slug: "kafka-sarama-consumer-lag-troubleshooting"
-title: "Kafka 消费堆积排障框架：先分层再定根因，不要先怀疑 Kafka"
-description: "Sarama 消费堆积的 6 种根因分类与对应的解决方向：session 不稳、业务处理慢、提交错位、热点 partition、下游依赖阻塞、拉取层失效。"
-date: "2026-05-09"
-tag: "Go / Cache"
-readTime: "18 min"
+slug: kafka-sarama-consumer-lag-troubleshooting
+title: Kafka 消费堆积排障框架：先分层再定根因，不要先怀疑 Kafka
+description: Sarama 消费堆积的 6 种根因分类与对应的解决方向：session 不稳、业务处理慢、提交错位、热点 partition、下游依赖阻塞、拉取层失效。
+date: '2026-05-09'
+tag: Go / Cache
+readTime: 18 min
 top: false
 featured: false
+series: Kafka / Sarama
+seriesSlug: kafka-sarama
+seriesOrder: 999
 ---
-
 > **核心观点：** 在 Sarama 里看"消费堆积"，不要先问"是不是 Kafka 慢"，而要先判断：**堆积到底卡在了哪一层。** 因为同样是 lag 上升，根因可能完全不同。
 
 ---

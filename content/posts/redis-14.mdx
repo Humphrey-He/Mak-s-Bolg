@@ -1,12 +1,15 @@
 ---
-slug: "redis-14"
-title: "14 RDB：Redis 如何生成内存快照"
-description: "RDB 解决的是“如何把某个时刻的内存数据保存成可快速加载的快照”。它不是逐条记录写命令，而是周期性地把数据集序列化到磁盘文件中。理解 RDB，关键不是只会配置 save，而是要知道 fork、COW、磁盘写入和恢复..."
-date: "2026-05-26"
-tag: "Go / Cache"
-readTime: "3 min"
+slug: redis-14
+title: 14 RDB：Redis 如何生成内存快照
+description: RDB 解决的是“如何把某个时刻的内存数据保存成可快速加载的快照”。它不是逐条记录写命令，而是周期性地把数据集序列化到磁盘文件中。理解 RDB，关键不是只会配置 save，而是要知道 fork、COW、磁盘写入和恢复...
+date: '2026-05-26'
+tag: Go / Cache
+readTime: 3 min
 top: false
 featured: false
+series: Redis 核心原理与实战
+seriesSlug: redis-core
+seriesOrder: 14
 ---
 # 14 RDB：Redis 如何生成内存快照
 

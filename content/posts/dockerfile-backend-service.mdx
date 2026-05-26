@@ -1,14 +1,16 @@
 ---
-slug: "dockerfile-backend-service"
-title: "Dockerfile 如何描述一个后端服务：可重复构建、安全运行与生产模板"
-description: "从后端服务视角讲清 Dockerfile、BuildKit 缓存、多阶段构建、secret mount、非 root 用户、OCI label、ENTRYPOINT、优雅退出和健康检查。"
-date: "2026-05-14"
-tag: "Cloud Native"
-readTime: "32 min"
+slug: dockerfile-backend-service
+title: Dockerfile 如何描述一个后端服务：可重复构建、安全运行与生产模板
+description: 从后端服务视角讲清 Dockerfile、BuildKit 缓存、多阶段构建、secret mount、非 root 用户、OCI label、ENTRYPOINT、优雅退出和健康检查。
+date: '2026-05-14'
+tag: Cloud Native
+readTime: 32 min
 top: false
 featured: false
+series: Docker
+seriesSlug: docker
+seriesOrder: 999
 ---
-
 ## 这篇解决什么问题
 
 Dockerfile 不是“把本机环境打包一下”的脚本，而是定义一个后端服务如何从源码变成可重复构建、可分发、可运行镜像的过程。

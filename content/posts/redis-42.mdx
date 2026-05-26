@@ -1,12 +1,15 @@
 ---
-slug: "redis-42"
-title: "42 CPU结构为什么会影响Redis性能"
-description: "Redis 大部分命令在主线程执行，看起来只要给它一个高主频 CPU 就够了。但在多核、多 NUMA 节点、云主机虚拟化、网卡多队列环境下，CPU 拓扑会直接影响内存访问、网络中断、线程调度和尾延迟。"
-date: "2026-05-26"
-tag: "Go / Cache"
-readTime: "3 min"
+slug: redis-42
+title: 42 CPU结构为什么会影响Redis性能
+description: Redis 大部分命令在主线程执行，看起来只要给它一个高主频 CPU 就够了。但在多核、多 NUMA 节点、云主机虚拟化、网卡多队列环境下，CPU 拓扑会直接影响内存访问、网络中断、线程调度和尾延迟。
+date: '2026-05-26'
+tag: Go / Cache
+readTime: 3 min
 top: false
 featured: false
+series: Redis 核心原理与实战
+seriesSlug: redis-core
+seriesOrder: 42
 ---
 # 42 CPU结构为什么会影响Redis性能
 

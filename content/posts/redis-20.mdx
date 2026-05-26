@@ -1,12 +1,15 @@
 ---
-slug: "redis-20"
-title: "20 哨兵 Leader 选举与 Raft 思想"
-description: "多个 Sentinel 都能发现主库故障，但不能大家同时执行故障转移。本章解释 Sentinel 如何选出一个 Leader，并借 Raft 的任期、投票和多数派思想理解它的工程简化。"
-date: "2026-05-26"
-tag: "Go / Cache"
-readTime: "3 min"
+slug: redis-20
+title: 20 哨兵 Leader 选举与 Raft 思想
+description: 多个 Sentinel 都能发现主库故障，但不能大家同时执行故障转移。本章解释 Sentinel 如何选出一个 Leader，并借 Raft 的任期、投票和多数派思想理解它的工程简化。
+date: '2026-05-26'
+tag: Go / Cache
+readTime: 3 min
 top: false
 featured: false
+series: Redis 核心原理与实战
+seriesSlug: redis-core
+seriesOrder: 20
 ---
 # 20 哨兵 Leader 选举与 Raft 思想
 

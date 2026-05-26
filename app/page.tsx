@@ -5,11 +5,12 @@ import { AgentFeatureCard } from "@/components/home/AgentFeatureCard";
 import { PersonaLab } from "@/components/home/PersonaLab";
 import { BlogList } from "@/components/blog/BlogList";
 import { BackendSection } from "@/components/backend/BackendSection";
-import { getAllPosts, getPostTags } from "@/lib/posts";
+import { getAllPosts, getPostSeries, getPostTags } from "@/lib/posts";
 
 export default function HomePage() {
   const posts = getAllPosts();
   const tags = getPostTags();
+  const series = getPostSeries();
 
   return (
     <SiteShell>
@@ -17,7 +18,7 @@ export default function HomePage() {
       <StartHere />
       <AgentFeatureCard />
       <PersonaLab />
-      <BlogList posts={posts} tags={tags} />
+      <BlogList posts={posts} tags={tags} series={series} />
       <BackendSection />
     </SiteShell>
   );

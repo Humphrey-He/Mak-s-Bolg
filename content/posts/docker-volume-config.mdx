@@ -1,14 +1,16 @@
 ---
-slug: "docker-volume-config"
-title: "Docker 数据卷与配置：数据库文件、日志和配置怎么处理"
-description: "解释容器文件系统的临时性、Docker volume、宿主机挂载、配置注入方式和后端服务数据持久化检查清单。"
-date: "2026-05-16"
-tag: "Cloud Native"
-readTime: "19 min"
+slug: docker-volume-config
+title: Docker 数据卷与配置：数据库文件、日志和配置怎么处理
+description: 解释容器文件系统的临时性、Docker volume、宿主机挂载、配置注入方式和后端服务数据持久化检查清单。
+date: '2026-05-16'
+tag: Cloud Native
+readTime: 19 min
 top: false
 featured: false
+series: Docker
+seriesSlug: docker
+seriesOrder: 999
 ---
-
 ## 这篇解决什么问题
 
 容器运行起来以后，很多后端开发者会自然地把文件写进容器：数据库数据、上传文件、日志、配置文件、临时缓存。短期看没问题，容器一删，问题就来了：数据没了，配置回滚了，日志也找不到了。

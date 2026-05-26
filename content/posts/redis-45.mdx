@@ -1,12 +1,15 @@
 ---
-slug: "redis-45"
-title: "45 异步机制如何避免单线程阻塞"
-description: "Redis 主线程负责命令执行，任何耗时操作都可能拖慢所有请求。但 Redis 并不是“只有一个线程”。它通过后台线程、子进程、lazy free、多 IO 线程等机制，把某些重活从主路径中移开。"
-date: "2026-05-26"
-tag: "Go / Cache"
-readTime: "3 min"
+slug: redis-45
+title: 45 异步机制如何避免单线程阻塞
+description: Redis 主线程负责命令执行，任何耗时操作都可能拖慢所有请求。但 Redis 并不是“只有一个线程”。它通过后台线程、子进程、lazy free、多 IO 线程等机制，把某些重活从主路径中移开。
+date: '2026-05-26'
+tag: Go / Cache
+readTime: 3 min
 top: false
 featured: false
+series: Redis 核心原理与实战
+seriesSlug: redis-core
+seriesOrder: 45
 ---
 # 45 异步机制如何避免单线程阻塞
 

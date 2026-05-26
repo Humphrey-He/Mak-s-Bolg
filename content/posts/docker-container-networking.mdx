@@ -1,14 +1,16 @@
 ---
-slug: "docker-container-networking"
-title: "Docker 容器网络：端口映射、服务互通与排障路径"
-description: "面向后端开发者讲清 Docker bridge、自定义网络、容器 DNS、expose 与 ports、host.docker.internal、网络命名空间和常见排障命令。"
-date: "2026-05-15"
-tag: "Cloud Native"
-readTime: "27 min"
+slug: docker-container-networking
+title: Docker 容器网络：端口映射、服务互通与排障路径
+description: 面向后端开发者讲清 Docker bridge、自定义网络、容器 DNS、expose 与 ports、host.docker.internal、网络命名空间和常见排障命令。
+date: '2026-05-15'
+tag: Cloud Native
+readTime: 27 min
 top: false
 featured: false
+series: Docker
+seriesSlug: docker
+seriesOrder: 999
 ---
-
 ## 这篇解决什么问题
 
 后端服务容器化后，最常见的问题不是代码错，而是“连不上”：浏览器访问宿主机端口失败，API 连不上 Redis，容器里访问 `localhost` 却不是想象中的服务，明明进程启动了但端口映射后外部仍然无法访问。

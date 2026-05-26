@@ -1,12 +1,15 @@
 ---
-slug: "redis-50"
-title: "50 ziplist quicklist listpack的内存设计"
-description: "Redis 很多对象在“小数据量”时不用普通链表或哈希表，而使用紧凑编码。ziplist、quicklist、listpack 的演进，体现了 Redis 在内存占用、访问效率和更新成本之间的不断平衡。"
-date: "2026-05-26"
-tag: "Go / Cache"
-readTime: "3 min"
+slug: redis-50
+title: 50 ziplist quicklist listpack的内存设计
+description: Redis 很多对象在“小数据量”时不用普通链表或哈希表，而使用紧凑编码。ziplist、quicklist、listpack 的演进，体现了 Redis 在内存占用、访问效率和更新成本之间的不断平衡。
+date: '2026-05-26'
+tag: Go / Cache
+readTime: 3 min
 top: false
 featured: false
+series: Redis 核心原理与实战
+seriesSlug: redis-core
+seriesOrder: 50
 ---
 # 50 ziplist quicklist listpack的内存设计
 

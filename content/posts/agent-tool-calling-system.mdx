@@ -1,14 +1,16 @@
 ---
-slug: "agent-tool-calling-system"
-title: "Agent 工具调用系统设计：从 Toolformer、Gorilla 到 Function Calling 与 Handoff"
-description: "系统分析 LLM Agent 的工具调用能力：模型如何学会使用工具、如何减少 API hallucination、如何设计 Agent 友好的工具，以及多 Agent Handoff 为什么本质上也是一种工具调用。"
-date: "2026-05-09"
-tag: "AI Agent"
-readTime: "22 min"
+slug: agent-tool-calling-system
+title: Agent 工具调用系统设计：从 Toolformer、Gorilla 到 Function Calling 与 Handoff
+description: 系统分析 LLM Agent 的工具调用能力：模型如何学会使用工具、如何减少 API hallucination、如何设计 Agent 友好的工具，以及多 Agent Handoff 为什么本质上也是一种工具调用。
+date: '2026-05-09'
+tag: AI Agent
+readTime: 22 min
 top: false
 featured: true
+series: AI Agent
+seriesSlug: ai-agent
+seriesOrder: 999
 ---
-
 如果说大语言模型提供了推理与生成能力，那么工具调用就是 Agent 走向真实世界的接口。
 
 没有工具调用，Agent 只能停留在"会说"的层面；有了工具调用，Agent 才能搜索资料、查询数据库、执行代码、操作文件、调用业务 API、转交任务，甚至参与完整工作流。

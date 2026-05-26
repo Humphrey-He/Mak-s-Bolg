@@ -1,14 +1,16 @@
 ---
-slug: "kubernetes-backend-deploy-chain"
-title: "Kubernetes 后端服务部署完整链路：从镜像到线上请求"
-description: "串起镜像 digest、Deployment、探针、Service、EndpointSlice、IngressClass、ConfigMap、Secret、PDB、HPA、调度分布和排障链路。"
-date: "2026-05-15"
-tag: "Cloud Native"
-readTime: "32 min"
+slug: kubernetes-backend-deploy-chain
+title: Kubernetes 后端服务部署完整链路：从镜像到线上请求
+description: 串起镜像 digest、Deployment、探针、Service、EndpointSlice、IngressClass、ConfigMap、Secret、PDB、HPA、调度分布和排障链路。
+date: '2026-05-15'
+tag: Cloud Native
+readTime: 32 min
 top: false
 featured: false
+series: Kubernetes
+seriesSlug: kubernetes
+seriesOrder: 999
 ---
-
 ## 这篇解决什么问题
 
 很多后端开发者第一次接触 Kubernetes 时，会把部署理解成“把 YAML apply 一下”。但线上请求真正命中服务，中间至少经过镜像仓库、Deployment、ReplicaSet、Pod、Service、EndpointSlice、Ingress Controller 和探针。任何一环不对，表现都可能是“接口不通”。

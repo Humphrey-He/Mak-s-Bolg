@@ -1,12 +1,16 @@
 ---
-title: "W-TinyLFU 缓存淘汰算法详解"
-description: "深入解析 W-TinyLFU 准入策略的数学原理与工程实现，包含布隆过滤器、SLFU 和 LRU 的协同工作机制。"
-date: "2026-05-08"
-tag: "Go / Cache"
-readTime: "15 min"
+title: W-TinyLFU 缓存淘汰算法详解
+description: 深入解析 W-TinyLFU 准入策略的数学原理与工程实现，包含布隆过滤器、SLFU 和 LRU 的协同工作机制。
+date: '2026-05-08'
+tag: Go / Cache
+readTime: 15 min
 top: true
+slug: wtinylfu-algorithm
+series: 工程实践随笔
+seriesSlug: engineering-notes
+seriesOrder: 999
+featured: false
 ---
-
 ## 背景
 
 在缓存系统中，如何高效地淘汰低价值数据、保留热点数据是一个核心问题。W-TinyLFU（Window TinyLFU）是一种结合了 **L**east **R**ecently **U**sed（最近最少使用）和 **F**requency **L**east **F**requently **U**sed（最不频繁使用）优点的准入策略。

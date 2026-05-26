@@ -1,12 +1,15 @@
 ---
-slug: "redis-09"
-title: "List 从 ziplist 到 quicklist/listpack 的演进"
-description: "Redis List 既能做列表，也常被用作简单队列。它的底层结构经历了 ziplist、linkedlist、quicklist、listpack 的演进。本章解释这条演进背后的内存、性能和工程取舍。"
-date: "2026-05-26"
-tag: "Go / Cache"
-readTime: "3 min"
+slug: redis-09
+title: List 从 ziplist 到 quicklist/listpack 的演进
+description: Redis List 既能做列表，也常被用作简单队列。它的底层结构经历了 ziplist、linkedlist、quicklist、listpack 的演进。本章解释这条演进背后的内存、性能和工程取舍。
+date: '2026-05-26'
+tag: Go / Cache
+readTime: 3 min
 top: false
 featured: false
+series: Redis 核心原理与实战
+seriesSlug: redis-core
+seriesOrder: 9
 ---
 # List 从 ziplist 到 quicklist/listpack 的演进
 

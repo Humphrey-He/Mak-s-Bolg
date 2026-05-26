@@ -1,12 +1,15 @@
 ---
-slug: "distributed-cache-10"
-title: "Memcached 内存管理和淘汰机制"
-description: "缓存系统最终都会遇到一个问题：内存不够时怎么办。对 Memcached 来说，这个问题尤其关键，因为它是纯内存组件，没有磁盘持久化兜底，也没有复杂的数据分层。写入一个新 item，要么找到合适空间，要么淘汰旧 ite..."
-date: "2026-05-26"
-tag: "Go / Cache"
-readTime: "4 min"
+slug: distributed-cache-10
+title: Memcached 内存管理和淘汰机制
+description: 缓存系统最终都会遇到一个问题：内存不够时怎么办。对 Memcached 来说，这个问题尤其关键，因为它是纯内存组件，没有磁盘持久化兜底，也没有复杂的数据分层。写入一个新 item，要么找到合适空间，要么淘汰旧 ite...
+date: '2026-05-26'
+tag: Go / Cache
+readTime: 4 min
 top: false
 featured: false
+series: 分布式缓存核心原理与实战
+seriesSlug: distributed-cache
+seriesOrder: 10
 ---
 # Memcached 内存管理和淘汰机制
 
