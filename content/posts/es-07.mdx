@@ -1,0 +1,300 @@
+---
+slug: "es-07"
+title: "索引管理与 Mapping 设计"
+description: "ES 的性能问题很多都不是查询写错造成的, 而是索引建模一开始就埋了雷: 字段类型不合适、动态字段爆炸、分片数量随意、text 和 keyword 混用、对象数组被错误建模。索引设计一旦上线, 后续修改成本往往很高。"
+date: "2026-05-26"
+tag: "Architecture"
+readTime: "3 min"
+top: false
+featured: false
+---
+# 索引管理与 Mapping 设计
+
+## 1. 这一章解决什么问题
+
+ES 的性能问题很多都不是查询写错造成的, 而是索引建模一开始就埋了雷: 字段类型不合适、动态字段爆炸、分片数量随意、text 和 keyword 混用、对象数组被错误建模。索引设计一旦上线, 后续修改成本往往很高。
+
+这篇文章围绕 index、settings、mapping、alias 和字段类型, 讲清楚生产环境如何设计一个可维护的 ES 索引。
+
+## 2. 核心概念
+
+| 概念 | 说明 | 建模要点 |
+|---|---|---|
+| Settings | 索引级配置 | 分片、副本、refresh、analysis 等 |
+| Mapping | 字段类型和索引方式 | 决定查询、排序、聚合能力 |
+| Alias | 索引别名 | 支持读写别名和零停机切换 |
+| Dynamic mapping | 自动识别字段类型 | 适合探索, 生产要限制 |
+| Multi-fields | 一个字段建立多个子字段 | `text` + `keyword` 最常见 |
+| Object | 普通 JSON 对象 | 数组对象会被扁平化, 可能错配 |
+| Nested | 嵌套对象 | 保留数组对象内部关系, 查询成本更高 |
+| Flattened | 扁平键值对象 | 治理未知字段和字段爆炸 |
+
+字段类型是 mapping 的核心。常用选择:
+
+| 业务含义 | 推荐类型 |
+|---|---|
+| 标题、正文、评论 | `text` |
+| 状态、枚举、标签、ID | `keyword` |
+| 金额 | `scaled_float` 或 `double` |
+| 数量、计数 | `integer`, `long` |
+| 时间 | `date` |
+| 开关 | `boolean` |
+| 地理位置 | `geo_point` |
+| 半结构化属性 | `flattened` |
+| 向量检索 | `dense_vector` |
+
+## 3. 原理拆解
+
+Mapping 不是“字段说明书”, 而是索引结构的声明。字段类型不同, 底层建立的结构不同。
+
+`text` 会走 analyzer, 生成倒排索引, 适合全文搜索。`keyword` 不分词, 适合精确过滤、排序、聚合。numeric/date 支持 BKD tree 等结构, 适合范围查询。keyword/numeric/date 默认通常有 doc_values, 用于排序和聚合。
+
+动态映射的风险在于 ES 会根据第一批数据猜类型。比如 `user_id` 第一次写入数字 `1001`, 可能被识别成 long; 后续写入 `u1001` 就失败。再比如日志中的任意 JSON 属性被全部展开成字段, 会迅速触发 mapping 爆炸。
+
+对象数组是另一个经典坑。普通 object 会被扁平化:
+
+```json
+{
+  "items": [
+    { "sku": "A", "price": 10 },
+    { "sku": "B", "price": 20 }
+  ]
+}
+```
+
+会类似变成:
+
+```json
+{
+  "items.sku": ["A", "B"],
+  "items.price": [10, 20]
+}
+```
+
+查询 `sku=A AND price=20` 可能误匹配。需要保留对象内部关系时应使用 `nested`。
+
+索引建模可以按下面的决策链路推进:
+
+```mermaid
+flowchart LR
+  A["业务查询与排序需求"] --> B["字段清单"]
+  B --> C["字段类型: text / keyword / date / numeric"]
+  C --> D["analyzer / normalizer"]
+  D --> E["分片与副本规划"]
+  E --> F["alias / rollover / ILM"]
+  F --> G["压测与慢查询校验"]
+```
+
+## 4. 使用示例
+
+### 4.1 商品索引建模
+
+先用 alias 规划读写入口, 后续重建索引时可以平滑切换:
+
+```http
+PUT products_v1
+{
+  "aliases": {
+    "products_read": {},
+    "products_write": {
+      "is_write_index": true
+    }
+  }
+}
+```
+
+```http
+PUT products-v1
+{
+  "settings": {
+    "number_of_shards": 3,
+    "number_of_replicas": 1,
+    "refresh_interval": "1s",
+    "index.mapping.total_fields.limit": 1000
+  },
+  "mappings": {
+    "dynamic": "strict",
+    "properties": {
+      "product_id": { "type": "keyword" },
+      "title": {
+        "type": "text",
+        "fields": {
+          "keyword": { "type": "keyword", "ignore_above": 256 }
+        }
+      },
+      "brand": { "type": "keyword" },
+      "category_id": { "type": "keyword" },
+      "price": { "type": "scaled_float", "scaling_factor": 100 },
+      "sales": { "type": "long" },
+      "online": { "type": "boolean" },
+      "tags": { "type": "keyword" },
+      "attrs": { "type": "flattened" },
+      "created_at": { "type": "date" },
+      "updated_at": { "type": "date" }
+    }
+  },
+  "aliases": {
+    "products-read": {},
+    "products-write": {
+      "is_write_index": true
+    }
+  }
+}
+```
+
+### 4.2 使用 alias 写入和查询
+
+```http
+POST products-write/_doc/sku-001
+{
+  "product_id": "sku-001",
+  "title": "无线蓝牙降噪耳机",
+  "brand": "soundplus",
+  "category_id": "c-earphone",
+  "price": 299.00,
+  "sales": 1024,
+  "online": true,
+  "tags": ["bluetooth", "noise-cancelling"],
+  "attrs": {
+    "color": "black",
+    "battery_hours": "30",
+    "origin": "CN"
+  },
+  "created_at": "2026-05-25T10:00:00+08:00",
+  "updated_at": "2026-05-25T10:00:00+08:00"
+}
+```
+
+```http
+GET products-read/_search
+{
+  "query": {
+    "bool": {
+      "must": [
+        { "match": { "title": "蓝牙耳机" } }
+      ],
+      "filter": [
+        { "term": { "online": true } },
+        { "range": { "price": { "lte": 300 } } },
+        { "term": { "attrs.color": "black" } }
+      ]
+    }
+  },
+  "sort": [
+    { "sales": "desc" }
+  ]
+}
+```
+
+### 4.3 nested 建模示例
+
+```http
+PUT orders-with-items
+{
+  "mappings": {
+    "properties": {
+      "order_id": { "type": "keyword" },
+      "items": {
+        "type": "nested",
+        "properties": {
+          "sku": { "type": "keyword" },
+          "price": { "type": "double" },
+          "quantity": { "type": "integer" }
+        }
+      }
+    }
+  }
+}
+```
+
+```http
+GET orders-with-items/_search
+{
+  "query": {
+    "nested": {
+      "path": "items",
+      "query": {
+        "bool": {
+          "filter": [
+            { "term": { "items.sku": "A" } },
+            { "range": { "items.price": { "gte": 10, "lte": 20 } } }
+          ]
+        }
+      }
+    }
+  }
+}
+```
+
+## 5. 工程取舍
+
+`dynamic: strict` 能提前暴露脏数据, 但对快速迭代不够友好。一个折中方式是核心业务字段 strict, 扩展属性放入 `flattened`。
+
+`nested` 能保证数组对象关系, 但查询和聚合成本更高, 内部会把嵌套对象作为隐藏文档处理。只有当你确实需要“同一个数组元素内的条件同时成立”时才使用。
+
+`flattened` 很适合日志标签、商品扩展属性、埋点参数, 但它不适合复杂范围查询和强类型统计。不要把所有字段都塞进 flattened 逃避建模。
+
+金额字段用 `scaled_float` 可以用整数存储小数, 在价格、金额这类固定精度场景更稳。需要科学计算或精度变化大时再考虑 double。
+
+分片数量要基于数据量和增长速度预估。单个 shard 过大恢复慢, 过小则元数据和查询 fan-out 成本高。日志类索引可以通过 rollover 控制 shard 大小, 业务索引则常结合容量规划和重建策略。
+
+## 6. 实战与排障
+
+### 6.1 零停机重建索引
+
+当 mapping 需要重大调整时, 通常不能直接修改旧字段类型, 而是新建索引并 reindex。
+
+```http
+POST _reindex
+{
+  "source": {
+    "index": "products-v1"
+  },
+  "dest": {
+    "index": "products-v2"
+  }
+}
+```
+
+切换别名:
+
+```http
+POST _aliases
+{
+  "actions": [
+    { "remove": { "index": "products-v1", "alias": "products-read" } },
+    { "remove": { "index": "products-v1", "alias": "products-write" } },
+    { "add": { "index": "products-v2", "alias": "products-read" } },
+    { "add": { "index": "products-v2", "alias": "products-write", "is_write_index": true } }
+  ]
+}
+```
+
+### 6.2 字段爆炸治理
+
+```http
+GET products-v1/_mapping
+GET products-v1/_field_caps?fields=*
+```
+
+治理手段:
+
+- 关闭或限制动态 mapping。
+- 使用 `dynamic_templates` 把未知字段统一映射到 keyword 或 flattened。
+- 对埋点参数、请求 header、用户自定义属性使用 flattened。
+- 设置合理的 `index.mapping.total_fields.limit`。
+- 在写入前清洗字段名, 防止高随机字段进入 mapping。
+
+### 6.3 常见 mapping 冲突
+
+多索引查询时如果同名字段类型不一致, Kibana 可视化和聚合会出问题。比如 `status` 在一天是 keyword, 另一天变成 long。解决方式是通过 index template 统一字段类型, 对历史数据 reindex 或隔离查询。
+
+## 7. 小结
+
+- Mapping 设计决定字段能否搜索、过滤、排序和聚合。
+- `text` 用于全文检索, `keyword` 用于精确匹配、排序和聚合。
+- 动态 mapping 适合探索, 生产要限制或显式设计。
+- object 数组会被扁平化, 需要保持对象关系时使用 nested。
+- flattened 是治理未知键值和字段爆炸的重要工具。
+- alias 是零停机重建索引的关键。
+- 分片、副本、refresh 和生命周期策略要结合数据增长和查询模式设计。

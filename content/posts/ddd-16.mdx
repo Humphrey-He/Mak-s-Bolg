@@ -1,0 +1,299 @@
+---
+slug: "ddd-16"
+title: "整洁架构和六边形架构如何支撑DDD"
+description: "DDD 负责回答“业务模型如何表达”，但它本身不自动保证模型能在代码里活得干净。现实项目里，领域对象经常被 Controller、ORM、RPC SDK、消息中间件牵着走：为了数据库映射暴露 setter，为了接口返..."
+date: "2026-05-26"
+tag: "Architecture"
+readTime: "5 min"
+top: false
+featured: false
+---
+# 整洁架构和六边形架构如何支撑DDD
+
+## 1. 解决什么问题
+
+DDD 负责回答“业务模型如何表达”，但它本身不自动保证模型能在代码里活得干净。现实项目里，领域对象经常被 Controller、ORM、RPC SDK、消息中间件牵着走：为了数据库映射暴露 setter，为了接口返回增加展示字段，为了调用三方系统把错误码写进聚合。
+
+整洁架构和六边形架构解决的正是这个落地问题：让业务核心位于系统中心，让框架、数据库、消息队列、外部系统都成为可替换的外部细节。它们不是 DDD 的替代品，而是 DDD 的工程保护壳。
+
+这篇文章重点讨论：
+
+- 整洁架构、六边形架构和 DDD 的关系。
+- 端口、适配器、用例、领域模型如何协作。
+- 在微服务代码中如何落地依赖倒置和边界隔离。
+
+## 2. 核心概念
+
+整洁架构强调“依赖规则”：源码依赖只能从外层指向内层。越靠内越稳定，越靠外越具体。领域实体、业务规则、用例不依赖框架；Web、DB、UI、消息队列等技术细节依赖内层定义的接口。
+
+六边形架构也叫端口与适配器架构。它把系统看成一个业务核心，外部世界通过端口与它交互：
+
+- 入站端口：外部驱动系统执行某个用例，例如 REST API、消息消费、定时任务。
+- 出站端口：系统为了完成用例需要访问外部能力，例如仓库、支付网关、库存服务、事件发布器。
+- 入站适配器：Controller、Consumer、Job 等，把外部协议转换为应用用例调用。
+- 出站适配器：RepositoryImpl、RpcClient、MessagePublisher 等，把内部端口转换为具体技术调用。
+
+和 DDD 对齐后，可以这样理解：
+
+```mermaid
+flowchart LR
+    subgraph Outside["外部世界"]
+      REST["REST 请求"]
+      MQIN["消息订阅"]
+      JOB["定时任务"]
+      DB["数据库"]
+      RPC["外部服务"]
+      MQOUT["消息队列"]
+    end
+
+    subgraph App["应用核心"]
+      INPORT["入站端口<br/>UseCase Interface"]
+      USECASE["应用用例<br/>Application Service"]
+      DOMAIN["领域模型<br/>Aggregate / VO / Domain Service"]
+      OUTPORT["出站端口<br/>Repository / Gateway / EventPublisher"]
+    end
+
+    REST --> ADAPTER1["入站适配器<br/>Controller"]
+    MQIN --> ADAPTER2["入站适配器<br/>Consumer"]
+    JOB --> ADAPTER3["入站适配器<br/>Scheduler"]
+    ADAPTER1 --> INPORT
+    ADAPTER2 --> INPORT
+    ADAPTER3 --> INPORT
+    INPORT --> USECASE --> DOMAIN
+    USECASE --> OUTPORT
+    ADAPTER4["出站适配器<br/>RepositoryImpl"] --> DB
+    ADAPTER5["出站适配器<br/>RpcGateway"] --> RPC
+    ADAPTER6["出站适配器<br/>EventPublisher"] --> MQOUT
+    OUTPORT <|.. ADAPTER4
+    OUTPORT <|.. ADAPTER5
+    OUTPORT <|.. ADAPTER6
+```
+
+这张图里最重要的是：适配器依赖端口，端口不依赖适配器。业务核心定义自己需要什么，外部技术负责满足它。
+
+## 3. 原理/方法拆解
+
+### 3.1 DDD 提供模型，架构提供边界
+
+DDD 的战术模式会告诉我们如何建模：实体有身份，值对象表达概念，聚合维护一致性，领域服务承载跨对象规则，领域事件表达已经发生的业务事实。
+
+但如果没有架构边界，这些模型很容易被技术细节侵蚀。例如支付聚合中直接调用 `AlipayClient`，订单实体里保存 `HttpServletRequest`，领域事件类上充满 MQ 框架注解。此时模型虽然叫领域模型，实际上已经被外部世界绑住。
+
+整洁架构和六边形架构提供的约束是：领域模型只表达业务。需要外部能力时，定义端口；外部细节通过适配器实现端口。
+
+### 3.2 用例是领域模型的入口
+
+在 DDD 项目中，不建议让 Controller 直接操作聚合。更稳妥的做法是由应用用例作为入口：
+
+```java
+public interface SubmitOrderUseCase {
+    OrderId submit(SubmitOrderCommand command);
+}
+```
+
+同等 Go 写法：
+
+```go
+type SubmitOrderUseCase interface {
+	Submit(command SubmitOrderCommand) (OrderID, error)
+}
+```
+
+Controller、消息消费者、定时任务都可以调用这个用例。它们只是不同入站适配器。这样做的好处是，同一个业务动作不会因为入口不同而复制多份逻辑。
+
+用例层通常承担这些职责：
+
+- 将外部输入转换为领域可理解的 Command。
+- 查询和保存聚合。
+- 调用领域行为或领域服务。
+- 控制事务边界。
+- 调用出站端口。
+- 发布领域事件或集成事件。
+
+用例层不应该承载复杂业务判断。它是剧场调度，不是演员本身。
+
+### 3.3 端口是业务核心对外部能力的声明
+
+端口不是为了抽象而抽象，而是业务核心对外部世界的需求声明。例如订单用例需要库存能力，但订单核心不应该知道库存服务是 HTTP、Dubbo、gRPC 还是本地库：
+
+```java
+public interface InventoryPort {
+    InventorySnapshot reserve(OrderId orderId, List<OrderItem> items);
+}
+```
+
+同等 Go 写法：
+
+```go
+type InventoryPort interface {
+	Reserve(orderID OrderID, items []OrderItem) (InventorySnapshot, error)
+}
+```
+
+基础设施层可以提供实现：
+
+```java
+@Component
+public class InventoryRpcAdapter implements InventoryPort {
+    private final InventoryClient client;
+
+    public InventorySnapshot reserve(OrderId orderId, List<OrderItem> items) {
+        InventoryReserveRequest request = InventoryRequestMapper.toRequest(orderId, items);
+        InventoryReserveResponse response = client.reserve(request);
+        return InventoryResponseMapper.toSnapshot(response);
+    }
+}
+```
+
+同等 Go 写法：
+
+```go
+type InventoryClient interface {
+	Reserve(request InventoryReserveRequest) (InventoryReserveResponse, error)
+}
+
+type InventoryRPCAdapter struct {
+	client InventoryClient
+}
+
+func (a InventoryRPCAdapter) Reserve(orderID OrderID, items []OrderItem) (InventorySnapshot, error) {
+	request := ToInventoryReserveRequest(orderID, items)
+	response, err := a.client.Reserve(request)
+	if err != nil {
+		return InventorySnapshot{}, err
+	}
+	return ToInventorySnapshot(response), nil
+}
+```
+
+这样外部服务协议变化时，主要修改适配器；业务核心仍然使用稳定的领域语言。
+
+### 3.4 反腐层是特殊的出站适配器
+
+当外部系统模型与本上下文语言不一致时，适配器还要承担反腐层职责。比如外部营销系统把“优惠券、红包、折扣码、活动补贴”都叫 `benefit`，而订单上下文需要明确区分优惠类型、使用门槛和分摊规则。此时不能把外部 `BenefitDTO` 直接传进领域模型，而应该在适配器中翻译成订单上下文自己的值对象。
+
+反腐层的价值不是“多写一层转换”，而是阻止外部模型污染本地统一语言。
+
+## 4. 实战落地
+
+### 4.1 目录结构示例
+
+以支付服务为例，可以把六边形架构和 DDD 分层合并成如下结构：
+
+```text
+payment-service
+  src/main/java/com/example/payment
+    adapter
+      in
+        web
+          PaymentController.java
+          PaymentRequest.java
+        mq
+          OrderCreatedConsumer.java
+      out
+        persistence
+          PaymentRepositoryAdapter.java
+          PaymentJpaEntity.java
+          PaymentJpaRepository.java
+        gateway
+          ThirdPartyPaymentAdapter.java
+        messaging
+          PaymentEventAdapter.java
+    application
+      port
+        in
+          CreatePaymentUseCase.java
+          ConfirmPaymentUseCase.java
+        out
+          PaymentRepositoryPort.java
+          PaymentGatewayPort.java
+          PaymentEventPort.java
+      service
+        PaymentApplicationService.java
+      command
+        CreatePaymentCommand.java
+    domain
+      Payment.java
+      PaymentId.java
+      PaymentStatus.java
+      Money.java
+      PaymentChannel.java
+      PaymentCreatedEvent.java
+```
+
+这种结构比简单的 `controller/service/dao` 更啰嗦，但边界更明确：
+
+- `adapter.in` 只负责把外部触发转换为入站端口调用。
+- `application.port.in` 定义系统能提供哪些用例。
+- `application.port.out` 定义用例需要哪些外部能力。
+- `adapter.out` 实现外部能力。
+- `domain` 保持纯粹的业务模型。
+
+### 4.2 依赖方向
+
+代码依赖可以按下面的规则控制：
+
+```text
+adapter.in  -> application.port.in
+application.service -> application.port.out + domain
+adapter.out -> application.port.out + domain
+domain -> domain only
+```
+
+领域层可以完全不认识 `adapter`。应用层知道端口，但不知道端口的具体实现。适配器知道应用核心，因为它要调用或实现核心定义的接口。
+
+### 4.3 事务边界与领域事件
+
+很多团队在六边形架构中会纠结：事务放哪里？事件在哪里发布？
+
+一般建议事务放在应用服务，因为应用服务代表一个用例边界。聚合内部只保证业务不变式，不负责开启数据库事务。
+
+领域事件可以由聚合产生，由应用服务收集，再交给出站端口发布。为了避免“数据库提交成功但消息发送失败”，生产环境常用 Outbox 模式：
+
+1. 聚合执行业务行为并产生领域事件。
+2. 应用服务在同一事务中保存聚合和事件记录。
+3. 异步任务或消息中继读取 Outbox 表并发布集成事件。
+4. 发布成功后标记事件状态。
+
+领域事件表达业务事实，集成事件面向跨上下文通信。两者可以同名，但不一定是同一个类。
+
+### 4.4 测试策略
+
+整洁架构的一个直接收益是测试更容易分层：
+
+- 领域模型测试：不启动 Spring，不连数据库，只验证业务规则。
+- 应用用例测试：用内存仓库或 mock 端口验证流程编排。
+- 适配器测试：验证 ORM 映射、RPC 协议、消息格式。
+- 契约测试：验证服务之间 API 或事件协议是否兼容。
+
+如果一个支付状态流转规则必须启动数据库、容器和 MQ 才能测试，说明领域规则已经被基础设施绑住了。
+
+## 5. 常见坑
+
+- 把六边形架构画成图，但代码仍然让领域模型直接调用外部 SDK。
+- 端口过度设计。每个小方法都抽接口，会让项目充满无意义抽象。端口应该围绕稳定的外部能力，而不是围绕每个技术类。
+- 入站端口和 Controller 一一对应。用例应该按业务动作划分，不是按 HTTP URL 划分。
+- 出站适配器泄漏外部模型。RPC Response、数据库 DO、第三方错误码直接进入领域层，会破坏统一语言。
+- 应用服务变成事务脚本。架构形态正确，但所有业务判断仍堆在 ApplicationService 里，领域模型没有行为。
+- 把整洁架构当成微服务拆分依据。整洁架构解决服务内部依赖，不能单独决定服务边界。
+- 为简单 CRUD 强行套完整端口适配器。低复杂度功能可以保持轻量，核心域才值得投入更强架构约束。
+
+## 6. 面试/复盘问题
+
+- 整洁架构和六边形架构的共同点是什么？
+- 端口和适配器分别解决什么问题？
+- DDD 的领域层为什么需要整洁架构保护？
+- 入站端口应该按接口协议划分，还是按业务用例划分？
+- 出站端口和防腐层是什么关系？
+- 事务应该放在应用层还是领域层？为什么？
+- 领域事件和集成事件有什么区别？
+- 如何判断一个端口是必要抽象，还是过度设计？
+- 六边形架构是否必然要求拆成多个 Maven module？
+
+## 7. 小结
+
+DDD 让我们找到业务模型，整洁架构和六边形架构让模型不被外部细节污染。前者偏建模，后者偏工程约束；两者结合，才能让领域模型在真实项目中长期演进。
+
+落地时要抓住三个关键词：依赖倒置、端口适配器、业务核心。业务核心定义语言和规则，端口声明所需能力，适配器处理技术世界的差异。
+
+好的架构不是让代码看起来更复杂，而是让复杂业务有地方安放，让技术变化不再频繁冲击领域模型。

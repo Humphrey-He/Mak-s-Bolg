@@ -1,0 +1,114 @@
+---
+slug: "redis-10"
+title: "Set 适合哪些集合计算，什么时候会慢"
+description: "Set 支持去重、交集、并集、差集，常用于标签、好友、抽奖、黑白名单。但集合计算一旦规模变大，很容易造成阻塞。本章讲清 intset、hashtable、复杂度和生产替代方案。"
+date: "2026-05-26"
+tag: "Go / Cache"
+readTime: "3 min"
+top: false
+featured: false
+---
+# Set 适合哪些集合计算，什么时候会慢
+
+## 1. 本章要解决的问题
+
+Set 支持去重、交集、并集、差集，常用于标签、好友、抽奖、黑白名单。但集合计算一旦规模变大，很容易造成阻塞。本章讲清 intset、hashtable、复杂度和生产替代方案。
+
+## 2. 核心观点
+
+Set 适合中小规模精确集合和成员判断。小整数集合使用 intset 节省内存，普通集合使用 hashtable。交并差是强大的能力，但大集合计算必须离线化、分批化或换模型。
+
+## 3. 原理拆解
+
+```mermaid
+flowchart TD
+    A[Set] --> B{元素是否全是整数且数量较小}
+    B -->|是| C[intset]
+    B -->|否| D[hashtable]
+    D --> E[SISMEMBER 平均 O(1)]
+    D --> F[SINTER/SUNION/SDIFF O(N)]
+    F --> G[大集合可能阻塞主线程]
+```
+
+intset 是有序整数数组，根据元素范围选择不同整数宽度，适合小整数集合。只要出现非整数元素或数量超过阈值，就会转换为 hashtable。
+
+Set 的成员判断很快，但集合运算本质要遍历元素。`SINTER` 会尽量从小集合开始，但总成本仍与参与集合规模相关。
+
+## 4. 命令与代码示例
+
+常用命令：
+
+```bash
+SADD user:1:tags java redis backend
+SISMEMBER user:1:tags redis
+SINTER user:1:tags job:backend:tags
+SCARD user:1:tags
+SSCAN user:1:tags 0 COUNT 100
+OBJECT ENCODING user:1:tags
+```
+
+好友共同关注：
+
+```bash
+SINTER following:1001 following:2002
+```
+
+大集合分批扫描：
+
+```python
+cursor = 0
+while True:
+    cursor, members = r.sscan("huge:set", cursor=cursor, count=500)
+    for m in members:
+        handle(m)
+    if cursor == 0:
+        break
+```
+
+## 5. 生产实践
+
+Set 建模适合：
+
+- 用户标签去重。
+- 活动参与用户去重。
+- 黑名单、白名单判断。
+- 中小规模共同好友、共同兴趣。
+
+大规模统计建议：
+
+- UV 估算用 HyperLogLog。
+- 是否存在用 Bloom Filter。
+- 复杂人群圈选放到离线数仓或搜索引擎。
+- 大集合交集提前预计算或异步计算。
+
+生产 checklist：
+
+- 对集合大小设置上限和告警。
+- 避免在线对多个大 Set 做 `SINTER`。
+- 使用 `SSCAN` 做后台任务扫描。
+- 按业务维度拆 key，例如按天、地域、租户拆分。
+
+## 6. 常见坑
+
+- 用 Set 存亿级用户再在线求交集。
+- 用 `SMEMBERS` 拉全量成员给接口返回。
+- 忽略 `SPOP count` 会修改集合，不适合只读抽样。
+- 大 key 迁移、删除和复制成本高。
+
+## 7. 面试追问
+
+- Set 的 intset 编码适合什么场景？
+- `SISMEMBER` 和 `SINTER` 复杂度有什么差异？
+- 如何治理大 Set？
+- 精确去重和近似去重如何选择？
+
+## 8. 章节笔记
+
+- Set 强在成员唯一性和集合运算。
+- 小整数集合用 intset，大集合用 hashtable。
+- 集合运算是 O(N) 类操作，要控制规模。
+- 大规模 UV、存在性判断不一定要用 Set。
+
+## 9. 小结
+
+Set 是业务建模里非常锋利的工具，适合精确集合，但不适合无限扩张。生产上要为集合规模画边界，必要时用 HLL、Bloom Filter 或离线系统替代。

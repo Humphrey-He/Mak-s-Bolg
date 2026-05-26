@@ -1,0 +1,166 @@
+---
+slug: "rpc-extra-03"
+title: "加餐 RPC 框架代码实例详解"
+description: "学 RPC 最容易卡在两个极端：只看框架 API，会觉得一切都很简单；直接读成熟框架源码，又容易被海量细节淹没。最好的过渡方式，是先实现一个迷你 RPC，把代理、协议、序列化、网络、服务注册和服务分发串起来，再回头看..."
+date: "2026-05-26"
+tag: "Architecture"
+readTime: "3 min"
+top: false
+featured: false
+---
+# 加餐 RPC 框架代码实例详解
+
+学 RPC 最容易卡在两个极端：只看框架 API，会觉得一切都很简单；直接读成熟框架源码，又容易被海量细节淹没。最好的过渡方式，是先实现一个迷你 RPC，把代理、协议、序列化、网络、服务注册和服务分发串起来，再回头看 Dubbo、gRPC、Thrift、Netty，很多设计就会变得清楚。
+
+## 本章要解决的问题
+
+本章不是追求写出生产级 RPC，而是通过一个 `mini-rpc` 的结构说明：
+
+- 一次远程调用在代码中如何流动。
+- RPC 框架最小闭环需要哪些模块。
+- 每个模块的扩展点应该放在哪里。
+- 从 Demo 走向生产框架还缺哪些能力。
+
+## 核心观点
+
+一个最小 RPC 框架至少包含六件事：
+
+- 接口代理：把本地方法调用转换为 RPC 请求。
+- 协议编解码：定义请求和响应的二进制边界。
+- 序列化：把参数对象转换成字节。
+- 网络传输：负责连接、发送、接收和异步匹配。
+- 服务分发：服务端根据服务名和方法名调用真实实现。
+- 注册发现：客户端知道服务端地址。
+
+不要一上来就做注册中心、限流、熔断、监控。先把一次调用闭环跑通，再逐步增加治理能力。
+
+## 原理拆解
+
+```mermaid
+flowchart LR
+    A[UserService 代理] --> B[InvocationHandler]
+    B --> C[RpcRequest]
+    C --> D[Serializer]
+    D --> E[Protocol Encoder]
+    E --> F[TCP Client]
+    F --> G[TCP Server]
+    G --> H[Protocol Decoder]
+    H --> I[Service Dispatcher]
+    I --> J[UserServiceImpl]
+    J --> K[RpcResponse]
+    K --> L[返回 Future/结果]
+```
+
+请求对象可以简化为：
+
+```java
+class RpcRequest {
+    String requestId;
+    String serviceName;
+    String methodName;
+    String[] parameterTypes;
+    Object[] arguments;
+    Map<String, String> attachments;
+}
+
+class RpcResponse {
+    String requestId;
+    int status;
+    Object result;
+    String errorMessage;
+}
+```
+
+协议头可以先设计成固定结构：
+
+| 字段 | 长度 | 说明 |
+| --- | --- | --- |
+| magic | 2 bytes | 魔数，识别协议 |
+| version | 1 byte | 协议版本 |
+| serializer | 1 byte | 序列化类型 |
+| messageType | 1 byte | 请求或响应 |
+| requestId | 8 bytes | 请求匹配 |
+| bodyLength | 4 bytes | 消息体长度 |
+
+## 工程实践
+
+### 1. 客户端代理
+
+代理层只做一件事：收集方法调用信息并交给 RPC Client。
+
+```java
+class RpcInvocationHandler implements InvocationHandler {
+    private final RpcClient client;
+    private final String serviceName;
+
+    public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+        RpcRequest request = new RpcRequest();
+        request.serviceName = serviceName;
+        request.methodName = method.getName();
+        request.parameterTypes = Arrays.stream(method.getParameterTypes())
+                .map(Class::getName)
+                .toArray(String[]::new);
+        request.arguments = args;
+        return client.invoke(request, method.getReturnType());
+    }
+}
+```
+
+### 2. 服务端分发
+
+服务端需要维护服务名到实现对象的映射。
+
+```java
+class ServiceDispatcher {
+    private final Map<String, Object> services = new ConcurrentHashMap<>();
+
+    RpcResponse dispatch(RpcRequest request) {
+        Object service = services.get(request.serviceName);
+        if (service == null) {
+            return RpcResponse.fail(request.requestId, "service not found");
+        }
+        try {
+            Class<?>[] types = resolveTypes(request.parameterTypes);
+            Method method = service.getClass().getMethod(request.methodName, types);
+            Object result = method.invoke(service, request.arguments);
+            return RpcResponse.success(request.requestId, result);
+        } catch (Exception e) {
+            return RpcResponse.fail(request.requestId, e.getMessage());
+        }
+    }
+}
+```
+
+### 3. 从 Demo 到生产的补齐清单
+
+- 网络层：连接池、心跳、断线重连、背压。
+- 协议层：版本兼容、压缩、状态码、扩展头。
+- 序列化：跨语言、schema 演进、反序列化安全。
+- 治理：超时、重试、路由、负载均衡、熔断限流。
+- 可观测：日志、指标、链路追踪。
+- 安全：认证、鉴权、TLS、防重放、审计。
+- 发布：优雅启动、优雅关闭、灰度和回滚。
+
+## 常见坑
+
+- Demo 里直接用 Java 原生序列化，忽略安全和跨语言问题。
+- 没有 requestId，异步响应无法正确匹配请求。
+- 协议没有长度字段，遇到 TCP 粘包半包就解析失败。
+- 服务端反射调用没有缓存 Method，性能抖动明显。
+- 把业务异常和框架异常混在一起返回。
+- 客户端没有超时控制，服务端一慢就无限等待。
+
+## 面试追问
+
+**问题 1：一个最小 RPC 框架为什么一定需要协议？**  
+TCP 只提供字节流，不提供消息边界。协议负责告诉接收方如何识别一条消息、如何解析头部、如何找到消息体和序列化方式。
+
+**问题 2：动态代理为什么是 RPC 的关键？**  
+动态代理把本地接口调用转换成统一的 `Invocation`，让业务代码不需要关心网络、序列化和服务发现，调用体验接近本地方法。
+
+**问题 3：Demo 和生产框架最大的差别是什么？**  
+Demo 证明链路可行，生产框架要处理异常、并发、兼容、治理、观测、安全和运维。两者复杂度差距主要来自不确定性。
+
+## 小结
+
+手写 mini-rpc 的价值，不在于替代成熟框架，而在于把 RPC 的骨架拆给自己看。只要你能清楚解释代理、协议、序列化、传输、分发和注册发现如何协作，再阅读 Dubbo 或 gRPC 源码时，就不会只看到零散类名，而能看到它们背后的设计分工。
