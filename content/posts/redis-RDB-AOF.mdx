@@ -1,0 +1,1218 @@
+# Redis 持久化机制：RDB 和 AOF 的原理、源码与生产取舍
+
+## 前言
+
+Redis 是内存数据库。它快，是因为大部分读写都发生在内存里。
+
+但这也带来一个非常关键的问题：
+
+```text id="zx22fl"
+Redis 数据会不会丢？
+```
+
+答案是：
+
+```text id="h4seab"
+会不会丢，取决于你怎么配置持久化、怎么部署高可用，以及你的业务是否把 Redis 当成唯一数据源。
+```
+
+Redis 提供两类核心持久化机制：
+
+```text id="by3yo2"
+RDB：快照持久化
+AOF：追加日志持久化
+```
+
+一句话区分：
+
+```text id="l2v90s"
+RDB 像定期拍照片；
+AOF 像记录每一次写操作。
+```
+
+RDB 适合做备份、恢复和冷启动；AOF 适合尽量降低数据丢失窗口。
+
+但它们都不是“绝对不丢数据”的银弹。
+
+站在开发角度，理解 RDB 和 AOF，是为了知道 Redis 宕机后业务会受到什么影响。
+
+站在架构角度，理解 RDB 和 AOF，是为了决定哪些数据能放 Redis，哪些必须以 MySQL、PostgreSQL、Kafka 或账务系统为准。
+
+站在源码角度，理解 RDB 和 AOF，是为了搞清楚 Redis 在什么时候 fork 子进程、什么时候追加日志、什么时候 fsync、什么时候重写 AOF，以及这些操作为什么会引起延迟抖动。
+
+本文重点拆解：
+
+```text id="lez4cr"
+1. Redis 为什么需要持久化？
+2. RDB 是怎么生成的？
+3. SAVE 和 BGSAVE 有什么区别？
+4. fork 和 Copy-On-Write 对 Redis 有什么影响？
+5. AOF 追加日志是怎么工作的？
+6. appendfsync always / everysec / no 有什么区别？
+7. AOF 重写为什么能压缩日志？
+8. Redis 7 Multi-Part AOF 解决了什么问题？
+9. RDB 和 AOF 怎么选？
+10. 宕机恢复时可能丢多少数据？
+11. 大厂生产环境如何配置 Redis 持久化？
+```
+
+---
+
+# 一、Redis 为什么需要持久化？
+
+Redis 的核心数据在内存里。
+
+如果没有持久化，Redis 进程退出、机器宕机、容器重启之后，内存数据就会消失。
+
+对于纯缓存场景，这不一定是问题。
+
+例如：
+
+```text id="eyxjr7"
+商品详情缓存
+用户资料缓存
+文章详情缓存
+接口结果缓存
+热点配置缓存
+```
+
+这些数据的源头在数据库里，Redis 只是加速层。Redis 挂了，最多是缓存丢失，系统可以从数据库重新加载。
+
+但如果 Redis 中保存了业务状态，例如：
+
+```text id="7q0cke"
+限流计数
+排行榜分数
+延迟队列任务
+Stream 消息
+用户会话
+临时库存
+分布式锁状态
+```
+
+这时 Redis 数据丢失就可能影响业务。
+
+所以讨论 Redis 持久化之前，必须先回答一个架构问题：
+
+```text id="m1q84d"
+Redis 是缓存，还是事实数据源？
+```
+
+如果 Redis 只是缓存：
+
+```text id="k49fwi"
+持久化的目标是加速恢复和降低缓存重建压力。
+```
+
+如果 Redis 承担状态存储：
+
+```text id="w6ycvj"
+持久化的目标是降低数据丢失窗口，但仍要接受 Redis 不是强事务数据库的事实。
+```
+
+如果是账务、订单、支付、库存最终扣减这类核心数据：
+
+```text id="mgyh7r"
+不要只依赖 Redis 持久化作为唯一可靠性保障。
+```
+
+---
+
+# 二、RDB：快照持久化
+
+## 1. RDB 是什么？
+
+RDB，全称 Redis Database Backup file，可以理解为 Redis 在某个时间点上的数据快照。
+
+Redis 会把内存中的数据以紧凑的二进制格式保存到磁盘文件中，默认文件名通常是：
+
+```text id="z6ztib"
+dump.rdb
+```
+
+RDB 的本质是：
+
+```text id="crn9zn"
+把某一时刻的 Redis 数据集整体保存下来。
+```
+
+它不是记录每条命令，而是保存最终数据状态。
+
+例如某个 key 被多次修改：
+
+```text id="rrh4a1"
+SET counter 1
+INCR counter
+INCR counter
+INCR counter
+```
+
+RDB 里最终只会保存：
+
+```text id="ubtait"
+counter = 4
+```
+
+这也是 RDB 文件通常比较紧凑的原因。
+
+---
+
+## 2. RDB 如何触发？
+
+RDB 常见触发方式有三种：
+
+```text id="kb4sb8"
+1. 手动执行 SAVE
+2. 手动执行 BGSAVE
+3. 配置 save 规则自动触发
+```
+
+配置示例：
+
+```text id="xh1ahf"
+save 900 1
+save 300 10
+save 60 10000
+```
+
+含义是：
+
+```text id="peq21v"
+900 秒内至少 1 次写入，触发 BGSAVE
+300 秒内至少 10 次写入，触发 BGSAVE
+60 秒内至少 10000 次写入，触发 BGSAVE
+```
+
+---
+
+## 3. SAVE 和 BGSAVE 的区别
+
+### SAVE
+
+`SAVE` 会由 Redis 主线程直接执行 RDB 保存。
+
+问题是：
+
+```text id="qp9brw"
+SAVE 执行期间，Redis 主线程会阻塞，无法处理其他请求。
+```
+
+所以生产环境一般不直接执行 `SAVE`。
+
+### BGSAVE
+
+`BGSAVE` 会 fork 一个子进程，由子进程负责把数据写成 RDB 文件。
+
+主线程继续处理请求。
+
+流程：
+
+```text id="fm5plv"
+Redis 主进程 fork 子进程
+  -> 子进程遍历内存数据
+  -> 写入临时 RDB 文件
+  -> 写完后替换旧 dump.rdb
+  -> 子进程退出
+```
+
+生产环境里，RDB 快照一般依赖 `BGSAVE`。
+
+---
+
+# 三、RDB 生成机制：fork 和 Copy-On-Write
+
+## 1. 为什么 BGSAVE 不直接复制一份内存？
+
+Redis 数据可能很大，比如几十 GB。
+
+如果 BGSAVE 时完整复制一份内存，成本会非常高。
+
+所以 Redis 依赖操作系统的 fork 和 Copy-On-Write，简称 COW。
+
+fork 子进程时，父子进程最开始共享同一份物理内存页。
+
+只有当父进程继续处理写请求、修改某些内存页时，操作系统才会复制被修改的内存页。
+
+这就是写时复制。
+
+可以理解为：
+
+```text id="disyr2"
+fork 后，子进程看到的是 fork 那一刻的数据快照；
+父进程继续处理新写入；
+父进程修改到的内存页才会被复制。
+```
+
+---
+
+## 2. RDB 快照期间写入会不会丢？
+
+不会影响当前 RDB 快照。
+
+因为子进程保存的是 fork 那一刻的数据视图。
+
+举例：
+
+```text id="18w9as"
+10:00:00 触发 BGSAVE
+10:00:01 SET user:1 Tom
+10:00:02 SET user:2 Jerry
+```
+
+这次 RDB 文件只包含 10:00:00 fork 时刻的数据，不包含后面两次写入。
+
+后续写入会留在内存中，等待下一次 RDB 或 AOF 记录。
+
+---
+
+## 3. fork 有什么风险？
+
+RDB 的核心风险不是子进程写文件，而是 fork 本身和 COW 带来的内存压力。
+
+### 第一，fork 可能阻塞主线程
+
+fork 不是完全无成本。
+
+Redis 数据越大，页表越大，fork 耗时可能越明显。
+
+如果 fork 耗时变长，Redis 主线程会短暂卡顿。
+
+### 第二，COW 会增加内存占用
+
+BGSAVE 期间，如果写入很频繁，父进程会修改大量内存页，操作系统就要复制这些页。
+
+这会导致 Redis 实际内存占用上升。
+
+极端情况下可能触发：
+
+```text id="mihmm4"
+内存不足
+swap
+OOM
+Redis 延迟飙升
+子进程失败
+```
+
+### 第三，磁盘 IO 会影响性能
+
+RDB 子进程写文件会产生大量磁盘 IO。
+
+如果磁盘性能差，或者和 AOF、业务日志、数据库共用磁盘，可能引起系统抖动。
+
+---
+
+## 4. 源码视角：RDB 关键路径
+
+RDB 相关源码可以重点看：
+
+```text id="ps7thm"
+src/rdb.c
+src/server.c
+src/db.c
+```
+
+核心函数包括：
+
+```text id="fceyqd"
+rdbSave()
+rdbSaveBackground()
+rdbSaveRio()
+rdbSaveKeyValuePair()
+```
+
+可以简单理解调用链：
+
+```text id="tmxtwr"
+BGSAVE
+  -> rdbSaveBackground()
+      -> fork()
+          -> 子进程 rdbSave()
+              -> 遍历 DB
+              -> 序列化 key/value
+              -> 写临时 RDB
+              -> rename 替换旧 RDB
+```
+
+RDB 文件保存的是 Redis 对象的序列化结果，因此恢复速度通常比 AOF 一条条重放命令更快。
+
+---
+
+# 四、AOF：追加日志持久化
+
+## 1. AOF 是什么？
+
+AOF，全称 Append Only File。
+
+它的核心思想是：
+
+```text id="uu172n"
+把每一条会修改数据的写命令追加到日志文件里。
+```
+
+例如客户端执行：
+
+```text id="41fwel"
+SET name redis
+INCR counter
+HSET user:1 name Tom
+```
+
+AOF 文件中会记录这些写命令。
+
+Redis 重启时，会重新执行 AOF 中的写命令，从而恢复数据。
+
+官方文档也说明，AOF 会记录 Redis 收到的每个写操作，重启时通过重放这些命令恢复数据。
+
+---
+
+## 2. AOF 和 RDB 的核心区别
+
+| 维度   | RDB          | AOF          |
+| ---- | ------------ | ------------ |
+| 保存内容 | 某一时刻的数据快照    | 每条写命令        |
+| 文件体积 | 通常较小         | 通常较大         |
+| 恢复速度 | 通常较快         | 可能较慢         |
+| 数据丢失 | 可能丢失上次快照后的数据 | 取决于 fsync 策略 |
+| 适合场景 | 备份、冷启动、可容忍丢失 | 更高数据可靠性      |
+| 写入影响 | fork + 磁盘写快照 | 每次写命令追加日志    |
+
+一句话：
+
+```text id="jhtpgk"
+RDB 关心最终状态；
+AOF 关心操作过程。
+```
+
+---
+
+# 五、AOF 追加日志的执行流程
+
+一个写命令执行时，AOF 大致会经历以下步骤：
+
+```text id="vprvrb"
+1. 客户端发送写命令
+2. Redis 主线程执行命令，修改内存
+3. Redis 把命令按 RESP 协议格式追加到 AOF 缓冲区
+4. 根据 appendfsync 策略决定何时 fsync 到磁盘
+```
+
+注意，Redis 不是每条命令都直接同步写磁盘。
+
+通常流程是：
+
+```text id="g28ppd"
+写入 AOF buffer
+  -> write 到操作系统 page cache
+  -> fsync 刷到磁盘
+```
+
+这里要区分两个动作：
+
+```text id="dlxwt6"
+write：写到操作系统缓存
+fsync：要求操作系统把数据刷到磁盘
+```
+
+真正影响可靠性和性能的是 fsync 策略。
+
+---
+
+# 六、appendfsync always / everysec / no 的区别
+
+AOF 最重要的配置之一是：
+
+```text id="tfkvc9"
+appendfsync
+```
+
+它有三个常见值：
+
+```text id="dltd14"
+always
+everysec
+no
+```
+
+---
+
+## 1. appendfsync always
+
+配置：
+
+```text id="owmri1"
+appendfsync always
+```
+
+含义：
+
+```text id="lfhsnx"
+每次写命令追加到 AOF 后，都执行 fsync。
+```
+
+优点：
+
+```text id="4wnr5x"
+数据安全性最高
+理论上宕机时丢失最少
+```
+
+缺点：
+
+```text id="b4qfai"
+性能最差
+写延迟明显增加
+磁盘压力大
+吞吐下降
+```
+
+适合：
+
+```text id="tigf7q"
+极少数对持久性要求极高、写入量不大的场景。
+```
+
+但生产中很少这么配。
+
+因为 Redis 的优势是低延迟，高频 fsync 会破坏性能优势。
+
+---
+
+## 2. appendfsync everysec
+
+配置：
+
+```text id="hy7iya"
+appendfsync everysec
+```
+
+含义：
+
+```text id="wq6r48"
+Redis 每秒左右执行一次 fsync。
+```
+
+这是最常见配置。
+
+官方文档也说明，AOF 每秒 fsync 是性能和数据安全之间的折中，故障时可能丢失大约 1 秒左右的数据；Redis Enterprise 文档进一步说明该策略通常可能导致 1 到 2 秒数据丢失，平均接近 1 秒。
+
+优点：
+
+```text id="q5j88g"
+性能较好
+数据丢失窗口较小
+生产最常用
+```
+
+缺点：
+
+```text id="j3wtfm"
+极端宕机时可能丢失最近约 1 秒左右写入
+磁盘抖动时可能影响延迟
+```
+
+适合：
+
+```text id="c16fyn"
+大多数需要一定可靠性、但又追求性能的 Redis 场景。
+```
+
+---
+
+## 3. appendfsync no
+
+配置：
+
+```text id="j07g7b"
+appendfsync no
+```
+
+含义：
+
+```text id="hy5kvc"
+Redis 不主动 fsync，交给操作系统决定什么时候刷盘。
+```
+
+优点：
+
+```text id="elgm9d"
+性能最好
+Redis 主线程受 fsync 影响最小
+```
+
+缺点：
+
+```text id="f3xgt9"
+宕机时可能丢失更多数据
+丢失窗口取决于操作系统刷盘策略
+```
+
+适合：
+
+```text id="6ngazc"
+纯缓存
+可容忍较大数据丢失
+性能优先
+```
+
+不适合：
+
+```text id="25qfzk"
+状态数据
+队列数据
+排行榜核心分数
+需要可靠恢复的业务
+```
+
+---
+
+## 4. 三者对比
+
+| 配置       | fsync 时机 | 性能 | 数据安全 | 可能丢失      |
+| -------- | -------- | -- | ---- | --------- |
+| always   | 每次写入     | 最差 | 最高   | 极少        |
+| everysec | 每秒一次     | 较好 | 较高   | 通常约 1 秒左右 |
+| no       | 由 OS 决定  | 最好 | 最低   | 取决于 OS    |
+
+生产建议：
+
+```text id="ehwyex"
+纯缓存：可以不开 AOF，或 appendfsync no
+多数状态类场景：appendfsync everysec
+极端可靠性：不要只靠 Redis，应该引入数据库或日志系统
+```
+
+---
+
+# 七、AOF 重写：为什么日志会变小？
+
+## 1. 为什么需要 AOF 重写？
+
+AOF 记录的是写命令。
+
+如果一个 key 被反复修改：
+
+```text id="v9c8yc"
+SET counter 1
+INCR counter
+INCR counter
+INCR counter
+INCR counter
+```
+
+AOF 会记录多条命令。
+
+但恢复数据时，实际上只需要最终状态：
+
+```text id="098xtj"
+SET counter 5
+```
+
+所以 AOF 文件会随着时间变大，需要重写压缩。
+
+Redis 官方 `BGREWRITEAOF` 文档说明，AOF rewrite 会创建当前 AOF 的较小优化版本，如果重写失败，旧 AOF 不会被破坏。
+
+---
+
+## 2. AOF 重写不是压缩旧文件
+
+很多人误以为 AOF 重写是读取旧 AOF，然后压缩。
+
+不是。
+
+AOF 重写的核心是：
+
+```text id="zvsmnw"
+根据当前内存中的数据状态，重新生成一份更短的 AOF。
+```
+
+例如当前 Redis 内存里有：
+
+```text id="mf4y7v"
+counter = 5
+user:1 = {name: Tom}
+```
+
+新的 AOF 可以写成：
+
+```text id="47ogq0"
+SET counter 5
+HSET user:1 name Tom
+```
+
+它不关心 counter 之前经历过多少次 INCR。
+
+---
+
+## 3. BGREWRITEAOF 流程
+
+AOF 重写通常通过：
+
+```text id="lxtvs5"
+BGREWRITEAOF
+```
+
+触发。
+
+流程大致是：
+
+```text id="kkxtwm"
+Redis 主进程 fork 子进程
+  -> 子进程根据当前内存数据生成新的 AOF 文件
+  -> 主进程继续处理写请求
+  -> 主进程把重写期间的新写入追加到缓冲区
+  -> 子进程完成后，主进程把增量写入追加到新 AOF
+  -> 用新 AOF 替换旧 AOF
+```
+
+这里的关键问题是：
+
+```text id="dqvxhj"
+子进程重写期间，主进程还在接受新写入，这些新写入不能丢。
+```
+
+所以 Redis 需要维护 AOF 重写期间的增量数据。
+
+---
+
+## 4. AOF 重写的风险
+
+AOF 重写也会 fork，因此和 RDB 类似，会面临：
+
+```text id="sy4ov1"
+fork 阻塞
+COW 内存增加
+磁盘 IO 压力
+重写期间延迟抖动
+```
+
+如果 AOF 文件很大、写入很频繁，重写成本会更明显。
+
+生产中要关注：
+
+```text id="a7k5wz"
+auto-aof-rewrite-percentage
+auto-aof-rewrite-min-size
+磁盘空间
+fork 耗时
+重写耗时
+AOF 文件大小
+```
+
+常见配置：
+
+```text id="6t49lo"
+auto-aof-rewrite-percentage 100
+auto-aof-rewrite-min-size 64mb
+```
+
+含义是：
+
+```text id="g2k6qt"
+AOF 文件体积比上次重写后增长 100%，并且超过 64MB，触发重写。
+```
+
+具体阈值要根据业务写入量和磁盘容量调整。
+
+---
+
+# 八、Redis 7 Multi-Part AOF
+
+Redis 7 引入了 Multi-Part AOF，用多个文件和 manifest 管理 AOF。
+
+在旧模式下，AOF 重写完成后需要处理旧 AOF、新 AOF、增量 AOF 的切换，文件替换逻辑比较复杂。
+
+Multi-Part AOF 把 AOF 拆成几类文件：
+
+```text id="mm06hc"
+base file：基础文件，类似一次重写后的基础数据
+incremental file：增量 AOF，记录后续写入
+manifest file：记录当前有效 AOF 文件清单
+```
+
+阿里云对 Redis 7 Multi-Part AOF 的设计文章中也说明，Redis 7 通过 manifest 管理基础 AOF 文件和增量 AOF 文件，解决旧 AOF 机制中的一些痛点。
+
+可以简单理解为：
+
+```text id="qe8mu9"
+旧 AOF：一个大文件为主；
+新 AOF：基础文件 + 增量文件 + manifest。
+```
+
+优势包括：
+
+```text id="qbbv1x"
+降低重写期间的复杂度
+减少文件替换风险
+更清晰地区分基础数据和增量数据
+便于 AOF 管理
+```
+
+生产中如果使用 Redis 7，需要关注 AOF 目录下不再只是一个简单的 appendonly.aof 文件，而是可能有多个 AOF 相关文件和 manifest。
+
+备份时不能只复制其中一个文件，要保证 manifest 和相关 AOF 文件一致。
+
+---
+
+# 九、RDB 和 AOF 同时开启时如何恢复？
+
+Redis 可以同时开启 RDB 和 AOF。
+
+如果同时存在 RDB 和 AOF，Redis 启动时通常优先使用 AOF 恢复，因为 AOF 通常包含更完整的数据。
+
+恢复过程可以理解为：
+
+```text id="ja1o17"
+如果开启 AOF 并且 AOF 文件存在：
+    优先加载 AOF
+否则：
+    加载 RDB
+```
+
+为什么优先 AOF？
+
+因为 RDB 是时间点快照，可能丢失快照之后的数据。
+
+AOF 记录写命令，通常数据更新。
+
+但 AOF 恢复速度可能比 RDB 慢，尤其是 AOF 文件很大时。
+
+---
+
+# 十、宕机恢复时可能丢多少数据？
+
+这是面试和架构评审中最关键的问题。
+
+不同配置下，数据丢失窗口不同。
+
+---
+
+## 1. 只开 RDB
+
+可能丢失：
+
+```text id="h89lfs"
+上一次 RDB 快照之后的所有写入。
+```
+
+例如配置：
+
+```text id="nl572t"
+save 300 10
+```
+
+如果 10:00 生成 RDB，10:04 宕机，那么 10:00 到 10:04 的写入可能丢失。
+
+所以 RDB 不适合对实时持久性要求高的场景。
+
+适合：
+
+```text id="0q528s"
+缓存恢复
+备份
+灾难恢复
+允许分钟级数据丢失的场景
+```
+
+---
+
+## 2. 只开 AOF everysec
+
+可能丢失：
+
+```text id="k30zj1"
+最近约 1 秒左右的写入。
+```
+
+在部分极端情况下，可能略大于 1 秒，例如操作系统、磁盘或 Redis fsync 调度异常。Redis Enterprise 文档说明 everysec 策略可能导致 1 到 2 秒数据丢失，平均接近 1 秒。
+
+适合：
+
+```text id="pr87h4"
+排行榜
+轻量状态
+可补偿队列
+会话
+部分业务计数
+```
+
+但仍不适合强一致账务数据。
+
+---
+
+## 3. AOF always
+
+理论上丢失最少。
+
+但问题是性能成本太高。
+
+如果每次写入都 fsync，Redis 写延迟会明显上升。
+
+适合：
+
+```text id="k8pyqz"
+写入量低，但持久性要求较高的少数场景。
+```
+
+但如果真的对数据可靠性要求极高，通常更应该使用：
+
+```text id="loy3iv"
+数据库事务
+WAL 日志
+消息队列
+多副本同步
+强一致存储
+```
+
+而不是仅靠 Redis AOF always。
+
+---
+
+## 4. 不开持久化
+
+可能丢失：
+
+```text id="ce87vc"
+Redis 内存中的全部数据。
+```
+
+适合：
+
+```text id="dtp5t1"
+纯缓存
+可重建数据
+临时数据
+压测环境
+```
+
+如果 Redis 只是缓存，完全可以不开持久化，避免持久化引起的 fork、磁盘 IO、延迟抖动。
+
+---
+
+# 十一、RDB 和 AOF 如何选择？
+
+## 1. 纯缓存场景
+
+例如：
+
+```text id="ib5f0j"
+商品详情缓存
+用户资料缓存
+文章缓存
+接口结果缓存
+```
+
+建议：
+
+```text id="tss5gl"
+可以不开持久化；
+或者只开 RDB，用于快速恢复；
+重点做好缓存预热和限流降级。
+```
+
+原因：
+
+```text id="0jndfj"
+数据源在数据库；
+Redis 丢了可以重建；
+持久化反而可能增加延迟和运维成本。
+```
+
+---
+
+## 2. 可容忍少量丢失的状态数据
+
+例如：
+
+```text id="qg92cw"
+排行榜
+阅读数
+点赞数
+限流计数
+部分用户会话
+临时任务状态
+```
+
+建议：
+
+```text id="d4w7hg"
+AOF everysec + RDB
+```
+
+原因：
+
+```text id="mrlovv"
+AOF 降低数据丢失窗口；
+RDB 方便备份和快速恢复；
+业务侧要有补偿或最终落库。
+```
+
+---
+
+## 3. Stream / 延迟队列类数据
+
+如果用 Redis Stream 或 ZSet 做轻量队列：
+
+```text id="xkz4e9"
+开启 AOF everysec；
+任务详情最好落数据库；
+消费要幂等；
+失败要能补偿扫描。
+```
+
+不要只依赖 Redis 队列保存不可丢任务。
+
+更稳的架构：
+
+```text id="b7x6cu"
+任务状态：数据库
+任务触发：Redis ZSet / Stream
+任务可靠投递：MQ
+```
+
+---
+
+## 4. 强一致核心数据
+
+例如：
+
+```text id="qy7lxg"
+账户余额
+支付流水
+订单最终状态
+库存最终扣减
+财务数据
+审计数据
+```
+
+建议：
+
+```text id="6w2m0p"
+不要把 Redis 作为唯一事实数据源。
+```
+
+Redis 可以做：
+
+```text id="g495so"
+缓存
+预扣减
+限流
+幂等标记
+临时状态
+```
+
+但最终状态应以数据库、事务日志、消息系统或账务系统为准。
+
+---
+
+# 十二、大厂生产实践
+
+## 1. 持久化策略按实例角色区分
+
+不要所有 Redis 实例统一配置。
+
+常见分类：
+
+```text id="vdkmrq"
+纯缓存实例：可不开 AOF，必要时开 RDB
+排行榜实例：AOF everysec + 定期落库
+队列实例：AOF everysec + DB/MQ 补偿
+锁实例：通常不依赖持久化
+会话实例：看业务是否允许重新登录
+配置实例：RDB + 主动刷新机制
+```
+
+---
+
+## 2. 避免持久化和业务高峰重叠
+
+RDB 和 AOF 重写都会产生 fork、COW、磁盘 IO。
+
+建议：
+
+```text id="ae9g0u"
+避开业务高峰做重写
+监控 fork 耗时
+监控 used_memory_rss
+监控 aof_rewrite_in_progress
+监控 rdb_bgsave_in_progress
+监控 latest_fork_usec
+```
+
+如果在高写入峰值触发 BGSAVE 或 BGREWRITEAOF，COW 内存可能暴涨。
+
+---
+
+## 3. 磁盘要独立规划
+
+Redis 是内存系统，但开启持久化后，磁盘非常关键。
+
+要关注：
+
+```text id="roqj7b"
+磁盘空间
+磁盘 IO 延迟
+fsync 延迟
+AOF 文件大小
+RDB 文件大小
+备份带宽
+容器磁盘限制
+```
+
+不要把 Redis AOF/RDB 和数据库、日志系统、对象存储网关混在同一块高争用磁盘上。
+
+---
+
+## 4. 持久化不等于备份
+
+RDB 和 AOF 是本机恢复机制，不等于异地备份。
+
+生产中还需要：
+
+```text id="r2unqp"
+定期拷贝 RDB 到远端
+备份 AOF manifest 和相关文件
+校验备份可恢复
+演练从备份恢复
+多可用区副本
+灾备切换方案
+```
+
+尤其 Redis 7 Multi-Part AOF 下，备份 AOF 时要保证 manifest 和 AOF 文件一致。
+
+---
+
+## 5. 业务侧必须有补偿
+
+即使 AOF everysec，也可能丢最近写入。
+
+所以对重要业务要设计补偿：
+
+```text id="6obm0t"
+排行榜定期落库
+计数定期 flush 到数据库
+队列任务有数据库状态表
+Stream 消费幂等
+延迟任务可通过 DB 扫描重建
+缓存可通过预热恢复
+```
+
+成熟架构不是假设 Redis 永不丢，而是假设 Redis 可能丢，然后设计恢复路径。
+
+---
+
+# 十三、源码视角：持久化关键文件
+
+想深入源码，可以重点看这些文件：
+
+```text id="jy4trq"
+src/rdb.c：RDB 保存和加载
+src/aof.c：AOF 追加、重写和加载
+src/server.c：周期任务、持久化状态管理
+src/bio.c：后台 IO 任务
+src/config.c：持久化配置
+```
+
+关键函数方向：
+
+```text id="vhst7p"
+rdbSave()
+rdbSaveBackground()
+rdbLoad()
+feedAppendOnlyFile()
+flushAppendOnlyFile()
+rewriteAppendOnlyFileBackground()
+loadAppendOnlyFiles()
+backgroundSaveDoneHandler()
+backgroundRewriteDoneHandler()
+```
+
+可以按三条链路阅读源码：
+
+```text id="moe73p"
+RDB 生成链路：
+BGSAVE -> fork -> rdbSave -> 写临时文件 -> rename
+
+AOF 写入链路：
+执行写命令 -> feedAppendOnlyFile -> AOF buffer -> flushAppendOnlyFile -> fsync
+
+AOF 重写链路：
+BGREWRITEAOF -> fork -> 根据内存生成新 AOF -> 合并增量 -> 切换文件
+```
+
+源码阅读重点不是记函数名，而是理解三个问题：
+
+```text id="fjc21k"
+1. 哪些动作在主线程？
+2. 哪些动作在子进程或后台线程？
+3. 哪些地方会造成延迟抖动？
+```
+
+---
+
+# 十四、面试表达
+
+## 1. Redis 数据会不会丢？
+
+可以这样回答：
+
+> Redis 是内存数据库，如果不开持久化，进程退出或机器宕机后内存数据会丢。Redis 提供 RDB 和 AOF 两种持久化机制。RDB 是某个时间点的数据快照，可能丢失上次快照之后的数据；AOF 是追加写命令日志，数据丢失窗口取决于 appendfsync 策略。常用的 everysec 策略通常可能丢失最近约 1 秒左右的数据。即使开启持久化，Redis 也不应该作为强一致核心数据的唯一存储。
+
+## 2. RDB 和 AOF 有什么区别？
+
+可以这样回答：
+
+> RDB 保存的是某一时刻的内存快照，文件紧凑、恢复快，适合备份和冷启动，但可能丢失快照之后的数据。AOF 记录每条写命令，重启时通过重放命令恢复，数据更完整，但文件更大，恢复可能更慢，需要 AOF 重写来压缩日志。生产中可以根据场景选择：纯缓存可以不开持久化或只开 RDB，需要更高可靠性的状态数据通常开 AOF everysec，并配合 RDB 做备份。
+
+## 3. BGSAVE 为什么会影响 Redis？
+
+可以这样回答：
+
+> BGSAVE 会 fork 子进程生成 RDB。fork 期间主线程会短暂阻塞，数据量越大页表越大，fork 耗时可能越明显。fork 后父子进程通过 Copy-On-Write 共享内存，如果此时写入很多，会复制大量内存页，导致内存上涨，甚至 OOM。同时子进程写 RDB 会产生磁盘 IO，所以 BGSAVE 可能带来延迟抖动。
+
+## 4. AOF rewrite 为什么能压缩文件？
+
+可以这样回答：
+
+> AOF 记录的是历史写命令，长期运行后会有大量冗余命令，比如一个 key 被多次 SET 或 INCR。AOF rewrite 不是读取旧 AOF 做压缩，而是根据当前内存中的最终数据状态重新生成一份新的 AOF，因此可以把多条历史命令合并成一条最终状态命令。重写通常由子进程完成，主进程继续处理请求，并记录重写期间的新写入，最后合并切换。
+
+## 5. appendfsync always / everysec / no 怎么选？
+
+可以这样回答：
+
+> always 是每次写都 fsync，数据安全性最好但性能最差；everysec 是每秒 fsync 一次，是性能和可靠性的折中，生产最常用，通常可能丢失约 1 秒左右数据；no 是交给操作系统刷盘，性能最好但数据丢失窗口不可控。纯缓存可以不开 AOF或用 no；多数状态类数据用 everysec；强一致核心数据不应该只靠 Redis 持久化。
+
+---
+
+# 十五、总结
+
+Redis 持久化不是“开了就不丢数据”。
+
+更准确的理解是：
+
+```text id="nsy34s"
+RDB：降低全量丢失风险，但可能丢失快照之后的数据。
+AOF：降低写入丢失窗口，但取决于 fsync 策略。
+AOF 重写：减少日志体积，但会带来 fork、COW 和磁盘 IO 成本。
+RDB + AOF：可靠性更高，但资源开销和运维复杂度也更高。
+```
+
+RDB 和 AOF 的选择，本质是性能、可靠性、恢复速度和复杂度之间的取舍。
+
+可以用一句话总结生产选型：
+
+```text id="s7cqji"
+纯缓存：可以不开持久化；
+可补偿状态：AOF everysec + RDB；
+核心数据：Redis 只做加速层，事实数据必须落数据库或可靠日志系统。
+```
+
+真正成熟的 Redis 架构，不是假设 Redis 永远不丢，而是清楚知道：
+
+```text id="v000fm"
+会丢什么；
+最多丢多少；
+丢了怎么恢复；
+哪些数据绝不能只放 Redis。
+```
+
+这才是回答“Redis 数据会不会丢”时最有架构深度的答案。

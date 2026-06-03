@@ -1,0 +1,1115 @@
+# Kafka 技术概览：为什么它能成为大规模系统的事件流基础设施？
+
+## 前言
+
+在后端系统设计中，Kafka 是一个非常高频的基础组件。
+
+很多人第一次接触 Kafka，会把它理解成“消息队列”。这个理解不能算错，但并不完整。Kafka 不只是一个负责“发消息、收消息”的中间件，它更准确的定位是：
+
+```text
+Kafka = 分布式持久化日志系统 + 发布订阅消息系统 + 事件流平台
+```
+
+它之所以流行，不只是因为吞吐高，而是因为它同时解决了几个大型系统中的核心问题：
+
+```text
+服务解耦
+异步削峰
+消息持久化
+事件回放
+水平扩展
+消费者独立演进
+实时数据流处理
+```
+
+在微服务、日志采集、实时计算、数据同步、CDC、事件驱动架构中，Kafka 都是非常常见的基础设施。
+
+本文从 Kafka 的核心概念、架构模型、工作机制、典型场景和使用边界几个角度做一个整体概览。
+
+---
+
+# 一、Kafka 解决了什么问题？
+
+在没有 Kafka 的系统里，服务之间经常直接调用。
+
+例如用户下单后，订单服务可能要同步调用多个下游：
+
+```text
+订单服务 -> 库存服务
+订单服务 -> 支付服务
+订单服务 -> 优惠券服务
+订单服务 -> 通知服务
+订单服务 -> 积分服务
+订单服务 -> 数据分析服务
+```
+
+这种架构有几个明显问题：
+
+```text
+调用链路长
+下游服务故障会影响上游
+接口耦合严重
+新增消费者需要修改生产者逻辑
+流量高峰时下游容易被打垮
+系统扩展成本高
+```
+
+引入 Kafka 后，可以把同步调用改成事件发布：
+
+```text
+订单服务 -> Kafka Topic: order_events
+
+库存服务    <- 订阅 order_events
+通知服务    <- 订阅 order_events
+积分服务    <- 订阅 order_events
+风控服务    <- 订阅 order_events
+数据分析服务 <- 订阅 order_events
+```
+
+订单服务只需要把“订单已创建”这个事件写入 Kafka，不需要关心后面有多少消费者，也不需要等待所有下游处理完成。
+
+这就是 Kafka 的第一个核心价值：
+
+```text
+解耦生产者和消费者。
+```
+
+生产者只负责发布事件，消费者自己决定什么时候消费、怎么消费、消费失败怎么重试。
+
+---
+
+# 二、Kafka 的核心概念
+
+理解 Kafka，需要先理解几个核心角色。
+
+## 1. Producer：生产者
+
+Producer 负责向 Kafka 写入消息。
+
+例如订单服务发布订单事件：
+
+```text
+OrderCreated
+OrderPaid
+OrderCancelled
+```
+
+Producer 通常会指定消息写入哪个 Topic，也可以指定消息 key，让同一类消息进入固定分区。
+
+---
+
+## 2. Consumer：消费者
+
+Consumer 负责从 Kafka 读取消息并处理。
+
+例如：
+
+```text
+库存服务消费订单事件扣库存
+通知服务消费订单事件发短信
+积分服务消费订单事件加积分
+数据服务消费订单事件做分析
+```
+
+Consumer 的处理速度可以和 Producer 解耦。生产者写得快，消费者可以慢慢追。
+
+---
+
+## 3. Topic：主题
+
+Topic 是消息的逻辑分类。
+
+例如：
+
+```text
+order_events
+payment_events
+user_events
+inventory_events
+log_events
+```
+
+Producer 写入某个 Topic，Consumer 订阅某个 Topic。
+
+可以把 Topic 理解为一个业务事件流。
+
+---
+
+## 4. Partition：分区
+
+Topic 可以拆成多个 Partition。
+
+例如：
+
+```text
+Topic: order_events
+
+Partition 0
+Partition 1
+Partition 2
+```
+
+Partition 是 Kafka 扩展吞吐和保证局部顺序的核心单位。
+
+Kafka 只保证：
+
+```text
+单个 Partition 内消息有序。
+```
+
+不保证整个 Topic 全局有序。
+
+如果业务要求同一个订单的事件有序，可以使用 `orderId` 作为消息 key，让同一个订单的消息进入同一个 Partition。
+
+---
+
+## 5. Broker：Kafka 节点
+
+Broker 是 Kafka 集群中的服务节点。
+
+一个 Kafka 集群通常由多个 Broker 组成。
+
+Topic 的不同 Partition 会分布在不同 Broker 上，从而实现水平扩展。
+
+---
+
+## 6. Consumer Group：消费者组
+
+Consumer Group 是 Kafka 非常关键的设计。
+
+同一个 Consumer Group 内，多个 Consumer 共同消费一个 Topic。
+
+规则是：
+
+```text
+同一个 Consumer Group 中，一个 Partition 同一时刻只能被一个 Consumer 消费。
+```
+
+例如：
+
+```text
+Topic: order_events
+Partition 0 -> Consumer A
+Partition 1 -> Consumer B
+Partition 2 -> Consumer C
+```
+
+这样可以实现并行消费。
+
+不同 Consumer Group 之间互不影响。
+
+例如：
+
+```text
+库存服务 Consumer Group 读取 order_events
+通知服务 Consumer Group 读取 order_events
+风控服务 Consumer Group 读取 order_events
+数据分析 Consumer Group 读取 order_events
+```
+
+每个组都可以完整消费同一份 Topic 数据，并且各自维护自己的消费进度。
+
+---
+
+## 7. Offset：消费位点
+
+Offset 表示消费者在某个 Partition 中消费到哪里。
+
+例如：
+
+```text
+Partition 0:
+offset 0 -> event A
+offset 1 -> event B
+offset 2 -> event C
+offset 3 -> event D
+```
+
+Consumer 消费完 offset 2 后，可以提交 offset，表示下次从 offset 3 开始消费。
+
+Offset 的存在让 Kafka 支持：
+
+```text
+断点续读
+失败重试
+历史回放
+不同消费者组独立消费
+重新处理历史数据
+```
+
+这也是 Kafka 和很多普通消息队列的重要区别。
+
+---
+
+# 三、Kafka 的底层模型：分布式日志
+
+Kafka 的核心不是“队列”，而是“日志”。
+
+消息写入 Kafka 后，会被追加到 Partition 的日志文件末尾。
+
+可以理解为：
+
+```text
+Partition = 只能追加写入的有序日志
+```
+
+例如：
+
+```text
+Partition 0:
+offset 0: OrderCreated
+offset 1: OrderPaid
+offset 2: OrderShipped
+offset 3: OrderCancelled
+```
+
+消费者不是把消息从 Kafka 中“拿走”，而是记录自己读到了哪个 offset。
+
+这带来几个重要能力。
+
+---
+
+## 1. 消息可持久化
+
+Kafka 会把消息写入磁盘日志。
+
+消费者短暂宕机时，消息不会立即丢失。消费者恢复后，可以从上次提交的 offset 继续消费。
+
+---
+
+## 2. 消息可回放
+
+如果消费者逻辑写错了，修复后可以把 offset 调回历史位置，重新消费历史数据。
+
+例如：
+
+```text
+风控服务 bug 修复后，从昨天 00:00 的 offset 重新消费
+```
+
+这对数据修复、历史重算、事件溯源非常重要。
+
+---
+
+## 3. 多个消费者可以独立读取同一份数据
+
+Kafka 中消息不会因为某个消费者读过就立刻消失。
+
+不同 Consumer Group 可以各自维护 offset，各自消费同一份 Topic 数据。
+
+这让 Kafka 非常适合做事件总线。
+
+---
+
+# 四、Kafka 为什么高吞吐？
+
+Kafka 的高吞吐来自多个方面。
+
+## 1. 顺序写磁盘
+
+Kafka 的消息是追加写入日志文件的。
+
+相比随机写，顺序写磁盘性能更好。
+
+很多人以为“磁盘一定比内存慢”，但顺序写磁盘在现代操作系统和硬件上可以非常高效。
+
+Kafka 利用了日志追加写的模型，将写入路径设计得非常适合高吞吐。
+
+---
+
+## 2. Page Cache
+
+Kafka 大量依赖操作系统 Page Cache。
+
+消息写入时，通常先进入操作系统缓存，再由操作系统异步刷盘。
+
+消费者读取时，如果数据还在 Page Cache 中，就可以直接从内存读取，避免真实磁盘 IO。
+
+---
+
+## 3. 零拷贝
+
+Kafka 在发送消息给消费者时，可以利用操作系统的零拷贝能力，减少数据在用户态和内核态之间的复制。
+
+普通路径可能是：
+
+```text
+磁盘 -> 内核缓冲区 -> 用户态应用 -> socket 缓冲区 -> 网络
+```
+
+零拷贝可以减少中间复制，让数据更高效地从文件发送到网络。
+
+---
+
+## 4. 批量处理
+
+Kafka 的 Producer 和 Consumer 都支持批量。
+
+Producer 可以批量发送消息，Broker 可以批量写入日志，Consumer 可以批量拉取消息。
+
+批量化能减少网络请求次数和系统调用开销。
+
+---
+
+## 5. Partition 并行
+
+Topic 可以拆成多个 Partition，分布在多个 Broker 上。
+
+Producer 可以并行写多个 Partition，Consumer Group 内多个 Consumer 可以并行消费多个 Partition。
+
+这就是 Kafka 水平扩展吞吐的核心。
+
+---
+
+# 五、Kafka 的副本机制和高可用
+
+Kafka 通过副本机制保证高可用。
+
+一个 Partition 可以有多个副本：
+
+```text
+Partition 0:
+Leader   -> Broker 1
+Follower -> Broker 2
+Follower -> Broker 3
+```
+
+Producer 和 Consumer 通常只和 Leader 交互。
+
+Follower 从 Leader 复制数据。
+
+如果 Leader 所在 Broker 挂了，Kafka 可以从 Follower 中选出新的 Leader。
+
+---
+
+## 1. Leader 和 Follower
+
+每个 Partition 都有一个 Leader。
+
+读写请求通常由 Leader 处理。
+
+Follower 负责从 Leader 拉取数据，保持同步。
+
+---
+
+## 2. ISR
+
+ISR 是 In-Sync Replicas，表示和 Leader 保持同步的副本集合。
+
+如果某个 Follower 落后太多，就可能被踢出 ISR。
+
+Kafka 的可靠性和 ISR 强相关。
+
+---
+
+## 3. acks 配置
+
+Producer 写入时，可以通过 `acks` 控制确认语义。
+
+常见配置：
+
+```text
+acks=0
+acks=1
+acks=all
+```
+
+含义：
+
+```text
+acks=0：Producer 不等 Broker 确认，性能高，但最容易丢消息
+acks=1：Leader 写入成功就返回，Follower 还没同步也算成功
+acks=all：ISR 中副本都确认后才返回，可靠性更高，但延迟更高
+```
+
+生产中，如果对消息可靠性要求较高，通常会选择：
+
+```text
+acks=all
+```
+
+并配合合理的副本数和最小同步副本数。
+
+---
+
+# 六、Kafka 的消费模型
+
+Kafka 的消费核心是 Consumer Group + Offset。
+
+## 1. 同组内负载均衡
+
+同一个 Consumer Group 内，多个 Consumer 分摊 Partition。
+
+例如 Topic 有 3 个 Partition，Consumer Group 有 3 个 Consumer：
+
+```text
+Partition 0 -> Consumer A
+Partition 1 -> Consumer B
+Partition 2 -> Consumer C
+```
+
+如果增加到 4 个 Consumer，由于只有 3 个 Partition，那么多出来的 Consumer 可能空闲。
+
+所以：
+
+```text
+同一个 Consumer Group 的最大并行消费能力，受 Partition 数量限制。
+```
+
+---
+
+## 2. 不同组独立消费
+
+不同 Consumer Group 之间互不影响。
+
+例如：
+
+```text
+库存服务 group 消费 order_events
+通知服务 group 消费 order_events
+分析服务 group 消费 order_events
+```
+
+每个组都有自己的 offset。
+
+这让 Kafka 特别适合“一份事件，多方订阅”的场景。
+
+---
+
+## 3. Offset 提交
+
+Consumer 处理完消息后，需要提交 offset。
+
+常见方式：
+
+```text
+自动提交
+手动提交
+```
+
+生产中更推荐手动提交。
+
+因为自动提交可能出现：
+
+```text
+消息还没处理成功，offset 已经提交
+服务宕机后，这条消息不会再被消费
+```
+
+手动提交可以保证：
+
+```text
+业务处理成功后，再提交 offset。
+```
+
+不过这也意味着：如果处理成功但提交 offset 前宕机，消息可能被重复消费。
+
+所以 Kafka 消费端必须做幂等。
+
+---
+
+# 七、Kafka 的消息语义
+
+Kafka 常见消费语义包括：
+
+```text
+至多一次
+至少一次
+精确一次
+```
+
+## 1. 至多一次
+
+消息可能丢，但不会重复。
+
+例如先提交 offset，再处理消息。
+
+如果处理时服务宕机，消息就丢了。
+
+---
+
+## 2. 至少一次
+
+消息不会轻易丢，但可能重复。
+
+例如先处理消息，再提交 offset。
+
+如果处理成功后，提交 offset 前服务宕机，那么重启后这条消息会被再次消费。
+
+这是很多系统的默认选择。
+
+因此业务必须幂等。
+
+---
+
+## 3. 精确一次
+
+Kafka 支持事务和幂等 Producer，可以在特定场景下提供更强语义。
+
+但精确一次不是免费能力，使用复杂度更高，也依赖端到端设计。
+
+在大多数业务系统里，更常见的工程做法是：
+
+```text
+Kafka 至少一次 + 消费端幂等 + 数据库唯一约束 / 状态机兜底
+```
+
+---
+
+# 八、Kafka 的典型业务场景
+
+## 1. 异步解耦
+
+用户注册后，可以异步发送欢迎邮件、短信、初始化资料。
+
+```text
+用户服务 -> user_registered Topic
+
+邮件服务消费
+短信服务消费
+积分服务消费
+数据分析服务消费
+```
+
+优点：
+
+```text
+主流程更短
+下游失败不阻塞主流程
+新增消费者无需修改生产者
+```
+
+---
+
+## 2. 削峰填谷
+
+秒杀、活动、抢购等场景中，流量可能瞬间打到后端。
+
+Kafka 可以承接瞬时流量，让消费者按自己的处理能力慢慢消费。
+
+```text
+高并发请求 -> Kafka -> 后端消费者慢慢处理
+```
+
+注意，Kafka 只能削峰，不能凭空提升最终处理能力。如果消费者长期处理不过来，会产生消费积压。
+
+---
+
+## 3. 日志采集
+
+Kafka 非常适合日志采集。
+
+```text
+应用日志 -> Kafka -> Flink / Spark / ClickHouse / Elasticsearch
+```
+
+典型日志包括：
+
+```text
+访问日志
+错误日志
+行为日志
+审计日志
+埋点日志
+```
+
+---
+
+## 4. 实时数据分析
+
+用户行为事件进入 Kafka 后，可以由 Flink、Spark Streaming 等实时计算引擎消费。
+
+```text
+用户点击事件 -> Kafka -> Flink -> 实时指标
+```
+
+适合：
+
+```text
+实时 UV
+实时 GMV
+实时转化率
+实时风控
+实时推荐特征
+```
+
+---
+
+## 5. 数据同步和 CDC
+
+Kafka 经常用于数据库变更数据捕获。
+
+典型链路：
+
+```text
+MySQL binlog -> Kafka -> Elasticsearch / ClickHouse / 数仓 / 缓存
+```
+
+这类架构可以把业务数据库变更同步到搜索、分析、缓存等系统。
+
+---
+
+## 6. 事件驱动架构
+
+Kafka 可以作为事件总线。
+
+例如：
+
+```text
+order_events
+payment_events
+inventory_events
+user_events
+```
+
+各个服务通过事件协作，而不是强依赖同步接口。
+
+这种架构让系统更容易扩展，也更适合复杂业务域解耦。
+
+---
+
+# 九、Kafka 的使用边界
+
+Kafka 很强，但不是所有异步任务都应该用 Kafka。
+
+## 1. Kafka 不一定适合小型简单任务
+
+如果系统规模很小，只是偶尔异步发一封邮件，用 Kafka 可能过重。
+
+更轻量的方案可能是：
+
+```text
+Redis Stream
+RabbitMQ
+云消息队列
+本地任务队列
+数据库任务表
+```
+
+---
+
+## 2. Kafka 不适合默认全局有序
+
+Kafka 只保证单 Partition 内有序。
+
+如果你需要全局有序，那么只能用一个 Partition，但这会牺牲并行度。
+
+更常见的做法是：
+
+```text
+按业务实体保证局部有序。
+```
+
+例如：
+
+```text
+同一个 orderId 的消息进入同一个 Partition
+```
+
+这样可以保证单个订单维度有序，而不是全局有序。
+
+---
+
+## 3. Kafka 消费端必须幂等
+
+Kafka 消息可能重复消费。
+
+所以消费者必须设计幂等逻辑。
+
+常见方式：
+
+```text
+eventId 去重
+业务唯一键去重
+数据库唯一索引
+消费记录表
+状态机判断
+幂等接口
+```
+
+例如订单支付事件：
+
+```sql
+UPDATE orders
+SET status = 'PAID'
+WHERE order_id = ? AND status = 'INIT';
+```
+
+如果订单已经是 `PAID`，重复消费不会再次改变状态。
+
+---
+
+## 4. Kafka 需要监控消费积压
+
+Kafka 的核心监控指标之一是 consumer lag。
+
+如果 lag 持续增长，说明消费者处理速度跟不上生产速度。
+
+常见原因：
+
+```text
+消费者数量不足
+Partition 数量不足
+单条消息处理太慢
+下游数据库慢
+消费者频繁 rebalance
+消息体太大
+```
+
+治理方式：
+
+```text
+扩容消费者
+增加 Partition
+批量消费
+优化下游写入
+拆分 Topic
+限流生产者
+```
+
+---
+
+# 十、Kafka 与其他消息系统的简单对比
+
+## 1. Kafka vs RabbitMQ
+
+RabbitMQ 更偏传统消息队列，路由能力强，适合复杂消息路由、任务队列、低延迟消息投递。
+
+Kafka 更偏事件流和日志系统，适合高吞吐、持久化、回放、日志采集和流处理。
+
+可以简单理解：
+
+```text
+RabbitMQ：消息路由和任务分发
+Kafka：事件流、日志和大规模数据管道
+```
+
+---
+
+## 2. Kafka vs Redis Stream
+
+Redis Stream 更轻量，适合业务内小规模消息流。
+
+Kafka 更适合大规模、可扩展、跨系统的数据流和消息平台。
+
+可以简单理解：
+
+```text
+Redis Stream：轻量消息流
+Kafka：公司级事件流平台
+```
+
+---
+
+## 3. Kafka vs 数据库任务表
+
+数据库任务表实现简单，适合小规模、低频任务。
+
+但高并发下会遇到：
+
+```text
+数据库轮询压力
+锁竞争
+任务堆积
+扩展困难
+```
+
+Kafka 更适合高吞吐事件流和异步解耦。
+
+---
+
+# 十一、Kafka 在架构设计中的常见模式
+
+## 1. Outbox Pattern
+
+业务系统写数据库和发 Kafka 消息时，可能遇到一致性问题。
+
+例如：
+
+```text
+数据库写成功，但 Kafka 发送失败
+Kafka 发送成功，但数据库事务回滚
+```
+
+Outbox Pattern 的做法是：
+
+```text
+业务数据和 outbox 事件表写在同一个数据库事务中
+后台任务扫描 outbox 表并发送到 Kafka
+发送成功后标记事件已发布
+```
+
+这样可以降低数据库状态和消息事件不一致的风险。
+
+---
+
+## 2. CDC 模式
+
+CDC 是 Change Data Capture。
+
+典型做法：
+
+```text
+业务写 MySQL
+Debezium / Canal 监听 binlog
+变更事件写入 Kafka
+下游系统消费 Kafka
+```
+
+优点是业务代码不需要显式发消息，数据变更可以自动进入事件流。
+
+适合：
+
+```text
+搜索索引同步
+数据仓库同步
+缓存更新
+异构系统同步
+```
+
+---
+
+## 3. 事件溯源
+
+事件溯源强调保存事件，而不是只保存最终状态。
+
+例如订单状态不是只存：
+
+```text
+order.status = PAID
+```
+
+而是记录完整事件：
+
+```text
+OrderCreated
+OrderPaid
+OrderShipped
+OrderCompleted
+```
+
+通过事件可以重建状态，也可以追溯状态变化过程。
+
+Kafka 的持久化日志和回放能力非常适合这类架构，但业务复杂度也更高。
+
+---
+
+# 十二、面试表达总结
+
+如果面试官问：“Kafka 为什么流行？”
+
+可以这样回答：
+
+> Kafka 流行的核心原因是它把生产者和消费者解耦了。生产者只需要把事件写入 Topic，不需要关心有多少消费者、消费者是否在线、消费速度如何。Kafka 把消息持久化成分区日志，消费者通过 offset 记录消费进度，因此支持断点续读和历史回放。Topic 可以通过 Partition 水平扩展吞吐，副本机制提供容错能力，所以 Kafka 很适合异步解耦、日志采集、实时分析、数据同步和事件驱动架构。
+
+如果面试官问：“Kafka 和普通消息队列有什么区别？”
+
+可以这样回答：
+
+> Kafka 更像分布式持久化日志，而不是简单队列。普通队列通常是消息被消费后就移除，而 Kafka 的消息会按照保留策略保存在 Partition 日志中，不同 Consumer Group 可以独立消费同一份数据，并各自维护 offset。这让 Kafka 不仅可以做消息队列，还可以做事件回放、日志采集、实时数据管道和流处理平台。
+
+如果面试官问：“Kafka 如何保证顺序？”
+
+可以这样回答：
+
+> Kafka 只保证单 Partition 内有序，不保证整个 Topic 全局有序。如果业务要求同一个实体有序，比如同一个订单的事件顺序，就应该使用 orderId 作为消息 key，让同一个 orderId 的消息进入同一个 Partition。这样可以保证订单维度有序，但不能保证所有订单全局有序。
+
+如果面试官问：“Kafka 消息会不会重复消费？”
+
+可以这样回答：
+
+> 会。Kafka 常见语义是至少一次消费，也就是消息不容易丢，但可能重复。比如消费者处理成功后，在提交 offset 前宕机，重启后这条消息可能再次被消费。因此消费端必须做幂等，比如 eventId 去重、数据库唯一索引、消费记录表或状态机判断。
+
+---
+
+# 十三、总结
+
+Kafka 的核心价值不是“发消息”，而是把系统之间的同步依赖改造成可持久化、可回放、可扩展的事件流。
+
+可以总结为：
+
+```text
+Kafka 解决的问题：
+- 服务解耦
+- 异步削峰
+- 高吞吐消息传输
+- 消息持久化
+- 消息回放
+- 多消费者独立订阅
+- 实时数据流处理
+
+Kafka 的核心机制：
+- Topic 做消息分类
+- Partition 做并行和局部有序
+- Consumer Group 做负载均衡
+- Offset 做消费进度管理
+- Replication 做高可用
+- Page Cache 和顺序写提升吞吐
+```
+
+真正掌握 Kafka，不是会创建 Topic、发送消息、消费消息，而是要理解：
+
+```text
+为什么需要事件解耦
+消息是否允许重复
+消费者如何幂等
+Partition 如何规划
+如何监控消费积压
+如何保证局部顺序
+如何处理消息和数据库一致性
+Kafka 适合什么场景，不适合什么场景
+```
+
+这才是 Kafka 在真实工程中的核心能力。
+
+---
+
+# 可以重点抽出来深入研究的亮点
+
+下面这些部分非常适合后续单独写成技术博客，也适合系统设计面试深挖。
+
+## 1. Kafka 为什么高吞吐？
+
+可以重点研究：
+
+```text
+顺序写磁盘
+Page Cache
+零拷贝
+批量发送
+批量拉取
+Partition 并行
+压缩机制
+```
+
+这个方向适合回答 Kafka 底层性能类面试题。
+
+---
+
+## 2. Topic、Partition 和 Consumer Group 的关系
+
+可以重点研究：
+
+```text
+Partition 如何决定并行度
+Consumer Group 如何分配 Partition
+为什么 Consumer 数量超过 Partition 会空闲
+Partition 数量怎么规划
+扩容 Partition 有什么影响
+```
+
+这个方向适合系统设计和容量规划。
+
+---
+
+## 3. Kafka 如何保证消息顺序？
+
+可以重点研究：
+
+```text
+单 Partition 有序
+Topic 不保证全局有序
+消息 key 如何决定分区
+同一个订单如何保证顺序
+全局有序为什么会牺牲吞吐
+```
+
+这个方向是面试高频点。
+
+---
+
+## 4. Kafka 消息可靠性机制
+
+可以重点研究：
+
+```text
+acks=0 / 1 / all
+副本机制
+ISR
+min.insync.replicas
+Producer retry
+幂等 Producer
+事务 Producer
+```
+
+这个方向适合回答“Kafka 消息会不会丢”。
+
+---
+
+## 5. Kafka 消费语义与幂等设计
+
+可以重点研究：
+
+```text
+自动提交 offset
+手动提交 offset
+至少一次
+至多一次
+精确一次
+重复消费
+消费端幂等
+消费记录表
+数据库唯一索引
+```
+
+这个方向非常适合结合真实项目讲。
+
+---
+
+## 6. Kafka 消费积压排查
+
+可以重点研究：
+
+```text
+consumer lag
+消费者处理慢
+Partition 不足
+下游数据库瓶颈
+rebalance 频繁
+消息体过大
+批量消费优化
+消费者扩容
+```
+
+这个方向适合生产事故排查专题。
+
+---
+
+## 7. Kafka 与数据库一致性
+
+可以重点研究：
+
+```text
+本地事务和消息发送不一致
+Outbox Pattern
+CDC
+Debezium
+Canal
+事务消息
+最终一致性
+补偿机制
+```
+
+这个方向适合架构设计和分布式系统专题。
+
+---
+
+## 8. Kafka 在事件驱动架构中的应用
+
+可以重点研究：
+
+```text
+事件建模
+Topic 设计
+事件版本管理
+事件回放
+事件溯源
+微服务解耦
+实时数仓
+数据湖
+```
+
+这个方向适合从普通后端开发进阶到架构视角。
+
+```
+```

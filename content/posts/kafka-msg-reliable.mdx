@@ -1,0 +1,1366 @@
+# Kafka 消息可靠性机制：acks、副本、ISR、重试、幂等 Producer 与事务 Producer
+
+## 前言
+
+Kafka 面试里有一个非常高频的问题：
+
+```text
+Kafka 消息会不会丢？
+```
+
+很多人会直接回答：
+
+```text
+设置 acks=all 就不会丢。
+```
+
+这个回答不够严谨。
+
+更准确的答案是：
+
+```text
+Kafka 能通过副本机制、acks、ISR、min.insync.replicas、Producer retry、幂等 Producer 和事务 Producer 来降低消息丢失和重复的风险，但不同配置对应不同可靠性边界。Kafka 不是简单配置一个参数就绝对不丢，端到端可靠性还取决于 Producer、Broker、Consumer、业务幂等和下游存储。
+```
+
+Kafka 可靠性要分三段看：
+
+```text
+Producer 发送阶段：消息有没有成功写入 Kafka？
+Broker 存储阶段：写入 Kafka 的消息会不会因为 Broker 故障丢失？
+Consumer 消费阶段：消息处理成功了吗？offset 提交是否正确？
+```
+
+本文重点讨论 Producer 到 Broker 这一段的可靠性机制，并延伸到事务 Producer 和端到端一致性设计。
+
+核心问题包括：
+
+```text
+1. acks=0 / 1 / all 有什么区别？
+2. Kafka 副本机制如何工作？
+3. ISR 是什么？
+4. min.insync.replicas 有什么作用？
+5. Producer retry 会不会导致重复或乱序？
+6. 幂等 Producer 解决了什么问题？
+7. 事务 Producer 解决了什么问题？
+8. Kafka 消息到底什么时候会丢？
+9. 大厂生产环境如何配置？
+10. 面试如何回答“Kafka 消息会不会丢”？
+```
+
+---
+
+# 一、Kafka 消息可靠性先看写入链路
+
+Kafka 的写入链路可以简化为：
+
+```text
+Producer
+  -> 发送 ProduceRequest
+  -> Broker 上的 Partition Leader
+  -> Leader 追加日志
+  -> Follower 从 Leader 复制
+  -> 根据 acks 策略返回响应
+```
+
+一个 Topic 会被拆成多个 Partition。
+
+每个 Partition 有一个 Leader 和若干 Follower。
+
+例如：
+
+```text
+Topic: order_events
+Partition 0:
+  Leader   -> Broker 1
+  Follower -> Broker 2
+  Follower -> Broker 3
+```
+
+Producer 写入某个 Partition 时，通常写到该 Partition 的 Leader。
+
+Follower 从 Leader 拉取数据，保持副本同步。
+
+Kafka 的可靠性主要来自：
+
+```text
+副本复制
+Leader/Follower 机制
+ISR
+acks
+min.insync.replicas
+Producer retry
+幂等写入
+事务写入
+```
+
+这些机制共同决定了消息写入成功后，遇到 Broker 故障时是否还能保留下来。
+
+---
+
+# 二、acks=0 / 1 / all 的区别
+
+Producer 发送消息时，最关键的可靠性参数之一是：
+
+```text
+acks
+```
+
+它决定 Producer 要等 Kafka 确认到什么程度，才认为消息发送成功。
+
+常见取值：
+
+```text
+acks=0
+acks=1
+acks=all
+```
+
+---
+
+## 1. acks=0：不等待确认
+
+配置：
+
+```text
+acks=0
+```
+
+含义：
+
+```text
+Producer 把消息发出去后，不等待 Broker 响应。
+```
+
+优点：
+
+```text
+延迟最低
+吞吐最高
+Producer 不阻塞等待确认
+```
+
+缺点：
+
+```text
+可靠性最弱
+消息可能没有到达 Broker
+Broker 拒绝或异常时 Producer 不知道
+网络抖动时可能直接丢
+```
+
+适合场景：
+
+```text
+监控指标
+部分埋点
+可丢日志
+对数据完整性要求不高的场景
+```
+
+不适合：
+
+```text
+订单事件
+支付事件
+库存事件
+审计日志
+核心业务消息
+```
+
+一句话：
+
+```text
+acks=0 是性能优先，不适合可靠消息。
+```
+
+---
+
+## 2. acks=1：Leader 写入成功即返回
+
+配置：
+
+```text
+acks=1
+```
+
+含义：
+
+```text
+消息写入 Partition Leader 成功后，Leader 就返回成功。
+```
+
+此时 Follower 可能还没有复制完成。
+
+流程：
+
+```text
+Producer -> Leader
+Leader 写本地日志成功
+Leader 返回成功
+Follower 后续异步复制
+```
+
+优点：
+
+```text
+性能较好
+比 acks=0 可靠
+只要 Leader 写入成功，Producer 就知道消息被 Kafka 接收
+```
+
+风险：
+
+```text
+Leader 写入成功并返回后，如果还没同步给 Follower，Leader 就宕机，则这条消息可能丢失。
+```
+
+典型事故流程：
+
+```text
+1. Producer 发送消息
+2. Leader 写入成功
+3. Leader 返回 ack
+4. Follower 还没复制这条消息
+5. Leader 宕机
+6. 某个没有该消息的 Follower 被选为新 Leader
+7. 消息丢失
+```
+
+适合：
+
+```text
+普通业务日志
+可补偿业务事件
+对吞吐要求较高、允许极小概率丢失的场景
+```
+
+---
+
+## 3. acks=all：等待 ISR 副本确认
+
+配置：
+
+```text
+acks=all
+```
+
+或者：
+
+```text
+acks=-1
+```
+
+含义：
+
+```text
+Leader 需要等待 ISR 中的副本确认后，才返回成功。
+```
+
+Kafka Broker 配置文档说明，`min.insync.replicas` 指定当 Producer 使用 `acks=all` 时，一次写入成功所需的最小同步副本数量；在 `acks=all` 情况下，ISR 中同步副本需要确认写入，写入才算成功。
+
+优点：
+
+```text
+可靠性最高
+只要至少有足够多同步副本保留消息，Leader 故障后消息仍有机会保留
+```
+
+缺点：
+
+```text
+延迟更高
+吞吐更低
+ISR 不足时写入可能失败
+```
+
+适合：
+
+```text
+订单事件
+支付事件
+库存事件
+资金流水事件
+审计事件
+核心业务消息
+```
+
+生产中，可靠性较高的 Kafka 写入通常选择：
+
+```text
+acks=all
+replication.factor >= 3
+min.insync.replicas >= 2
+enable.idempotence=true
+```
+
+---
+
+# 三、acks 对比总结
+
+| 配置       | Producer 等待什么 | 吞吐 | 可靠性 | 可能丢失场景                       |
+| -------- | ------------- | -- | --- | ---------------------------- |
+| acks=0   | 不等待 Broker 确认 | 最高 | 最低  | 网络失败、Broker 拒绝、Leader 异常     |
+| acks=1   | Leader 写入成功   | 较高 | 中等  | Leader 成功返回后，Follower 未复制就宕机 |
+| acks=all | ISR 副本确认      | 较低 | 最高  | ISR 配置不足、极端多副本故障、刷盘/运维异常     |
+
+一句话：
+
+```text
+acks 控制的是 Producer 认为“写入成功”的确认边界。
+```
+
+但要注意：
+
+```text
+acks=all 不等于绝对不丢。
+```
+
+它还要配合：
+
+```text
+replication.factor
+min.insync.replicas
+unclean.leader.election.enable
+Producer retry
+幂等 Producer
+Broker 磁盘可靠性
+```
+
+---
+
+# 四、副本机制：Kafka 如何容忍 Broker 故障？
+
+Kafka 的副本机制是可靠性的基础。
+
+每个 Partition 可以有多个 Replica。
+
+例如副本因子为 3：
+
+```text
+Partition 0:
+  Replica 1 on Broker A
+  Replica 2 on Broker B
+  Replica 3 on Broker C
+```
+
+其中一个是 Leader，其他是 Follower。
+
+```text
+Leader：处理读写请求
+Follower：从 Leader 复制日志
+```
+
+Kafka 官方文档说明，每个 Partition 有一个服务器作为 Leader，零个或多个服务器作为 Follower；Leader 处理该 Partition 的读写请求，Follower 被动复制 Leader；如果 Leader 失败，一个 Follower 会自动成为新 Leader。
+
+---
+
+## 1. 为什么需要副本？
+
+如果没有副本：
+
+```text
+Partition 只有一份数据
+Broker 宕机
+该 Partition 数据不可用甚至丢失
+```
+
+有副本后：
+
+```text
+Broker A 挂了
+Broker B 或 C 上还有副本
+可以选出新 Leader
+继续服务
+```
+
+副本机制解决的是：
+
+```text
+Broker 节点故障下的数据可用性和持久性。
+```
+
+---
+
+## 2. 副本因子怎么选？
+
+常见选择：
+
+```text
+replication.factor=1
+replication.factor=2
+replication.factor=3
+```
+
+生产核心场景通常至少为 3。
+
+原因：
+
+```text
+1 个副本：无容灾
+2 个副本：能容忍 1 个节点故障，但维护窗口风险较高
+3 个副本：更常见，可以容忍更多故障组合
+```
+
+推荐：
+
+```text
+普通生产 Topic：replication.factor=3
+核心业务 Topic：replication.factor=3 或更高，结合跨机架部署
+测试环境：可以为 1
+```
+
+副本越多，可靠性越高，但代价也越高：
+
+```text
+磁盘成本增加
+网络复制流量增加
+Broker 写入压力增加
+延迟可能上升
+```
+
+---
+
+# 五、ISR：In-Sync Replicas 是什么？
+
+ISR 全称是 In-Sync Replicas。
+
+它表示当前和 Leader 保持同步的副本集合。
+
+例如：
+
+```text
+Partition 0:
+Leader = Broker A
+Replicas = A, B, C
+ISR = A, B, C
+```
+
+如果 Broker C 落后太多，Leader 会把 C 从 ISR 中移除：
+
+```text
+ISR = A, B
+```
+
+如果 Broker C 追上来，又可以重新加入 ISR。
+
+Kafka 早期配置文档中也说明，如果 Follower 在指定时间窗口内没有发送 fetch 请求，Leader 会把它从 ISR 中移除并视为不可用。
+
+---
+
+## 1. 为什么 ISR 重要？
+
+因为 `acks=all` 等待的是 ISR 里的同步副本，而不是所有 Replica。
+
+假设：
+
+```text
+replication.factor = 3
+Replicas = A, B, C
+ISR = A, B
+```
+
+此时 C 已经落后，不在 ISR 中。
+
+Producer 使用 `acks=all` 写入时，Leader 只需要等待 ISR 中的 A、B 达到确认条件。
+
+这避免了一个落后很久的副本拖垮整个写入链路。
+
+---
+
+## 2. ISR 缩小意味着什么？
+
+ISR 缩小通常说明：
+
+```text
+某些副本复制跟不上 Leader。
+```
+
+可能原因：
+
+```text
+Follower Broker 负载高
+网络抖动
+磁盘慢
+GC 停顿
+Broker 宕机
+分区副本过多
+Leader 写入太快
+```
+
+ISR 缩小会影响可靠性。
+
+如果 ISR 从 3 个变成 1 个：
+
+```text
+只剩 Leader 自己在 ISR 中
+```
+
+此时即使 Producer 配置了 `acks=all`，如果没有设置合理的 `min.insync.replicas`，也可能退化成只写 Leader 成功。
+
+这就引出 `min.insync.replicas`。
+
+---
+
+# 六、min.insync.replicas：防止 acks=all 退化
+
+`min.insync.replicas` 是一个非常关键的 Broker / Topic 配置。
+
+它表示：
+
+```text
+当 Producer 使用 acks=all 时，写入成功所需的最小 ISR 副本数量。
+```
+
+例如：
+
+```text
+replication.factor=3
+min.insync.replicas=2
+acks=all
+```
+
+表示：
+
+```text
+至少需要 2 个 ISR 副本可用，写入才能成功。
+```
+
+如果 ISR 数量小于 2：
+
+```text
+ISR = 1
+```
+
+那么 Producer 写入会失败，通常会收到类似 NotEnoughReplicas 的错误。
+
+这看起来降低了可用性，但提高了可靠性。
+
+因为它避免了：
+
+```text
+只有 Leader 一个副本还在同步集合中时，仍然继续接受核心消息写入。
+```
+
+---
+
+## 1. 为什么推荐 replication.factor=3 + min.insync.replicas=2？
+
+这是生产中非常常见的组合。
+
+```text
+replication.factor=3
+min.insync.replicas=2
+acks=all
+```
+
+含义：
+
+```text
+每条消息有 3 个副本目标；
+至少 2 个同步副本确认，写入才成功；
+允许 1 个副本故障或短暂落后；
+但不允许只有 Leader 单副本时继续成功写入。
+```
+
+这是可靠性和可用性的折中。
+
+如果设置：
+
+```text
+min.insync.replicas=3
+```
+
+可靠性更强，但只要一个副本短暂落后，写入就失败，可用性较差。
+
+如果设置：
+
+```text
+min.insync.replicas=1
+```
+
+可用性更高，但可靠性变差。
+
+---
+
+# 七、Producer retry：失败重试机制
+
+Producer 发送消息可能失败。
+
+常见原因：
+
+```text
+网络抖动
+Leader 切换
+Broker 短暂不可用
+NotLeaderOrFollower
+Timeout
+NotEnoughReplicas
+请求超时
+```
+
+Producer retry 的作用是：
+
+```text
+在可重试错误发生时，自动重新发送消息。
+```
+
+如果没有 retry，短暂网络抖动就可能导致消息发送失败。
+
+所以生产中通常会开启 retry。
+
+---
+
+## 1. retry 会带来什么问题？
+
+retry 可以减少消息丢失，但会带来两个新问题：
+
+```text
+重复消息
+消息乱序
+```
+
+### 重复消息
+
+流程：
+
+```text
+1. Producer 发送消息
+2. Broker 实际写入成功
+3. Broker 返回 ack 时网络超时
+4. Producer 认为失败，触发 retry
+5. Broker 再写入一次
+6. Topic 中出现重复消息
+```
+
+### 消息乱序
+
+如果没有幂等 Producer，并且允许多个 in-flight request：
+
+```text
+batch1 发送失败，等待重试
+batch2 发送成功
+batch1 重试成功
+```
+
+最终日志中可能是：
+
+```text
+batch2
+batch1
+```
+
+Kafka Producer 配置文档也明确说明，在 `enable.idempotence=false` 且 `max.in.flight.requests.per.connection > 1` 时，如果启用 retry，可能因为后续批次先成功而导致顺序变化。
+
+所以 retry 必须和幂等 Producer、in-flight 配置一起理解。
+
+---
+
+# 八、幂等 Producer：避免 retry 导致重复写入
+
+幂等 Producer 是 Kafka 可靠性机制中的关键能力。
+
+配置：
+
+```text
+enable.idempotence=true
+```
+
+Kafka Producer 文档说明，开启幂等后，Producer 会确保每条消息在流中只写入一份；如果关闭幂等，Broker 故障等引发的 Producer retry 可能导致重复写入。启用幂等还要求 `acks=all`、`retries>0`、`max.in.flight.requests.per.connection<=5` 等条件。
+
+---
+
+## 1. 幂等 Producer 解决什么？
+
+它主要解决：
+
+```text
+Producer retry 导致同一条消息被写入多次。
+```
+
+没有幂等：
+
+```text
+send msgA
+ack 丢失
+retry msgA
+Broker 写入两份 msgA
+```
+
+有幂等：
+
+```text
+send msgA with ProducerId + SequenceNumber
+ack 丢失
+retry msgA with same sequence
+Broker 识别重复
+只保留一份
+```
+
+---
+
+## 2. 幂等 Producer 的核心原理
+
+幂等 Producer 的核心是 Broker 为每个 Producer 分配 Producer ID，并维护每个 Partition 上的序列号。
+
+简化理解：
+
+```text
+ProducerId = 123
+Partition 0:
+  sequence 0 -> msgA
+  sequence 1 -> msgB
+  sequence 2 -> msgC
+```
+
+如果 Producer 重试发送 sequence=1 的消息，Broker 可以判断：
+
+```text
+这个 sequence 已经写过了
+这是重复消息
+不再重复追加
+```
+
+所以幂等 Producer 可以做到：
+
+```text
+单 Producer、单 Partition 维度下避免重复写入。
+```
+
+---
+
+## 3. 幂等 Producer 的边界
+
+幂等 Producer 不等于端到端 exactly-once。
+
+它主要保证的是：
+
+```text
+Producer 到 Kafka Broker 写入阶段不因重试产生重复。
+```
+
+它不解决：
+
+```text
+Consumer 处理后宕机导致重复消费
+消息写入 Kafka 成功但业务数据库写失败
+业务处理成功但 offset 提交失败
+跨多个 Topic/Partition 的原子写入
+Kafka 消息和外部数据库事务一致性
+```
+
+所以，幂等 Producer 是 Kafka 写入可靠性的基础增强，但不是完整分布式事务。
+
+---
+
+# 九、事务 Producer：跨 Partition / Topic 的原子写入
+
+事务 Producer 进一步增强 Kafka 语义。
+
+KafkaProducer API 文档说明，从 Kafka 0.11 开始支持幂等 Producer 和事务 Producer；幂等 Producer 可以避免 retry 引入重复，事务 Producer 允许应用将消息原子性地发送到多个 Partition 和 Topic。
+
+事务 Producer 典型配置：
+
+```text
+transactional.id=my-producer-transaction-id
+enable.idempotence=true
+```
+
+核心 API：
+
+```text
+initTransactions()
+beginTransaction()
+send()
+sendOffsetsToTransaction()
+commitTransaction()
+abortTransaction()
+```
+
+---
+
+## 1. 事务 Producer 解决什么？
+
+它解决的是：
+
+```text
+多条 Kafka 消息之间的原子性。
+```
+
+例如，一个应用要同时写两个 Topic：
+
+```text
+payment_events
+order_events
+```
+
+如果没有事务，可能出现：
+
+```text
+payment_events 写成功
+order_events 写失败
+```
+
+事务 Producer 可以让这两次写入要么都提交，要么都回滚。
+
+---
+
+## 2. 消费-处理-生产的事务模式
+
+事务 Producer 还常用于流处理场景：
+
+```text
+从 input topic 消费消息
+处理后写 output topic
+同时提交 input offset
+```
+
+事务可以把：
+
+```text
+输出消息
+输入 offset 提交
+```
+
+放进同一个 Kafka 事务里。
+
+这样可以避免：
+
+```text
+输出写成功，但 offset 没提交 -> 重复处理
+offset 提交成功，但输出没写 -> 消息丢失
+```
+
+这就是 Kafka Streams 里 exactly-once 语义的基础。
+
+---
+
+## 3. 事务 Producer 的限制
+
+事务 Producer 主要保证 Kafka 内部的事务。
+
+它不能自动保证 Kafka 和外部数据库的一致性。
+
+例如：
+
+```text
+写 MySQL 成功
+写 Kafka 事务失败
+```
+
+或者：
+
+```text
+写 Kafka 成功
+写 MySQL 失败
+```
+
+这些仍然需要业务设计。
+
+常见方案：
+
+```text
+Outbox Pattern
+CDC
+本地事务表
+幂等消费
+补偿任务
+事务消息平台
+```
+
+所以要记住：
+
+```text
+Kafka 事务主要解决 Kafka 内部多分区、多 Topic、offset 提交和输出消息之间的一致性。
+```
+
+不是直接解决所有外部系统的分布式事务。
+
+---
+
+# 十、Kafka 消息到底什么时候会丢？
+
+下面按阶段拆。
+
+---
+
+## 1. Producer 发送前丢
+
+消息还在应用内存里，Producer 还没成功发给 Kafka，应用就崩溃。
+
+例如：
+
+```text
+业务线程构造消息
+还没 send
+应用进程宕机
+```
+
+解决：
+
+```text
+重要事件不要只存在内存
+使用 Outbox Pattern
+业务数据和事件表同库事务写入
+后台任务可靠发送 Kafka
+```
+
+---
+
+## 2. Producer 发送中丢
+
+配置不可靠时可能丢。
+
+例如：
+
+```text
+acks=0
+Producer 不等确认
+网络异常
+消息没到 Broker
+Producer 也不知道
+```
+
+解决：
+
+```text
+核心消息不要用 acks=0
+使用 acks=all
+开启 retry
+开启幂等 Producer
+```
+
+---
+
+## 3. Leader 写入后但未复制就丢
+
+配置：
+
+```text
+acks=1
+replication.factor=3
+```
+
+流程：
+
+```text
+Leader 写入成功并 ack
+Follower 还没复制
+Leader 宕机
+新 Leader 没有该消息
+消息丢失
+```
+
+解决：
+
+```text
+acks=all
+replication.factor>=3
+min.insync.replicas>=2
+unclean.leader.election.enable=false
+```
+
+---
+
+## 4. ISR 不足但仍继续写
+
+如果：
+
+```text
+min.insync.replicas=1
+```
+
+当 ISR 只剩 Leader 时，写入仍可能成功。
+
+这时 Leader 一挂，数据风险很高。
+
+解决：
+
+```text
+min.insync.replicas=2
+acks=all
+监控 UnderReplicatedPartitions / ISR shrink
+```
+
+---
+
+## 5. Consumer 处理阶段丢
+
+严格说，这是“业务处理丢”，不是 Kafka Broker 丢。
+
+典型场景：
+
+```text
+Consumer 拉到消息
+自动提交 offset
+业务处理失败
+Consumer 崩溃
+消息不会再消费
+```
+
+解决：
+
+```text
+关闭自动提交
+业务处理成功后再提交 offset
+消费端幂等
+失败重试
+死信队列
+```
+
+---
+
+## 6. 运维误操作导致丢
+
+例如：
+
+```text
+删除 Topic
+错误修改 retention
+磁盘损坏
+错误清理日志目录
+副本因子配置过低
+未备份核心 Topic
+```
+
+解决：
+
+```text
+权限控制
+Topic 删除保护
+变更审批
+监控 retention
+核心 Topic 多副本
+跨 AZ 部署
+备份和审计
+```
+
+---
+
+# 十一、Kafka 消息会不会重复？
+
+会。
+
+即使你使用：
+
+```text
+acks=all
+enable.idempotence=true
+```
+
+也只能避免 Producer retry 阶段的重复写入。
+
+Consumer 端仍然可能重复消费。
+
+典型流程：
+
+```text
+Consumer 处理消息成功
+还没提交 offset
+Consumer 宕机
+重启后从旧 offset 再消费
+```
+
+所以业务必须幂等。
+
+常见幂等方式：
+
+```text
+eventId 去重
+业务唯一键
+数据库唯一索引
+消费记录表
+状态机条件更新
+幂等接口
+```
+
+例如订单支付事件：
+
+```sql
+UPDATE orders
+SET status = 'PAID'
+WHERE order_id = ? AND status = 'CREATED';
+```
+
+如果状态已经是 `PAID`，重复事件不会再次推进状态。
+
+大厂实践里通常不会把“Exactly Once”完全寄托在 Kafka 参数上，而是采用：
+
+```text
+Kafka 至少一次投递
+Producer 幂等避免写入重复
+Consumer 业务幂等避免处理重复
+数据库状态机保证最终正确
+异常补偿修复边界场景
+```
+
+---
+
+# 十二、大厂生产推荐配置
+
+对于核心业务消息，常见推荐是：
+
+```text
+replication.factor=3
+min.insync.replicas=2
+acks=all
+enable.idempotence=true
+retries > 0
+delivery.timeout.ms 合理设置
+request.timeout.ms 合理设置
+unclean.leader.election.enable=false
+```
+
+含义：
+
+```text
+3 副本保证容灾基础
+至少 2 个 ISR 确认才算成功
+Producer 等待 ISR 确认
+Producer 重试不写重复
+禁止不同步副本被选为 Leader
+```
+
+但这些配置会带来代价：
+
+```text
+写入延迟增加
+吞吐下降
+ISR 不足时写入失败
+Broker 网络和磁盘成本增加
+Producer 需要处理发送失败
+```
+
+所以要按业务等级区分。
+
+---
+
+## 1. 日志埋点类
+
+```text
+acks=1 或 acks=all
+enable.idempotence=true
+compression=lz4/zstd
+replication.factor=2 或 3
+```
+
+如果允许少量丢失，可以降低可靠性要求。
+
+---
+
+## 2. 核心交易事件
+
+```text
+acks=all
+enable.idempotence=true
+replication.factor=3
+min.insync.replicas=2
+unclean.leader.election.enable=false
+手动处理发送失败
+Outbox Pattern
+消费端幂等
+```
+
+---
+
+## 3. 流处理 exactly-once 场景
+
+```text
+transactional.id
+enable.idempotence=true
+isolation.level=read_committed
+sendOffsetsToTransaction
+```
+
+用于 Kafka 内部消费-处理-生产链路。
+
+---
+
+# 十三、源码视角：可靠性看哪些模块？
+
+## 1. Producer 客户端
+
+重点看：
+
+```text
+RecordAccumulator
+Sender
+ProducerBatch
+TransactionManager
+Idempotent Producer
+ProducerId / Sequence Number
+ProduceRequest
+ProduceResponse
+```
+
+关注问题：
+
+```text
+消息如何攒 batch？
+失败如何重试？
+sequence number 如何生成？
+Broker 如何识别重复？
+事务如何 begin / commit / abort？
+```
+
+---
+
+## 2. Broker 写入链路
+
+重点看：
+
+```text
+KafkaApis
+ReplicaManager
+Partition
+UnifiedLog / Log
+DelayedProduce
+```
+
+关注问题：
+
+```text
+ProduceRequest 如何处理？
+Leader 如何追加日志？
+acks=all 如何等待副本？
+ISR 不足时如何返回错误？
+```
+
+---
+
+## 3. 副本复制链路
+
+重点看：
+
+```text
+ReplicaFetcherThread
+Partition
+ReplicaManager
+ISR 管理
+LeaderAndIsr
+```
+
+关注问题：
+
+```text
+Follower 如何从 Leader 拉数据？
+副本什么时候进入 / 退出 ISR？
+Leader 故障时如何切换？
+```
+
+---
+
+## 4. 事务链路
+
+重点看：
+
+```text
+TransactionCoordinator
+TransactionLog
+ProducerStateManager
+__transaction_state
+```
+
+关注问题：
+
+```text
+transactional.id 如何映射 ProducerId？
+事务状态如何保存？
+commit / abort marker 如何写入？
+Consumer read_committed 如何过滤未提交事务？
+```
+
+---
+
+# 十四、面试表达
+
+## 1. Kafka 消息会不会丢？
+
+可以这样回答：
+
+> Kafka 消息是否会丢取决于 Producer、Broker 和 Consumer 三段链路。Producer 侧如果用 acks=0，网络抖动就可能丢；acks=1 时 Leader 写入成功就返回，但如果 Follower 还没复制 Leader 就宕机，也可能丢。更可靠的配置是 acks=all、replication.factor=3、min.insync.replicas=2、enable.idempotence=true，并关闭 unclean leader election。但这也不代表端到端绝对不丢，Consumer 还要关闭自动提交，处理成功后提交 offset，并做幂等和补偿。
+
+---
+
+## 2. acks=0 / 1 / all 有什么区别？
+
+可以这样回答：
+
+> acks=0 表示 Producer 不等 Broker 确认，吞吐最高但可靠性最低；acks=1 表示 Leader 写入成功就返回，性能较好，但如果 Leader 返回后还没同步给 Follower 就宕机，消息可能丢；acks=all 表示等待 ISR 副本确认，可靠性最高，但延迟和写入成本也更高。核心业务一般使用 acks=all，并配合 min.insync.replicas。
+
+---
+
+## 3. ISR 是什么？
+
+可以这样回答：
+
+> ISR 是 In-Sync Replicas，表示当前和 Leader 保持同步的副本集合。Kafka 的 acks=all 等待的是 ISR 中的同步副本确认，而不是所有副本。Follower 如果落后太多，会被移出 ISR；追上后可以重新加入。ISR 缩小意味着副本同步能力下降，可靠性风险上升。
+
+---
+
+## 4. min.insync.replicas 有什么作用？
+
+可以这样回答：
+
+> min.insync.replicas 指定在 acks=all 时，写入成功所需的最小同步副本数。例如 replication.factor=3、min.insync.replicas=2，表示至少 2 个 ISR 副本可用并确认，Producer 写入才成功。如果 ISR 只剩 1 个，写入会失败。它的作用是防止 acks=all 在 ISR 缩小到只有 Leader 时退化成单副本写入。
+
+---
+
+## 5. Producer retry 会不会导致重复？
+
+可以这样回答：
+
+> 会。比如 Broker 实际写入成功，但 ack 返回时网络超时，Producer 认为失败后 retry，就可能写入重复消息。解决方式是开启幂等 Producer，也就是 enable.idempotence=true，Kafka 会通过 ProducerId 和 Sequence Number 识别重复写入，避免 retry 导致同一条消息在同一 Partition 中写多份。
+
+---
+
+## 6. 幂等 Producer 和事务 Producer 有什么区别？
+
+可以这样回答：
+
+> 幂等 Producer 主要解决单 Producer 到单 Partition 写入阶段，因 retry 导致的重复消息问题。事务 Producer 进一步支持跨多个 Partition 和 Topic 的原子写入，也可以把消费 offset 和输出消息放到同一个 Kafka 事务中，常用于 Kafka 内部的 exactly-once 流处理。但 Kafka 事务不能自动解决 Kafka 和外部数据库之间的分布式事务，这仍然需要 Outbox、CDC、幂等和补偿机制。
+
+---
+
+# 十五、总结
+
+Kafka 消息可靠性不是一个参数决定的，而是一组机制共同作用：
+
+```text
+acks：决定 Producer 等待确认的边界
+副本机制：决定 Broker 故障下的数据冗余
+ISR：决定哪些副本算同步副本
+min.insync.replicas：防止同步副本不足时仍然写成功
+retry：处理短暂失败
+幂等 Producer：避免 retry 造成重复写入
+事务 Producer：支持 Kafka 内部多分区、多 Topic 原子写入
+Consumer 幂等：处理重复消费
+Outbox / CDC：解决业务数据库和 Kafka 消息一致性
+```
+
+生产环境常见可靠配置是：
+
+```text
+replication.factor=3
+min.insync.replicas=2
+acks=all
+enable.idempotence=true
+retries>0
+unclean.leader.election.enable=false
+```
+
+但真正成熟的 Kafka 可靠性设计，不是只会调参数，而是清楚知道：
+
+```text
+哪里可能丢？
+哪里可能重复？
+哪里可能乱序？
+失败后怎么重试？
+重复后怎么幂等？
+Kafka 和数据库不一致怎么补偿？
+```
+
+一句话总结：
+
+```text
+Kafka 可以通过配置和机制把消息丢失风险降到很低，但端到端可靠性最终要靠 Producer、Broker、Consumer 和业务幂等共同保证。
+```

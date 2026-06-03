@@ -1,0 +1,1348 @@
+# Kafka Topic、Partition 和 Consumer Group 的关系：并行度、顺序性、Rebalance 与容量规划
+
+## 前言
+
+Kafka 的核心概念不多，但真正影响系统吞吐、顺序性、扩展性和稳定性的，主要是三个：
+
+```text
+Topic
+Partition
+Consumer Group
+```
+
+很多 Kafka 线上问题，本质都和这三个概念有关。
+
+例如：
+
+```text
+为什么我加了 Consumer，消费速度没变？
+为什么 Consumer 数量超过 Partition 后有些实例空闲？
+为什么同一个订单的消息顺序乱了？
+为什么扩容 Partition 后消息 key 的分布变了？
+为什么 Consumer Group 频繁 Rebalance，导致消费卡顿？
+Partition 数量到底怎么规划？
+```
+
+这些问题不是简单配置问题，而是 Kafka 并行模型和消费模型决定的。
+
+从开发角度看，理解 Topic、Partition 和 Consumer Group，是为了正确写 Producer 和 Consumer。
+
+从架构角度看，理解它们，是为了做容量规划、吞吐扩展、顺序性设计、消费积压治理和成本控制。
+
+从源码角度看，Kafka Broker 通过 Partition 组织日志文件，Consumer Group 通过 Group Coordinator 和 Assignor 完成 Partition 分配，客户端通过 FetchRequest 按 Partition 拉取数据。Go Sarama 这类客户端也围绕 Topic、Partition 和 Consumer Group 构建消费流程。
+
+本文重点拆解：
+
+```text
+1. Topic、Partition、Consumer Group 分别是什么？
+2. Partition 如何决定 Kafka 的并行度？
+3. Consumer Group 如何分配 Partition？
+4. 为什么 Consumer 数量超过 Partition 会空闲？
+5. Partition 数量怎么规划？
+6. 扩容 Partition 会有什么影响？
+7. Rebalance 为什么会影响消费稳定性？
+8. 大厂生产环境如何做容量规划？
+9. 面试中如何回答这类问题？
+```
+
+---
+
+# 一、Topic 是什么？
+
+Topic 是 Kafka 中消息的逻辑分类。
+
+例如：
+
+```text
+order_events
+payment_events
+user_events
+inventory_events
+log_events
+```
+
+Producer 写入 Topic，Consumer 订阅 Topic。
+
+可以把 Topic 理解为一条业务事件流。
+
+例如订单系统可以设计：
+
+```text
+order_events
+```
+
+里面的消息可能包括：
+
+```text
+OrderCreated
+OrderPaid
+OrderCancelled
+OrderShipped
+```
+
+Topic 是业务层面的概念，但真正决定 Kafka 存储、并行和顺序的是 Partition。
+
+---
+
+# 二、Partition 是什么？
+
+Partition 是 Topic 的物理分片。
+
+一个 Topic 可以有多个 Partition。
+
+例如：
+
+```text
+Topic: order_events
+
+Partition 0
+Partition 1
+Partition 2
+Partition 3
+```
+
+每个 Partition 本质上是一条有序的追加日志。
+
+```text
+Partition 0:
+offset 0 -> msgA
+offset 1 -> msgB
+offset 2 -> msgC
+
+Partition 1:
+offset 0 -> msgD
+offset 1 -> msgE
+offset 2 -> msgF
+```
+
+Kafka 保证：
+
+```text
+单个 Partition 内消息有序。
+```
+
+但不保证：
+
+```text
+整个 Topic 全局有序。
+```
+
+这是 Kafka 非常重要的设计取舍。
+
+如果要保证同一个订单的事件顺序，就应该让同一个 `orderId` 的消息进入同一个 Partition。
+
+例如：
+
+```text
+key = orderId
+```
+
+这样 Kafka Producer 会根据 key 计算 Partition，同一个 key 的消息会进入同一个 Partition，从而保证这个 key 维度的顺序。Kafka 官方文档也说明，带有相同 event key 的事件会写入同一个 Partition。
+
+---
+
+# 三、Consumer Group 是什么？
+
+Consumer Group 是 Kafka 的消费组机制。
+
+同一个 Consumer Group 内，多个 Consumer 共同消费一个或多个 Topic。
+
+例如：
+
+```text
+Consumer Group: inventory-service
+
+Consumer A
+Consumer B
+Consumer C
+```
+
+它们共同消费：
+
+```text
+Topic: order_events
+```
+
+Kafka 会把 Topic 的 Partition 分配给组内 Consumer。
+
+规则是：
+
+```text
+同一个 Consumer Group 中，一个 Partition 在同一时刻只能分配给一个 Consumer。
+```
+
+Confluent 的 Consumer 设计文档明确说明，一个 Partition 在同一个 Consumer Group 中任意时刻只会被一个 Consumer 消费。
+
+例如 Topic 有 4 个 Partition，Group 里有 2 个 Consumer：
+
+```text
+Partition 0 -> Consumer A
+Partition 1 -> Consumer A
+Partition 2 -> Consumer B
+Partition 3 -> Consumer B
+```
+
+如果 Group 里有 4 个 Consumer：
+
+```text
+Partition 0 -> Consumer A
+Partition 1 -> Consumer B
+Partition 2 -> Consumer C
+Partition 3 -> Consumer D
+```
+
+如果 Group 里有 6 个 Consumer：
+
+```text
+Partition 0 -> Consumer A
+Partition 1 -> Consumer B
+Partition 2 -> Consumer C
+Partition 3 -> Consumer D
+Consumer E -> 空闲
+Consumer F -> 空闲
+```
+
+这就是为什么 Consumer 数量超过 Partition 数量后，多出来的 Consumer 会空闲。
+
+---
+
+# 四、Partition 如何决定并行度？
+
+Kafka 的并行度主要由 Partition 决定。
+
+可以从 Producer、Broker、Consumer 三个角度看。
+
+---
+
+## 1. Producer 侧并行度
+
+Producer 可以把消息写到多个 Partition。
+
+如果消息均匀分布到多个 Partition，写入就可以分散到多个 Broker。
+
+例如：
+
+```text
+Topic: log_events
+Partition 0 -> Broker A
+Partition 1 -> Broker B
+Partition 2 -> Broker C
+Partition 3 -> Broker D
+```
+
+Producer 写入时：
+
+```text
+msg1 -> Partition 0
+msg2 -> Partition 1
+msg3 -> Partition 2
+msg4 -> Partition 3
+```
+
+这样写入压力可以分散到多个 Broker。
+
+但如果所有消息都使用同一个 key，例如：
+
+```text
+key = fixed_key
+```
+
+那么所有消息可能进入同一个 Partition。
+
+结果是：
+
+```text
+一个 Partition 特别热
+一个 Broker 压力特别高
+其他 Partition 空闲
+整体吞吐上不去
+```
+
+所以 Producer 侧并行度不仅取决于 Partition 数量，还取决于 key 分布是否均匀。
+
+---
+
+## 2. Broker 侧并行度
+
+Partition 分布在不同 Broker 上。
+
+不同 Partition 的 Leader 可以分布在不同 Broker 上。
+
+例如：
+
+```text
+Partition 0 Leader -> Broker A
+Partition 1 Leader -> Broker B
+Partition 2 Leader -> Broker C
+```
+
+Producer 写入不同 Partition，本质上是在写不同 Broker 上的不同日志文件。
+
+这让 Kafka 可以横向扩展写入吞吐。
+
+但如果 Partition Leader 分布不均，就可能出现：
+
+```text
+Broker A 上 Leader 特别多
+Broker A 网络和磁盘压力高
+其他 Broker 比较空闲
+```
+
+所以生产中不仅要规划 Partition 数，还要关注 Leader 分布和副本分布。
+
+---
+
+## 3. Consumer 侧并行度
+
+Consumer Group 内，一个 Partition 同时只能被一个 Consumer 消费。
+
+因此：
+
+```text
+同一个 Consumer Group 的最大消费并行度 ≈ Partition 数量
+```
+
+例如：
+
+```text
+Topic 有 8 个 Partition
+Consumer Group 最多可以有 8 个 Consumer 并行消费
+```
+
+如果 Consumer 数量少于 Partition 数量，一个 Consumer 会消费多个 Partition。
+
+如果 Consumer 数量等于 Partition 数量，通常每个 Consumer 消费一个 Partition。
+
+如果 Consumer 数量超过 Partition 数量，多出来的 Consumer 空闲。
+
+所以系统设计时必须记住一句话：
+
+```text
+想提高同一个 Consumer Group 的消费并行度，必须有足够多的 Partition。
+```
+
+---
+
+# 五、为什么 Consumer 数量超过 Partition 会空闲？
+
+这是 Kafka 面试高频题。
+
+原因是 Kafka 的消费模型决定的：
+
+```text
+同一个 Consumer Group 中，一个 Partition 不能同时被多个 Consumer 消费。
+```
+
+为什么不能？
+
+因为 Kafka 要保证 Partition 内顺序。
+
+如果一个 Partition 被多个 Consumer 同时消费：
+
+```text
+Partition 0:
+offset 0 -> Consumer A
+offset 1 -> Consumer B
+offset 2 -> Consumer A
+offset 3 -> Consumer B
+```
+
+那么消息处理顺序就很难保证。
+
+而 Kafka 的设计是：
+
+```text
+Partition 是并行和顺序的基本单位。
+```
+
+所以它选择让一个 Partition 在一个 Group 内只被一个 Consumer 消费。
+
+代价是：
+
+```text
+Consumer 数量超过 Partition 后无法继续提升并行度。
+```
+
+举例：
+
+```text
+Topic 有 3 个 Partition
+Consumer Group 有 5 个 Consumer
+```
+
+分配结果可能是：
+
+```text
+P0 -> C1
+P1 -> C2
+P2 -> C3
+C4 空闲
+C5 空闲
+```
+
+因此，盲目扩 Consumer 是没有意义的。
+
+如果消费积压严重，先要看：
+
+```text
+Partition 数是否足够
+Consumer 是否已经等于 Partition 数
+单个 Consumer 是否处理慢
+下游数据库是否慢
+是否存在热点 Partition
+```
+
+---
+
+# 六、不同 Consumer Group 之间的关系
+
+同一个 Topic 可以被多个 Consumer Group 独立消费。
+
+例如：
+
+```text
+Topic: order_events
+
+Consumer Group A: inventory-service
+Consumer Group B: notification-service
+Consumer Group C: analytics-service
+```
+
+每个 Group 都会完整消费一份 `order_events`。
+
+它们各自维护 offset，互不影响。
+
+这也是 Kafka 适合作为事件总线的原因。
+
+```text
+订单服务只发布一次 OrderCreated
+库存服务消费一份
+通知服务消费一份
+风控服务消费一份
+数仓服务消费一份
+```
+
+如果是同一个业务应用的多个实例，就应该使用同一个 Group ID。
+
+如果是不同业务系统要独立消费同一份消息，就应该使用不同 Group ID。
+
+---
+
+# 七、Consumer Group 如何分配 Partition？
+
+Kafka Consumer Group 的 Partition 分配由 Group Coordinator 协调。
+
+简化流程：
+
+```text
+1. Consumer 启动，加入 Consumer Group
+2. Group Coordinator 发现成员变化
+3. 触发 Rebalance
+4. Consumer Group 根据分配策略计算 Partition 分配结果
+5. 每个 Consumer 获得自己负责的 Partition
+6. Consumer 从对应 Partition 拉取消息
+```
+
+Confluent 文档说明，当新的 Consumer 加入或旧 Consumer 离开时，Topic 的 Partition 会在 Group 内重新分配，这个过程就是 Rebalance。
+
+常见分配策略包括：
+
+```text
+RangeAssignor
+RoundRobinAssignor
+StickyAssignor
+CooperativeStickyAssignor
+```
+
+不同策略的目标不同：
+
+```text
+Range：按 Topic 范围分配，简单但可能不均
+RoundRobin：轮询分配，更均匀
+Sticky：尽量保持原分配，减少迁移
+CooperativeSticky：增量协作式 Rebalance，减少停顿
+```
+
+---
+
+# 八、Rebalance 为什么重要？
+
+Rebalance 是 Kafka Consumer Group 的核心机制，也是很多线上消费抖动的来源。
+
+## 1. 什么情况会触发 Rebalance？
+
+常见触发条件：
+
+```text
+Consumer 加入 Group
+Consumer 离开 Group
+Consumer 心跳超时
+Consumer 处理太久，超过 max.poll.interval.ms
+Topic Partition 数量变化
+订阅 Topic 元数据变化
+```
+
+Confluent 对 Rebalance 的解释中也提到，Consumer 加入或离开 Group，以及 Topic 元数据变化，例如新增 Partition，都可能触发 Rebalance。
+
+---
+
+## 2. Rebalance 有什么影响？
+
+Rebalance 期间，Consumer 可能暂停消费，重新分配 Partition。
+
+如果 Rebalance 频繁，会导致：
+
+```text
+消费短暂停顿
+consumer lag 增长
+重复消费概率上升
+offset 提交混乱
+业务处理延迟抖动
+下游压力不稳定
+```
+
+在高吞吐系统中，频繁 Rebalance 是非常危险的。
+
+---
+
+## 3. Rebalance 常见根因
+
+```text
+Consumer 处理单批消息太慢
+max.poll.interval.ms 设置太小
+session.timeout.ms 设置不合理
+心跳线程被阻塞
+应用频繁发布重启
+K8s 滚动更新太激进
+Consumer 数量频繁伸缩
+下游 DB 慢导致 poll 间隔过长
+```
+
+大厂实践里，Kafka Consumer 的稳定性很大程度取决于：
+
+```text
+消费逻辑是否足够快
+是否批量处理
+是否异步处理但控制并发
+是否合理提交 offset
+是否优雅关闭
+是否避免频繁扩缩容
+```
+
+---
+
+# 九、Go Sarama 视角：Consumer Group 如何消费 Partition？
+
+Go Sarama 客户端中，Consumer Group 消费通常实现一个 Handler。
+
+核心接口类似：
+
+```go
+type ConsumerGroupHandler interface {
+    Setup(ConsumerGroupSession) error
+    Cleanup(ConsumerGroupSession) error
+    ConsumeClaim(ConsumerGroupSession, ConsumerGroupClaim) error
+}
+```
+
+典型消费结构：
+
+```go
+func (h *Handler) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
+    for msg := range claim.Messages() {
+        err := h.process(msg)
+        if err == nil {
+            session.MarkMessage(msg, "")
+        }
+    }
+    return nil
+}
+```
+
+这里的 `claim` 可以理解为某个 Consumer 被分配到的一个 Partition 消费任务。
+
+一个 Consumer 可能有多个 claim。
+
+Sarama 的消费流程可以简化为：
+
+```text
+ConsumerGroup.Join
+  -> Broker 协调分配 Partition
+  -> 每个 Consumer 获得 claims
+  -> 每个 claim 对应 TopicPartition
+  -> ConsumeClaim 读取 claim.Messages()
+  -> 业务处理
+  -> MarkMessage
+  -> Commit offset
+```
+
+源码阅读可以重点看：
+
+```text
+consumer_group.go
+consumer.go
+offset_manager.go
+broker.go
+fetch_request.go
+```
+
+从源码角度，你要重点理解：
+
+```text
+Consumer Group 不是每个 Consumer 自己随便拉 Partition；
+而是先由 Group 协议完成分配，再由 Consumer 按分配结果拉取。
+```
+
+---
+
+# 十、Partition 数量怎么规划？
+
+Partition 数量规划是 Kafka 容量设计的核心问题。
+
+Partition 太少，吞吐和并行度不够。
+
+Partition 太多，会增加 Broker、Controller、文件句柄、元数据、Rebalance 和故障恢复成本。
+
+所以 Partition 数量不是越多越好。
+
+---
+
+## 1. 从生产吞吐估算
+
+假设目标写入吞吐是：
+
+```text
+目标写入吞吐 = 200 MB/s
+```
+
+压测得到单个 Partition 稳定写入能力是：
+
+```text
+单 Partition 写入能力 = 20 MB/s
+```
+
+那么至少需要：
+
+```text
+200 / 20 = 10 个 Partition
+```
+
+再加上冗余：
+
+```text
+建议 12 ~ 16 个 Partition
+```
+
+公式：
+
+```text
+Partition 数 >= 目标写入吞吐 / 单 Partition 写入吞吐
+```
+
+注意：单 Partition 吞吐不是固定值，要通过压测得出，和消息大小、ack、压缩、Broker 磁盘、网络、Producer 配置都有关。
+
+---
+
+## 2. 从消费吞吐估算
+
+假设目标消费吞吐是：
+
+```text
+目标消费吞吐 = 10000 msg/s
+```
+
+单个 Consumer 稳定处理能力是：
+
+```text
+单 Consumer 能力 = 1000 msg/s
+```
+
+至少需要：
+
+```text
+10000 / 1000 = 10 个 Consumer
+```
+
+因为 Consumer Group 并行度受 Partition 限制，所以 Partition 至少也要 10 个。
+
+公式：
+
+```text
+Partition 数 >= 目标 Consumer 并行度
+```
+
+---
+
+## 3. 从顺序性要求估算
+
+如果业务要求同一个实体有序，例如：
+
+```text
+同一个 orderId 有序
+同一个 userId 有序
+同一个 deviceId 有序
+```
+
+则需要选择合适的 message key。
+
+例如订单事件：
+
+```text
+key = orderId
+```
+
+这样同一个订单进入同一个 Partition。
+
+但如果某些 key 特别热，会造成热点 Partition。
+
+例如：
+
+```text
+某个大客户 userId 产生了 50% 的消息
+```
+
+那么这个 key 所在 Partition 会非常热。
+
+这时要重新设计 key，例如：
+
+```text
+key = userId + 业务子维度
+key = orderId
+key = tenantId + hash(bucket)
+```
+
+要在顺序性和均匀分布之间取舍。
+
+---
+
+## 4. 从 Broker 数量估算
+
+假设有 6 个 Broker。
+
+为了让 Partition Leader 尽量均匀分布，Partition 数最好明显大于 Broker 数，并且能较均匀分布。
+
+例如：
+
+```text
+Broker 数 = 6
+Partition 数 = 12 / 18 / 24
+```
+
+通常会比 7、11 这类不容易均匀分布的数量更好管理。
+
+但这不是硬规则，最终要结合吞吐和运维成本。
+
+---
+
+## 5. 一个实用规划模板
+
+可以按下面流程规划：
+
+```text
+1. 明确目标写入吞吐：MB/s 或 msg/s
+2. 压测单 Partition 写入能力
+3. 明确目标消费吞吐
+4. 压测单 Consumer 处理能力
+5. 判断是否有顺序性要求
+6. 判断 key 分布是否均匀
+7. 结合 Broker 数量和副本因子
+8. 预留未来增长空间
+9. 通过压测验证
+```
+
+最终 Partition 数取以下几个值的较大者：
+
+```text
+生产吞吐所需 Partition 数
+消费并行所需 Partition 数
+Broker 分布所需 Partition 数
+未来扩容预留值
+```
+
+---
+
+# 十一、Partition 数量过多有什么问题？
+
+很多人知道 Partition 少了不够用，但忽略 Partition 太多也有代价。
+
+Partition 过多会带来：
+
+```text
+更多日志文件
+更多文件句柄
+更多内存索引
+更多元数据
+更多副本复制任务
+更长 Leader 选举时间
+更高 Controller 压力
+更复杂的 Rebalance
+更长故障恢复时间
+```
+
+一个 Partition 通常对应多个文件：
+
+```text
+.log
+.index
+.timeindex
+```
+
+Partition 越多，Broker 上文件和元数据越多。
+
+如果副本因子是 3，实际副本 Partition 数还要乘以 3。
+
+例如：
+
+```text
+Topic Partition = 1000
+Replication Factor = 3
+实际副本数 = 3000
+```
+
+这对 Broker、Controller、磁盘、文件句柄和恢复速度都会有影响。
+
+所以：
+
+```text
+Partition 是扩展能力，也是成本单位。
+```
+
+---
+
+# 十二、扩容 Partition 有什么影响？
+
+Kafka 支持增加 Topic 的 Partition 数量。Confluent 文档给出的命令形式是使用 `kafka-topics.sh --alter --partitions <number>` 增加某个 Topic 的 Partition 数。
+
+例如：
+
+```bash
+bin/kafka-topics.sh \
+  --bootstrap-server broker:9092 \
+  --topic order_events \
+  --alter \
+  --partitions 16
+```
+
+但扩容 Partition 不是无风险操作。
+
+---
+
+## 1. Partition 只能增加，不能简单减少
+
+Kafka 支持增加 Partition，但减少 Partition 通常不是直接支持的常规操作。
+
+如果要减少，通常要新建 Topic，再迁移数据。
+
+所以初始规划不能太随意。
+
+---
+
+## 2. 扩容后 key 到 Partition 的映射可能变化
+
+如果 Producer 使用 key 进行分区，常见分区方式类似：
+
+```text
+partition = hash(key) % partitionCount
+```
+
+当 Partition 数从 8 增加到 16 时，同一个 key 可能被路由到不同 Partition。
+
+例如：
+
+```text
+hash(orderId=1001) % 8 = 3
+hash(orderId=1001) % 16 = 11
+```
+
+这会影响：
+
+```text
+同一个 key 的后续消息可能进入新 Partition
+同一个 key 的历史消息在旧 Partition
+同一个 key 的全局处理顺序可能被破坏
+```
+
+所以对于强依赖 key 顺序的业务，扩容 Partition 要非常谨慎。
+
+---
+
+## 3. 扩容会触发 Rebalance
+
+Topic Partition 数变化会让 Consumer Group 重新分配 Partition。
+
+结果是：
+
+```text
+Consumer Group Rebalance
+短暂停止消费
+Partition 迁移
+Consumer lag 可能上升
+```
+
+如果业务流量很大，扩容 Partition 要选择低峰期，并观察 lag 和 Rebalance 耗时。
+
+---
+
+## 4. 扩容不会自动搬迁旧数据
+
+新增 Partition 只影响新写入消息。
+
+历史消息仍然留在旧 Partition。
+
+这意味着扩容后短时间内可能出现：
+
+```text
+旧 Partition 数据多
+新 Partition 数据少
+消费负载不均
+Broker 存储不均
+```
+
+所以 Partition 扩容不是立即让历史数据均衡。
+
+---
+
+## 5. 扩容前要确认 Producer 分区策略
+
+不同客户端和不同版本的分区器策略可能不同。
+
+要确认：
+
+```text
+是否使用 key
+key 分布是否均匀
+是否使用自定义 partitioner
+是否依赖顺序
+是否使用 sticky partitioner
+```
+
+如果业务强依赖顺序，可以考虑：
+
+```text
+提前规划足够 Partition
+用业务分桶 key
+新建 Topic 迁移
+停写后切换
+通过版本 Topic 灰度迁移
+```
+
+---
+
+# 十三、Consumer 扩容为什么有时无效？
+
+线上经常出现：
+
+```text
+消费积压严重，我把 Consumer 从 10 个扩到 30 个，但 lag 还是不降。
+```
+
+原因可能有很多。
+
+---
+
+## 1. Consumer 数量超过 Partition
+
+如果 Topic 只有 10 个 Partition，Consumer Group 最多只有 10 个 Consumer 并行工作。
+
+扩到 30 个，只有 10 个工作，20 个空闲。
+
+解决：
+
+```text
+增加 Partition
+或者提高单 Consumer 处理能力
+```
+
+---
+
+## 2. 单个 Partition 是热点
+
+如果某个 Partition 积压特别严重，其他 Partition 很轻松。
+
+说明消息分布不均，可能是 key 热点。
+
+解决：
+
+```text
+优化 key 设计
+拆分热点业务
+增加业务维度分桶
+对热点 key 做特殊处理
+```
+
+---
+
+## 3. 下游系统是瓶颈
+
+Consumer 读 Kafka 很快，但处理时要写数据库。
+
+如果数据库慢，扩 Consumer 只会把数据库打爆。
+
+解决：
+
+```text
+批量写 DB
+异步处理
+限流
+分库分表
+优化 SQL
+引入缓冲层
+```
+
+---
+
+## 4. Rebalance 太频繁
+
+Consumer 一直加入、离开 Group，导致频繁 Rebalance。
+
+表现：
+
+```text
+消费停顿
+lag 上升
+日志里频繁 revoke / assign partition
+```
+
+解决：
+
+```text
+优化 max.poll.interval.ms
+优化 session.timeout.ms
+减少发布频率
+优雅关闭
+使用静态成员
+使用 cooperative sticky assignor
+```
+
+---
+
+# 十四、大厂实践：Topic 和 Partition 设计规范
+
+## 1. Topic 按业务事件建模
+
+推荐：
+
+```text
+order_events
+payment_events
+user_events
+inventory_events
+```
+
+不要把所有事件塞进一个大 Topic：
+
+```text
+all_events
+```
+
+也不要过度拆分成太多细碎 Topic：
+
+```text
+order_created_event
+order_paid_event
+order_cancelled_event
+```
+
+除非它们的消费者、保留策略、吞吐模型、权限和 SLA 完全不同。
+
+一个实用原则：
+
+```text
+同一业务域、相似消费方、相似保留策略，可以放一个 Topic；
+吞吐、权限、保留时间、消费语义差异很大，应拆 Topic。
+```
+
+---
+
+## 2. Partition key 要体现业务顺序边界
+
+例如：
+
+```text
+订单事件：key = orderId
+用户事件：key = userId
+设备事件：key = deviceId
+租户事件：key = tenantId + entityId
+```
+
+目标是：
+
+```text
+需要有序的消息进入同一 Partition；
+不需要强绑定的消息尽量分散。
+```
+
+---
+
+## 3. Partition 数要预留增长空间
+
+如果预计未来一年吞吐会增长 3 倍，初始 Partition 不要刚好卡在当前需求。
+
+但也不能盲目给几千个 Partition。
+
+建议：
+
+```text
+当前容量需求 + 未来增长 + 运维成本
+```
+
+最终通过压测确认。
+
+---
+
+## 4. 大 Topic 要有独立资源规划
+
+高吞吐 Topic 不要和低优先级 Topic 混在同一批 Broker 上。
+
+可以按业务等级隔离：
+
+```text
+核心交易事件集群
+日志采集集群
+埋点分析集群
+测试集群
+```
+
+避免日志流量打爆 Kafka 后影响交易事件。
+
+---
+
+## 5. Consumer Group 要稳定
+
+Consumer Group 稳定性很重要。
+
+建议：
+
+```text
+避免频繁扩缩容
+滚动发布控制节奏
+优雅关闭 Consumer
+消费逻辑不要阻塞 poll
+使用批量处理
+监控 lag 和 rebalance 次数
+```
+
+---
+
+# 十五、源码视角：Kafka 和 Sarama 分别看哪里？
+
+## 1. Kafka Broker 侧源码方向
+
+可以重点看：
+
+```text
+Log / UnifiedLog：Partition 日志读写
+ReplicaManager：副本和 Partition 管理
+GroupCoordinator：Consumer Group 协调
+Partition：Leader / Follower 逻辑
+Fetch / Produce 请求处理
+```
+
+关注问题：
+
+```text
+消息如何追加到 Partition Log？
+Partition Leader 如何处理 ProduceRequest？
+Consumer FetchRequest 如何按 Partition 拉取？
+GroupCoordinator 如何管理 Consumer Group？
+Rebalance 如何触发和完成？
+```
+
+---
+
+## 2. Go Sarama 客户端源码方向
+
+Sarama 可以重点看：
+
+```text
+consumer_group.go
+consumer.go
+offset_manager.go
+partitioner.go
+async_producer.go
+broker.go
+fetch_request.go
+produce_request.go
+```
+
+关注问题：
+
+```text
+Producer 如何根据 key 选择 Partition？
+AsyncProducer 如何按 Topic / Partition / Broker 路由消息？
+ConsumerGroup 如何 JoinGroup / SyncGroup？
+ConsumeClaim 如何映射到 Partition？
+OffsetManager 如何提交 offset？
+Rebalance 后如何重新分配 claim？
+```
+
+---
+
+# 十六、系统设计案例：订单事件 Topic 怎么设计？
+
+假设一个电商系统需要设计订单事件流。
+
+事件包括：
+
+```text
+OrderCreated
+OrderPaid
+OrderCancelled
+OrderShipped
+```
+
+要求：
+
+```text
+同一个订单的事件必须有序
+峰值写入 50000 msg/s
+单个 Consumer 处理能力 2000 msg/s
+需要库存、通知、风控、数仓多个系统独立消费
+```
+
+设计：
+
+```text
+Topic: order_events
+Key: orderId
+Partition: 至少 32 个
+Consumer Group:
+  inventory-service
+  notification-service
+  risk-service
+  warehouse-sync-service
+```
+
+为什么 key 用 orderId？
+
+```text
+保证同一个订单的事件进入同一个 Partition，从而保证订单维度有序。
+```
+
+为什么 Partition 至少 32？
+
+```text
+消费侧需要 50000 / 2000 = 25 个 Consumer 并行；
+Partition 数必须大于等于消费并行度；
+考虑冗余和未来增长，设置 32。
+```
+
+为什么不同系统使用不同 Consumer Group？
+
+```text
+库存、通知、风控、数仓都要独立消费同一份订单事件；
+每个系统有自己的 offset 和处理进度。
+```
+
+风险：
+
+```text
+如果某些大订单或大商家 orderId 分布不均，可能导致热点 Partition；
+如果未来扩容 Partition，orderId 到 Partition 的映射可能变化，影响顺序；
+如果某个 Consumer 处理慢，会导致对应 Group lag 增长，但不影响其他 Group。
+```
+
+治理：
+
+```text
+监控每个 Partition 的消息量
+监控每个 Group 的 lag
+消费端幂等
+低峰期扩容
+必要时新建 Topic 迁移
+```
+
+---
+
+# 十七、面试表达
+
+## 1. Topic、Partition 和 Consumer Group 的关系是什么？
+
+可以这样回答：
+
+> Topic 是消息的逻辑分类，Partition 是 Topic 的物理分片，也是 Kafka 并行和顺序的基本单位。Kafka 只保证单个 Partition 内消息有序，不保证 Topic 全局有序。Consumer Group 是消费者组，同一个 Group 内多个 Consumer 共同消费 Topic 的多个 Partition，一个 Partition 在同一时刻只能被同一个 Group 内的一个 Consumer 消费。不同 Consumer Group 可以独立消费同一个 Topic，并各自维护 offset。
+
+---
+
+## 2. 为什么 Consumer 数量超过 Partition 会空闲？
+
+可以这样回答：
+
+> 因为 Kafka 的消费并行度是以 Partition 为单位的。在同一个 Consumer Group 内，一个 Partition 同一时刻只能被一个 Consumer 消费，这是为了保证 Partition 内顺序。如果 Topic 只有 4 个 Partition，那么同一个 Group 最多只有 4 个 Consumer 并行工作，多出来的 Consumer 没有 Partition 可分配，所以会空闲。
+
+---
+
+## 3. Partition 如何决定并行度？
+
+可以这样回答：
+
+> Producer 侧，多个 Partition 可以分布在多个 Broker 上，Producer 可以并行写多个 Partition，从而提升写入吞吐。Consumer 侧，同一个 Consumer Group 的最大并行度受 Partition 数限制，因为一个 Partition 只能被组内一个 Consumer 消费。因此 Partition 数量决定了 Topic 的生产和消费扩展上限，但也会带来文件句柄、元数据、Rebalance 和恢复成本。
+
+---
+
+## 4. Partition 数量怎么规划？
+
+可以这样回答：
+
+> Partition 数量要从生产吞吐、消费吞吐、顺序性要求和 Broker 数量几个维度规划。可以先压测单 Partition 写入能力和单 Consumer 处理能力，然后用目标吞吐除以单 Partition 或单 Consumer 能力，得到最低 Partition 数。同时要考虑 key 分布是否均匀、是否需要同一业务实体有序、未来增长空间和运维成本。Partition 不是越多越好，太多会增加元数据、文件句柄、Rebalance 和故障恢复成本。
+
+---
+
+## 5. 扩容 Partition 有什么影响？
+
+可以这样回答：
+
+> Kafka 支持增加 Topic 的 Partition 数，但扩容不是无风险的。首先，新增 Partition 通常只影响新消息，历史消息不会自动迁移。其次，如果 Producer 使用 key 分区，Partition 数变化后，同一个 key 通过 hash 计算出来的 Partition 可能变化，可能影响同一 key 的顺序性。另外，Partition 数变化会触发 Consumer Group Rebalance，短时间内可能导致消费停顿和 lag 上升。所以强依赖顺序的业务扩容 Partition 要谨慎，必要时通过新 Topic 迁移。
+
+---
+
+# 十八、总结
+
+Topic、Partition 和 Consumer Group 是 Kafka 架构中最重要的三组概念。
+
+可以总结为：
+
+```text
+Topic：业务事件流的逻辑分类
+Partition：Topic 的物理分片，并行和顺序的基本单位
+Consumer Group：消费端的负载均衡和独立订阅机制
+```
+
+Kafka 的核心规则是：
+
+```text
+单 Partition 内有序；
+Topic 全局不保证有序；
+同一个 Group 内，一个 Partition 同时只能被一个 Consumer 消费；
+不同 Group 可以独立消费同一个 Topic；
+Consumer 并行度上限由 Partition 数决定。
+```
+
+Partition 数量规划的核心不是“越多越好”，而是综合：
+
+```text
+生产吞吐
+消费吞吐
+Consumer 处理能力
+Broker 数量
+副本因子
+顺序性要求
+key 分布
+未来增长
+Rebalance 成本
+```
+
+真正成熟的 Kafka 设计，不是简单创建一个 Topic，而是要提前想清楚：
+
+```text
+这个 Topic 的业务边界是什么？
+哪些消息需要有序？
+Partition key 怎么选？
+未来吞吐会增长多少？
+Consumer Group 有多少个？
+每个 Group 的处理能力如何？
+扩容 Partition 会不会破坏顺序？
+Rebalance 会不会影响稳定性？
+```
+
+这才是 Kafka 在系统设计和容量规划中的核心能力。

@@ -1,0 +1,1519 @@
+# Redis 的典型业务场景与高可用扩展：从开发实战到架构设计
+
+## 前言
+
+Redis 在后端系统中的定位，经常被简单概括成两个字：
+
+```text
+缓存
+```
+
+但这个理解并不完整。
+
+Redis 的本质是一个基于内存的高性能数据结构服务器。它既能做缓存，也能做计数器、限流、排行榜、分布式锁、会话存储、消息流、延迟任务、热点数据层和实时统计组件。
+
+从开发角度看，Redis 是一个好用的数据结构工具箱。
+
+从架构角度看，Redis 是高并发系统中非常重要的低延迟数据访问层。
+
+从生产治理角度看，Redis 不是“加一层缓存就完事”，而是要考虑：
+
+```text
+数据放什么
+key 怎么设计
+容量怎么控制
+热点怎么治理
+故障怎么切换
+读写怎么扩展
+数据会不会丢
+集群怎么运维
+客户端怎么路由
+```
+
+本文围绕两个主题展开：
+
+```text
+1. Redis 的典型业务场景
+2. Redis 的高可用与扩展架构
+```
+
+目标不是罗列命令，而是站在开发和架构视角，讲清楚 Redis 在真实系统里怎么用、怎么扩、怎么避坑。
+
+---
+
+# 一、Redis 在系统中的定位
+
+Redis 通常位于应用服务和后端存储之间。
+
+典型架构：
+
+```text
+客户端
+  -> 网关
+  -> 业务服务
+  -> Redis
+  -> MySQL / PostgreSQL / MongoDB / Elasticsearch / MQ
+```
+
+Redis 的价值主要体现在：
+
+```text
+1. 降低数据库压力
+2. 提升接口响应速度
+3. 承接热点读写
+4. 提供原子计数能力
+5. 支撑短生命周期状态
+6. 实现部分实时数据结构需求
+```
+
+但 Redis 不是万能数据库。
+
+它不适合直接承担：
+
+```text
+复杂关系查询
+强一致事务
+多表 Join
+大对象存储
+长时间消息堆积
+不可丢失的核心交易数据
+```
+
+更准确的定位是：
+
+```text
+Redis = 高性能内存数据结构层 + 缓存层 + 实时状态层 + 热点流量缓冲层
+```
+
+---
+
+# 二、典型业务场景一：缓存
+
+缓存是 Redis 最常见的使用场景。
+
+典型读流程：
+
+```text
+请求进入服务
+  -> 先查 Redis
+  -> 命中，直接返回
+  -> 未命中，查数据库
+  -> 写入 Redis
+  -> 返回结果
+```
+
+示例：
+
+```text
+GET product:detail:1001
+SET product:detail:1001 {json} EX 300
+```
+
+适合缓存的数据：
+
+```text
+商品详情
+用户资料
+文章详情
+配置数据
+权限快照
+接口聚合结果
+搜索热词
+首页数据
+```
+
+缓存的核心价值是：
+
+```text
+把高频读请求从数据库转移到 Redis。
+```
+
+## 1. 缓存建模方式
+
+常见两种：
+
+```text
+String JSON：整对象缓存
+Hash：字段级对象缓存
+```
+
+例如商品详情通常用 String JSON：
+
+```text
+SET product:detail:1001 "{...}" EX 300
+```
+
+用户状态可以用 Hash：
+
+```text
+HSET user:status:1001 online 1 lastActiveTime 1717392000
+```
+
+选择原则：
+
+```text
+整对象读多：String JSON
+字段级读写多：Hash
+字段需要独立过期：拆成多个 String key
+对象特别大：先考虑是否应该放 Redis
+```
+
+## 2. 缓存实践要点
+
+缓存不是简单的 `GET` 和 `SET`，还要治理：
+
+```text
+缓存穿透
+缓存击穿
+缓存雪崩
+大 key
+热 key
+缓存一致性
+TTL 随机化
+缓存预热
+多级缓存
+```
+
+大厂实践里，缓存组件通常会封装统一模板：
+
+```text
+GetOrLoad
+GetOrLoadWithNullCache
+GetOrLoadWithMutex
+GetOrLoadWithLogicalExpire
+BatchGetOrLoad
+```
+
+统一处理：
+
+```text
+空值缓存
+TTL 随机化
+互斥锁重建
+逻辑过期
+降级兜底
+监控埋点
+```
+
+---
+
+# 三、典型业务场景二：计数器
+
+Redis 的 String 可以存整数，并支持原子递增。
+
+常见命令：
+
+```text
+INCR article:1001:view_count
+INCRBY user:1001:score 10
+DECR stock:sku:2001
+```
+
+适合场景：
+
+```text
+文章阅读数
+视频播放数
+点赞数
+评论数
+接口调用次数
+短信发送次数
+库存预扣减
+积分变更
+```
+
+Redis 适合做计数器，是因为单个命令原子执行。
+
+例如：
+
+```text
+INCR counter
+```
+
+多个客户端并发执行，也会被 Redis 顺序处理，不会出现普通应用内存计数那种并发覆盖问题。
+
+## 1. 计数器落库模式
+
+高频计数通常不会每次都写数据库。
+
+常见架构：
+
+```text
+用户行为
+  -> Redis INCR
+  -> 定时任务批量读取
+  -> 聚合写入 MySQL / ClickHouse
+```
+
+适合：
+
+```text
+阅读数
+点赞数
+播放数
+访问统计
+```
+
+不适合：
+
+```text
+账户余额
+支付金额
+财务流水
+强一致库存最终扣减
+```
+
+一句话：
+
+```text
+Redis 计数适合高频统计，不适合强一致账务。
+```
+
+---
+
+# 四、典型业务场景三：限流
+
+Redis 很适合做分布式限流。
+
+原因是：
+
+```text
+多个应用实例共享同一个 Redis 计数状态。
+```
+
+例如限制某个用户一分钟最多访问 100 次：
+
+```text
+INCR rate:user:1001:202606031030
+EXPIRE rate:user:1001:202606031030 60
+```
+
+但这个简单版本有一个问题：
+
+```text
+INCR 和 EXPIRE 是两个命令，不完全原子。
+```
+
+更严谨的方式是 Lua 脚本。
+
+伪代码：
+
+```lua
+local current = redis.call("INCR", KEYS[1])
+if current == 1 then
+    redis.call("EXPIRE", KEYS[1], ARGV[1])
+end
+return current
+```
+
+限流算法常见有：
+
+```text
+固定窗口
+滑动窗口
+令牌桶
+漏桶
+```
+
+Redis 适合实现：
+
+```text
+用户维度限流
+IP 维度限流
+API 维度限流
+租户维度限流
+短信验证码限流
+登录失败次数限制
+```
+
+限流实践中要注意：
+
+```text
+限流 key 粒度
+窗口大小
+误杀率
+热点 key
+Redis 故障时默认放行还是拒绝
+限流结果监控
+```
+
+大厂一般会把限流放在多层：
+
+```text
+网关限流
+应用限流
+Redis 分布式限流
+下游资源保护限流
+```
+
+---
+
+# 五、典型业务场景四：排行榜
+
+排行榜是 Redis Sorted Set 的经典场景。
+
+ZSet 模型：
+
+```text
+member + score
+```
+
+示例：
+
+```text
+ZADD rank:game:1001 100 userA
+ZINCRBY rank:game:1001 50 userA
+ZREVRANGE rank:game:1001 0 9 WITHSCORES
+ZREVRANK rank:game:1001 userA
+```
+
+适合场景：
+
+```text
+游戏积分榜
+直播贡献榜
+商品销量榜
+文章热度榜
+用户活跃榜
+学习打卡榜
+运动步数榜
+```
+
+Redis 官方也把 Sorted Set 排行榜作为典型用例，适用于按持续变化的分数实时排序的实体，比如玩家、商品、卖家等。
+
+## 1. 排行榜架构实践
+
+排行榜不要做成一个永久大 key。
+
+推荐按周期拆分：
+
+```text
+rank:game:{gameId}:daily:{yyyyMMdd}
+rank:game:{gameId}:weekly:{yyyyWW}
+rank:game:{gameId}:monthly:{yyyyMM}
+```
+
+例如：
+
+```text
+rank:game:1001:daily:20260603
+rank:game:1001:weekly:2026W23
+```
+
+好处：
+
+```text
+控制单个 ZSet 大小
+方便设置 TTL
+方便归档历史榜单
+避免永久榜无限膨胀
+```
+
+## 2. 排行榜冷热分离
+
+实时榜：
+
+```text
+Redis ZSet
+```
+
+历史榜：
+
+```text
+MySQL / ClickHouse / 对象存储
+```
+
+典型链路：
+
+```text
+用户行为产生分数
+  -> ZINCRBY 更新 Redis
+  -> 定时任务结算 Top N
+  -> 写入数据库
+  -> Redis 设置 TTL 或裁剪
+```
+
+---
+
+# 六、典型业务场景五：会话与登录态
+
+Redis 常用于保存 session、token、验证码等短生命周期数据。
+
+示例：
+
+```text
+SETEX login:token:abc123 7200 userId
+SETEX sms:code:phone:138xxxx 300 123456
+```
+
+适合场景：
+
+```text
+用户 session
+登录 token
+短信验证码
+邮箱验证码
+OAuth state
+临时授权码
+用户在线状态
+```
+
+优势：
+
+```text
+读写快
+天然支持 TTL
+多服务实例共享状态
+适合短生命周期数据
+```
+
+注意事项：
+
+```text
+token key 必须设置 TTL
+敏感值不要明文存储
+验证码要限制尝试次数
+登录态变更要主动删除旧 token
+Redis 故障时要有登录降级策略
+```
+
+如果是强安全场景，Redis 中最好只存 token 摘要或 sessionId 映射，不要保存过多敏感信息。
+
+---
+
+# 七、典型业务场景六：分布式锁
+
+Redis 锁常用于短时间互斥。
+
+正确加锁：
+
+```text
+SET lock:order:1001 requestId NX EX 30
+```
+
+正确释放锁：
+
+```lua
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("DEL", KEYS[1])
+else
+    return 0
+end
+```
+
+适合场景：
+
+```text
+缓存重建互斥
+防重复提交
+定时任务抢占
+短任务互斥
+接口并发保护
+```
+
+不适合单独承担：
+
+```text
+账户余额扣减
+支付状态最终确认
+订单核心状态变更
+库存最终扣减
+金融交易流水
+```
+
+生产原则：
+
+```text
+Redis 锁减少并发
+数据库约束保证最终正确
+幂等和补偿处理异常
+```
+
+例如优惠券领取：
+
+```text
+Redis 锁：减少并发冲突
+数据库唯一索引：保证 userId + couponId 不重复
+幂等逻辑：处理重复请求
+```
+
+---
+
+# 八、典型业务场景七：消息流与异步任务
+
+Redis 可以通过 Stream 实现轻量消息流。
+
+示例：
+
+```text
+XADD order:events * orderId 1001 status created
+XREADGROUP GROUP order_group consumer_1 COUNT 10 STREAMS order:events >
+XACK order:events order_group messageId
+```
+
+Stream 支持：
+
+```text
+消息 ID
+消费者组
+ACK
+Pending 消息
+失败转移
+历史读取
+```
+
+适合：
+
+```text
+业务内轻量异步
+事件通知
+操作日志流
+小规模任务队列
+低延迟消息流
+```
+
+不适合替代：
+
+```text
+Kafka
+RocketMQ
+RabbitMQ
+公司级消息总线
+长时间消息堆积系统
+强审计消息系统
+```
+
+生产建议：
+
+```text
+Stream 设置 MAXLEN
+监控 XPENDING
+消息体只存 ID 和必要字段
+任务详情落数据库
+消费逻辑必须幂等
+失败消息进入死信队列
+```
+
+---
+
+# 九、典型业务场景八：延迟队列
+
+Redis ZSet 可以实现轻量延迟队列。
+
+模型：
+
+```text
+member = taskId
+score = 执行时间戳
+```
+
+写入：
+
+```text
+ZADD delay:order:cancel 1717392000 orderId:1001
+```
+
+拉取到期任务：
+
+```text
+ZRANGEBYSCORE delay:order:cancel 0 now LIMIT 0 10
+```
+
+删除：
+
+```text
+ZREM delay:order:cancel orderId:1001
+```
+
+多消费者场景下，需要 Lua 保证“读取 + 删除”原子性：
+
+```lua
+local tasks = redis.call("ZRANGEBYSCORE", KEYS[1], 0, ARGV[1], "LIMIT", 0, ARGV[2])
+for i, task in ipairs(tasks) do
+    redis.call("ZREM", KEYS[1], task)
+end
+return tasks
+```
+
+适合：
+
+```text
+订单超时取消
+支付超时关闭
+定时通知
+失败重试
+优惠券到期提醒
+```
+
+边界：
+
+```text
+不是强可靠 MQ
+任务详情最好落 DB
+消费必须幂等
+要有补偿扫描
+```
+
+---
+
+# 十、典型业务场景九：实时统计
+
+Redis 可以通过多种结构做实时统计。
+
+## 1. Bitmap
+
+适合二值状态：
+
+```text
+签到
+活跃
+是否完成任务
+是否在线
+```
+
+示例：
+
+```text
+SETBIT active:daily:20260603 1001 1
+BITCOUNT active:daily:20260603
+```
+
+适合用户 ID 连续或可映射的场景。
+
+## 2. HyperLogLog
+
+适合 UV 估算：
+
+```text
+PFADD site:uv:20260603 user1001
+PFCOUNT site:uv:20260603
+```
+
+适合：
+
+```text
+页面 UV
+站点 UV
+独立 IP 数
+搜索词去重估算
+```
+
+不适合：
+
+```text
+精确人数统计
+成员明细查询
+审计数据
+财务数据
+```
+
+## 3. Sorted Set
+
+适合实时 Top N：
+
+```text
+热搜榜
+热文榜
+活跃用户榜
+```
+
+大厂实践通常是：
+
+```text
+Redis 做实时统计
+Kafka 收集行为日志
+Flink / Spark / ClickHouse 做离线或准实时精确统计
+报表最终以数仓口径为准
+```
+
+---
+
+# 十一、Redis 高可用与扩展：从单机到集群
+
+Redis 用得越多，越要考虑高可用和扩展。
+
+常见演进路径：
+
+```text
+单实例
+  -> 主从复制
+  -> Sentinel 自动故障转移
+  -> 客户端分片
+  -> Redis Cluster
+  -> 多机房 / 多可用区 / 云托管
+```
+
+不同阶段解决的问题不同：
+
+```text
+单实例：简单
+主从复制：读扩展和数据副本
+Sentinel：自动故障转移
+客户端分片：横向扩展容量和写入
+Redis Cluster：官方自动分片和故障转移
+多机房：灾备和地域级可用性
+```
+
+---
+
+# 十二、单实例：最简单，但有单点风险
+
+单实例适合：
+
+```text
+开发环境
+测试环境
+小流量业务
+非核心缓存
+可快速重建的数据
+```
+
+优点：
+
+```text
+部署简单
+延迟低
+排查容易
+成本低
+```
+
+缺点：
+
+```text
+单点故障
+容量受单机内存限制
+写入受单线程主路径限制
+无法横向扩展
+```
+
+对于很多中小系统，单实例 Redis 已经足够。
+
+但只要进入生产核心链路，就要考虑副本和故障转移。
+
+---
+
+# 十三、主从复制：读扩展和数据副本
+
+Redis 支持主从复制。
+
+结构：
+
+```text
+Master：处理写请求
+Replica：复制 Master 数据，可以承担读请求
+```
+
+复制的价值：
+
+```text
+提高读能力
+提供数据副本
+支持故障恢复
+支持读写分离
+```
+
+复制的限制：
+
+```text
+复制通常是异步的
+主从可能有延迟
+写能力仍受 Master 限制
+主节点故障需要故障转移机制
+```
+
+Redis 官方复制文档说明，Redis 支持 leader-follower 复制，副本会在连接中断后自动重连并尝试继续保持为主节点的拷贝。
+
+## 1. 读写分离要谨慎
+
+读写分离可以让 Replica 承担读请求。
+
+但要注意：
+
+```text
+刚写完马上读 Replica，可能读到旧数据。
+```
+
+适合读 Replica 的场景：
+
+```text
+对一致性不敏感的缓存读
+统计类数据
+排行榜展示
+配置类数据
+用户非核心信息
+```
+
+不适合：
+
+```text
+写后立即强一致读取
+支付状态
+订单状态
+库存状态
+强一致权限判断
+```
+
+---
+
+# 十四、Sentinel：非 Cluster 模式的高可用
+
+Redis Sentinel 用于非 Cluster 模式下的高可用。
+
+它主要做四件事：
+
+```text
+监控 Redis 主从节点
+发现 Master 故障
+自动选举新的 Master
+通知客户端新的 Master 地址
+```
+
+结构：
+
+```text
+Sentinel 集群
+  -> 监控 Redis Master
+  -> 监控 Redis Replica
+```
+
+当 Master 故障时：
+
+```text
+1. Sentinel 发现 Master 主观下线
+2. 多个 Sentinel 达成客观下线
+3. 选举一个 Sentinel 作为 Leader
+4. 从 Replica 中选择一个提升为新 Master
+5. 其他 Replica 改为复制新 Master
+6. 客户端通过 Sentinel 获取新 Master
+```
+
+适合：
+
+```text
+单主多从
+不需要自动分片
+需要自动故障转移
+容量单机可承受
+```
+
+## 1. Sentinel 的边界
+
+Sentinel 解决的是高可用，不解决分片扩容。
+
+也就是说：
+
+```text
+Sentinel 可以帮你换 Master；
+但不能帮你把一个大 Redis 自动拆成多个分片。
+```
+
+如果容量或写入压力超过单机，需要考虑分片或 Redis Cluster。
+
+## 2. Sentinel 实践要点
+
+```text
+至少部署 3 个 Sentinel
+Sentinel 分散到不同机器
+客户端必须支持 Sentinel
+合理设置 down-after-milliseconds
+监控故障转移耗时
+演练主从切换
+```
+
+---
+
+# 十五、客户端分片：简单直接的横向扩展
+
+客户端分片是指应用根据 key 自己决定访问哪个 Redis 实例。
+
+例如：
+
+```text
+hash(user:1001) -> Redis A
+hash(user:1002) -> Redis B
+hash(user:1003) -> Redis C
+```
+
+常见分片方式：
+
+```text
+取模 hash
+一致性 hash
+自定义路由表
+业务维度分片
+```
+
+适合：
+
+```text
+纯缓存场景
+业务可接受部分分片故障
+不需要跨 key 原子操作
+团队希望控制路由逻辑
+```
+
+优点：
+
+```text
+架构简单
+每个 Redis 实例独立
+扩展读写和容量
+故障影响局部 key
+```
+
+缺点：
+
+```text
+扩缩容复杂
+客户端要维护路由
+跨 key 操作困难
+迁移 key 麻烦
+没有官方自动故障转移能力
+```
+
+## 1. 客户端分片适合缓存
+
+对于纯缓存：
+
+```text
+某个分片挂了
+  -> 对应 key 缓存 miss
+  -> 回源数据库
+  -> 重建缓存
+```
+
+只要数据库保护、限流、降级做得好，这种模式可以接受。
+
+## 2. 客户端分片不适合复杂数据结构跨 key 操作
+
+例如：
+
+```text
+SINTER user:1:follows user:2:follows
+MGET 多个不同分片 key
+Lua 操作多个分片 key
+事务操作多个 key
+```
+
+这些在客户端分片下都会变复杂。
+
+---
+
+# 十六、Redis Cluster：官方分片和高可用方案
+
+Redis Cluster 是 Redis 官方集群方案。
+
+它解决两个问题：
+
+```text
+自动分片
+部分故障下的高可用
+```
+
+Redis Cluster 把 keyspace 划分为 16384 个 hash slot。
+
+每个 key 根据 hash 计算落到某个 slot。
+
+每个 Master 负责一部分 slot。
+
+结构：
+
+```text
+Master A：slots 0 - 5460
+Master B：slots 5461 - 10922
+Master C：slots 10923 - 16383
+
+每个 Master 配一个或多个 Replica
+```
+
+当某个 Master 故障时，它的 Replica 可以被提升为新 Master。
+
+## 1. Redis Cluster 的优点
+
+```text
+官方支持
+自动分片
+容量横向扩展
+写入横向扩展
+支持故障转移
+客户端可感知 slot 路由
+```
+
+## 2. Redis Cluster 的限制
+
+```text
+多 key 操作要求 key 在同一个 slot
+Lua 脚本跨 slot 受限
+事务跨 slot 受限
+热点 key 仍然只落一个 slot
+迁移 slot 有运维成本
+客户端必须支持 Cluster 协议
+```
+
+例如：
+
+```text
+MGET key1 key2
+```
+
+如果 key1 和 key2 不在同一个 slot，可能报：
+
+```text
+CROSSSLOT Keys in request don't hash to the same slot
+```
+
+可以用 hash tag 控制多个 key 落在同一 slot：
+
+```text
+user:{1001}:profile
+user:{1001}:cart
+user:{1001}:status
+```
+
+`{1001}` 中的内容会参与 slot 计算，这样这些 key 会落到同一个 slot。
+
+## 3. Cluster 不能解决所有热点问题
+
+如果有一个超级热 key：
+
+```text
+product:detail:1001
+```
+
+它仍然只属于一个 slot，只会落到一个 Master 上。
+
+所以 Cluster 解决的是：
+
+```text
+整体 keyspace 分散
+```
+
+不是自动解决：
+
+```text
+单 key 过热
+```
+
+热 key 仍然要靠：
+
+```text
+本地缓存
+多副本 key
+请求合并
+热点拆分
+限流降级
+```
+
+---
+
+# 十七、Redis 扩展方案怎么选？
+
+可以按下面思路选择。
+
+## 1. 业务小、数据少、可重建
+
+选择：
+
+```text
+单实例
+```
+
+适合：
+
+```text
+测试环境
+小业务
+非核心缓存
+```
+
+## 2. 数据量不大，但要求高可用
+
+选择：
+
+```text
+主从复制 + Sentinel
+```
+
+适合：
+
+```text
+单机容量够
+需要自动故障转移
+不需要分片
+```
+
+## 3. 纯缓存，想横向扩展，能接受路由复杂度
+
+选择：
+
+```text
+客户端分片
+```
+
+适合：
+
+```text
+业务可控
+跨 key 操作少
+希望简单独立实例
+```
+
+## 4. 容量和写入都需要横向扩展
+
+选择：
+
+```text
+Redis Cluster
+```
+
+适合：
+
+```text
+数据量大
+写入量大
+需要官方分片
+需要集群故障转移
+```
+
+## 5. 强灾备、多地域可用
+
+选择：
+
+```text
+云托管 Redis
+多可用区部署
+多机房灾备
+业务侧降级和回源保护
+```
+
+---
+
+# 十八、高可用不是只靠 Redis
+
+Redis 高可用架构必须和业务一起设计。
+
+完整高可用包含：
+
+```text
+Redis 副本
+故障转移
+客户端重试
+连接池治理
+限流降级
+数据库保护
+缓存预热
+多级缓存
+数据补偿
+监控告警
+故障演练
+```
+
+很多 Redis 故障不是 Redis 自己导致全站崩，而是：
+
+```text
+Redis 超时
+  -> 应用线程阻塞
+  -> 请求堆积
+  -> 调用方重试
+  -> 数据库被打爆
+  -> 系统雪崩
+```
+
+所以客户端也要治理：
+
+```text
+合理超时时间
+连接池上限
+失败快速返回
+熔断
+本地缓存兜底
+禁止无限重试
+```
+
+---
+
+# 十九、大厂 Redis 实践规范
+
+## 1. 实例隔离
+
+不同业务不要混用一个 Redis。
+
+建议按用途隔离：
+
+```text
+缓存实例
+会话实例
+排行榜实例
+限流实例
+锁实例
+消息流实例
+热点业务实例
+```
+
+原因：
+
+```text
+避免一个业务的大 key、热 key、慢命令影响其他业务。
+```
+
+## 2. key 规范
+
+推荐格式：
+
+```text
+业务:模块:实体:ID:维度
+```
+
+示例：
+
+```text
+product:detail:1001
+user:profile:1001
+rank:game:1001:daily:20260603
+rate:user:1001:202606031030
+lock:order:1001
+```
+
+不推荐：
+
+```text
+data
+cache
+tmp
+list
+user
+```
+
+## 3. TTL 规范
+
+```text
+缓存类 key 必须有 TTL
+TTL 加随机扰动
+热点 key 用逻辑过期
+空值缓存 TTL 要短
+永久 key 必须有归属和清理策略
+```
+
+## 4. 命令规范
+
+线上禁用或限制：
+
+```text
+KEYS *
+HGETALL 大 Hash
+SMEMBERS 大 Set
+ZRANGE 0 -1 大 ZSet
+LRANGE 0 -1 大 List
+复杂 Lua
+DEL 大 key
+```
+
+替代：
+
+```text
+SCAN
+HSCAN
+SSCAN
+ZSCAN
+分页读取
+UNLINK
+后台任务
+```
+
+## 5. 监控规范
+
+必须监控：
+
+```text
+QPS
+命中率
+P99 延迟
+内存使用
+连接数
+慢命令
+大 key
+热 key
+主从延迟
+AOF/RDB 状态
+Cluster slot 状态
+故障转移次数
+客户端超时
+```
+
+---
+
+# 二十、源码视角：Redis 高可用与扩展看哪些模块？
+
+想深入源码，可以按方向看。
+
+## 1. 网络与事件循环
+
+```text
+ae.c
+networking.c
+server.c
+```
+
+关注：
+
+```text
+Redis 如何处理客户端连接
+命令如何进入执行链路
+事件循环如何调度读写事件
+```
+
+## 2. 主从复制
+
+```text
+replication.c
+```
+
+关注：
+
+```text
+全量同步
+部分重同步
+复制积压缓冲区
+replicaof
+主从 offset
+PSYNC
+```
+
+主从复制大致流程：
+
+```text
+Replica 连接 Master
+  -> 发送 PSYNC
+  -> 能部分同步则增量复制
+  -> 不能部分同步则全量同步
+  -> Master 生成 RDB 给 Replica
+  -> 后续命令流持续同步
+```
+
+## 3. Sentinel
+
+```text
+sentinel.c
+```
+
+关注：
+
+```text
+主观下线
+客观下线
+Leader 选举
+故障转移
+新 Master 选择
+通知客户端
+```
+
+## 4. Cluster
+
+```text
+cluster.c
+```
+
+关注：
+
+```text
+hash slot
+MOVED / ASK 重定向
+节点 gossip
+故障检测
+failover
+slot 迁移
+```
+
+Cluster 客户端访问大致流程：
+
+```text
+客户端根据 slot 路由到节点
+  -> 如果节点正确，执行命令
+  -> 如果 slot 已迁移，返回 MOVED / ASK
+  -> 客户端更新 slot 缓存
+  -> 重试正确节点
+```
+
+---
+
+# 二十一、系统设计题怎么讲 Redis？
+
+如果面试官问：“Redis 在你的系统里怎么用？”
+
+可以按这个结构回答：
+
+```text
+1. 先说业务场景
+2. 再说数据结构
+3. 再说 key 设计
+4. 再说一致性和 TTL
+5. 再说高可用
+6. 最后说监控和降级
+```
+
+示例回答：
+
+> 我们在商品详情页使用 Redis 做缓存，key 设计为 `product:detail:{productId}`，value 用 String JSON，因为接口每次读取的是整对象。缓存 TTL 设置为 5 分钟加随机扰动，避免雪崩。热点商品使用逻辑过期和异步刷新，防止击穿。Redis 部署上使用主从 + Sentinel 或 Cluster，客户端设置短超时和连接池上限。如果 Redis 不可用，会走本地缓存和限流降级，避免数据库被打爆。同时监控命中率、P99、慢命令、大 key 和热 key。
+
+如果面试官问：“Redis 怎么保证高可用？”
+
+可以回答：
+
+> Redis 高可用通常分几层。单机有单点风险，可以通过主从复制提供副本，通过 Sentinel 实现自动故障转移。如果需要横向扩展容量和写入，可以使用 Redis Cluster，它通过 16384 个 hash slot 做自动分片，并通过 master-replica 做故障转移。但 Redis 高可用不只是服务端部署，还包括客户端重试、超时控制、连接池治理、本地缓存、限流降级和缓存预热。否则 Redis 故障时请求可能全部打到数据库，引发雪崩。
+
+如果面试官问：“Sentinel 和 Cluster 有什么区别？”
+
+可以回答：
+
+> Sentinel 主要解决非分片 Redis 的高可用问题，它监控主从节点，在 Master 故障时自动提升 Replica 为新 Master，但它不解决数据分片和容量扩展。Redis Cluster 同时解决分片和一定程度的高可用，它把 keyspace 拆成 16384 个 hash slot 分布到多个 Master 上，每个 Master 可以有 Replica，节点故障时可以 failover。但 Cluster 对跨 slot 多 key 操作有限制，客户端也必须支持 Cluster 路由和 MOVED/ASK 重定向。
+
+---
+
+# 二十二、总结
+
+Redis 的典型业务场景可以概括为：
+
+```text
+缓存：降低数据库压力
+计数器：原子递增统计
+限流：分布式请求配额
+排行榜：ZSet 实时排序
+会话：短生命周期状态
+分布式锁：短时间互斥
+Stream：轻量消息流
+延迟队列：ZSet 定时调度
+实时统计：Bitmap / HyperLogLog / ZSet
+```
+
+Redis 的高可用与扩展可以概括为：
+
+```text
+单实例：简单但有单点
+主从复制：副本和读扩展
+Sentinel：自动故障转移
+客户端分片：业务侧横向扩展
+Redis Cluster：官方分片和高可用
+多级缓存：业务侧抗故障
+限流降级：保护数据库
+监控演练：保障生产稳定
+```
+
+Redis 真正的价值，不是“能存数据”，而是：
+
+```text
+用合适的数据结构承接高频访问；
+用合理的架构支撑高可用和扩展；
+用治理规范避免大 key、热 key、慢命令和雪崩。
+```
+
+成熟的 Redis 架构，不是简单部署一个 Redis，而是知道：
+
+```text
+什么数据适合放 Redis；
+什么数据不能只放 Redis；
+什么时候用单机、主从、Sentinel、Cluster；
+Redis 出问题时业务怎么降级；
+数据变大和流量变热后怎么扩展。
+```
+
+这才是开发和架构视角下真正有价值的 Redis 实战能力。

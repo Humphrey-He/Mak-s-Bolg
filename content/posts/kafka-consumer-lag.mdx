@@ -1,0 +1,1699 @@
+# Kafka 消费积压排查：Consumer Lag、消费者处理慢、Partition 不足、下游瓶颈与 Rebalance 频繁
+
+## 前言
+
+Kafka 消费积压，是 Kafka 生产环境里最常见的事故之一。
+
+典型现象是：
+
+```text
+Producer 还在持续写入消息；
+Kafka Broker 看起来正常；
+但是 Consumer 处理不过来；
+consumer lag 越来越大；
+业务数据延迟越来越高。
+```
+
+例如：
+
+```text
+订单支付成功事件已经写入 Kafka；
+但订单服务 Consumer 处理慢；
+用户支付后几分钟订单状态还没变成 PAID；
+客服系统、积分系统、通知系统都出现延迟。
+```
+
+这类问题表面上叫“消费积压”，本质上是：
+
+```text
+消息生产速度 > 消息消费速度。
+```
+
+但真正排查时，不能只看 Consumer 数量，也不能简单地“加机器”。
+
+因为消费积压的原因可能有很多：
+
+```text
+consumer lag 增长
+消费者处理慢
+Partition 数量不足
+下游数据库瓶颈
+Rebalance 频繁
+消息体过大
+批量消费不合理
+消费者扩容无效
+热点 Partition
+offset 提交异常
+```
+
+从开发角度看，消费积压考验的是 Consumer 代码是否高效、是否批量处理、是否正确提交 offset。
+
+从架构角度看，消费积压考验的是 Topic 分区规划、消费者组扩容能力、下游系统承载能力和故障降级策略。
+
+从源码角度看，消费积压和 Kafka Consumer 的 poll、fetch、offset commit、consumer group rebalance、partition assignment 都有关系；在 Go Sarama 里，还和 `ConsumeClaim`、`MarkMessage`、`OffsetManager`、FetchRequest、ConsumerGroup 协调流程有关。
+
+本文重点拆解：
+
+```text
+1. 什么是 consumer lag？
+2. 如何判断 Kafka 消费积压？
+3. 消费者处理慢怎么定位？
+4. Partition 不足为什么会导致扩容无效？
+5. 下游数据库瓶颈为什么是最常见根因？
+6. Rebalance 频繁为什么会放大积压？
+7. 消息体过大如何拖慢消费？
+8. 批量消费如何优化吞吐？
+9. 消费者扩容策略怎么设计？
+10. 用一个订单事件积压案例完整演示排查过程。
+```
+
+---
+
+# 一、什么是 Consumer Lag？
+
+Consumer Lag 表示 Consumer Group 当前消费进度落后于 Kafka 日志最新位置的消息数量。
+
+可以简单理解为：
+
+```text
+lag = log end offset - committed offset
+```
+
+例如某个 Partition：
+
+```text
+Log End Offset = 10000
+Consumer Committed Offset = 8500
+Lag = 1500
+```
+
+含义是：
+
+```text
+这个 Consumer Group 在这个 Partition 上还有 1500 条消息没有消费完成。
+```
+
+Kafka 的 lag 是 Consumer Group 维度的。
+
+同一个 Topic 可以被多个 Consumer Group 消费，每个 Group 都有自己的 offset 和 lag。
+
+例如：
+
+```text
+Topic: payment_events
+
+order-service-group       lag = 100
+point-service-group       lag = 10000
+notification-service-group lag = 0
+```
+
+这说明：
+
+```text
+同一份 payment_events 消息里，
+订单服务消费基本正常；
+积分服务严重积压；
+通知服务没有积压。
+```
+
+所以排查消费积压时，必须明确：
+
+```text
+哪个 Topic？
+哪个 Consumer Group？
+哪个 Partition？
+lag 是整体增长，还是某几个 Partition 增长？
+```
+
+---
+
+# 二、如何判断消费积压？
+
+最常用命令是：
+
+```bash
+bin/kafka-consumer-groups.sh \
+  --bootstrap-server broker:9092 \
+  --describe \
+  --group order-service-group
+```
+
+典型输出类似：
+
+```text
+GROUP                TOPIC           PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG
+order-service-group  payment_events  0          120000          125000          5000
+order-service-group  payment_events  1          130000          130100          100
+order-service-group  payment_events  2          119000          124500          5500
+order-service-group  payment_events  3          140000          140000          0
+```
+
+这里要重点看三类信息：
+
+```text
+CURRENT-OFFSET：当前 Consumer Group 已提交的消费进度
+LOG-END-OFFSET：Partition 当前最新消息位置
+LAG：两者差值
+```
+
+如果 lag 持续增长，说明消费速度跟不上生产速度。
+
+如果 lag 偶尔增长后快速下降，可能只是短暂流量峰值。
+
+真正危险的是：
+
+```text
+lag 持续增长；
+lag 增长速度越来越快；
+预计清空时间越来越长；
+业务 SLA 已经被影响。
+```
+
+---
+
+# 三、消费积压的本质公式
+
+消费积压可以用一个简单公式理解：
+
+```text
+生产速率 > 消费速率
+```
+
+例如：
+
+```text
+Producer 写入：50000 msg/s
+Consumer 处理：30000 msg/s
+积压增长：20000 msg/s
+```
+
+如果持续 10 分钟：
+
+```text
+20000 * 600 = 1200 万条积压
+```
+
+所以排查消费积压的核心是：
+
+```text
+为什么消费速率不够？
+```
+
+进一步拆解：
+
+```text
+1. Consumer 数量够不够？
+2. Partition 数量够不够？
+3. 单个 Consumer 处理能力够不够？
+4. 下游 DB / RPC 是否拖慢？
+5. 是否频繁 Rebalance？
+6. 是否消息体太大？
+7. 是否批处理不足？
+8. 是否 offset 提交异常？
+9. 是否存在热点 Partition？
+```
+
+---
+
+# 四、消费积压排查总流程
+
+生产事故中，建议按照下面顺序排查：
+
+```text
+第一步：确认积压范围
+- 哪个 Topic？
+- 哪个 Consumer Group？
+- 是所有 Partition 积压，还是少数 Partition 积压？
+
+第二步：确认生产和消费速率
+- Producer 写入速率是多少？
+- Consumer 消费速率是多少？
+- lag 是持续增长还是周期性波动？
+
+第三步：看 Consumer 实例状态
+- Consumer 数量是多少？
+- 是否超过 Partition 数？
+- 是否有实例空闲？
+- 是否频繁重启？
+
+第四步：看单条处理耗时
+- 消费逻辑耗时多少？
+- 下游 DB / RPC 耗时多少？
+- 是否同步逐条处理？
+
+第五步：看 Rebalance
+- 是否频繁 revoke / assign？
+- 是否超过 max.poll.interval.ms？
+- 是否发布或扩缩容导致？
+
+第六步：看消息体和批量配置
+- 消息是否过大？
+- max.poll.records 是否过小？
+- fetch 配置是否合理？
+- 是否可以批量写下游？
+
+第七步：制定治理方案
+- 扩 Consumer
+- 增加 Partition
+- 优化消费逻辑
+- 批量处理
+- 下游扩容
+- 限流 Producer
+- 拆 Topic
+- 引入重试 / 死信
+```
+
+---
+
+# 五、原因一：消费者处理慢
+
+消费者处理慢是最直观的原因。
+
+例如 Consumer 每条消息处理流程是：
+
+```text
+1. 反序列化 JSON
+2. 查订单表
+3. 更新订单状态
+4. 写积分流水
+5. 调用用户服务
+6. 调用通知服务
+7. 提交 offset
+```
+
+如果每条消息平均耗时 100ms，那么单线程每秒只能处理大约：
+
+```text
+10 msg/s
+```
+
+即使 Kafka 本身吞吐很高，业务处理慢也会导致积压。
+
+---
+
+## 1. 如何定位消费者处理慢？
+
+需要在 Consumer 代码里做分段耗时埋点：
+
+```text
+消息反序列化耗时
+业务校验耗时
+数据库查询耗时
+数据库更新耗时
+外部 RPC 耗时
+幂等表写入耗时
+offset 标记 / 提交耗时
+单条总处理耗时
+批次总处理耗时
+```
+
+例如日志：
+
+```text
+eventId=pay_evt_001
+deserialize=2ms
+idempotent_check=5ms
+update_order=80ms
+insert_points=30ms
+rpc_notify=120ms
+total=240ms
+```
+
+从这个日志可以看出，真正慢的是：
+
+```text
+rpc_notify=120ms
+update_order=80ms
+```
+
+不是 Kafka 拉取慢。
+
+---
+
+## 2. 常见优化方式
+
+### 第一，减少单条同步调用
+
+不要在 Consumer 里串行调用多个外部服务。
+
+错误方式：
+
+```text
+消费支付事件
+  -> 更新订单
+  -> 发积分
+  -> 调通知服务
+  -> 调风控服务
+  -> 调营销服务
+```
+
+更好的方式：
+
+```text
+支付事件进入 payment_events
+订单服务只更新订单状态
+积分服务独立消费发积分
+通知服务独立消费发通知
+风控服务独立消费做风控
+```
+
+这就是事件驱动架构的价值：
+
+```text
+不同副作用由不同 Consumer Group 独立处理。
+```
+
+### 第二，批量处理
+
+如果每条消息都单独写数据库：
+
+```text
+INSERT 一次
+UPDATE 一次
+COMMIT 一次
+```
+
+吞吐会很低。
+
+可以改成：
+
+```text
+批量查询
+批量更新
+批量插入
+批量提交
+```
+
+例如积分流水可以批量插入：
+
+```sql
+INSERT INTO user_points_record(user_id, order_id, points, source_type)
+VALUES
+  (?, ?, ?, ?),
+  (?, ?, ?, ?),
+  (?, ?, ?, ?);
+```
+
+### 第三，异步处理但控制并发
+
+可以在 Consumer 内部用 worker pool 提高处理能力。
+
+但要注意：
+
+```text
+同一个 Partition 内并发处理会影响 offset 连续提交；
+顺序敏感业务不能随意并发；
+并发过高会打爆下游 DB。
+```
+
+更稳妥的方式是：
+
+```text
+Partition 级串行；
+不同 Partition 并行；
+下游批量写。
+```
+
+---
+
+# 六、原因二：Partition 不足
+
+Kafka Consumer Group 的并行度受 Partition 数限制。
+
+规则是：
+
+```text
+同一个 Consumer Group 内，一个 Partition 同一时刻只能被一个 Consumer 消费。
+```
+
+所以：
+
+```text
+Consumer 并行度上限 ≈ Partition 数量
+```
+
+例如：
+
+```text
+Topic 有 4 个 Partition
+Consumer Group 有 10 个 Consumer
+```
+
+最多只有 4 个 Consumer 真正工作，剩下 6 个空闲。
+
+这时继续扩 Consumer 没有意义。
+
+---
+
+## 1. 如何判断 Partition 不足？
+
+看 Consumer Group 分配情况。
+
+如果：
+
+```text
+Partition 数 = 8
+Consumer 实例数 = 20
+```
+
+并且有大量 Consumer 没有分配到 Partition，就说明 Consumer 数量已经超过并行上限。
+
+此时 lag 还在增长，说明需要：
+
+```text
+增加 Partition
+或者提高单 Partition 消费能力
+或者拆分 Topic
+```
+
+---
+
+## 2. Partition 不足的典型现象
+
+```text
+扩容 Consumer 后 lag 没下降
+部分 Consumer 没有消息处理
+CPU 很低但 lag 高
+单个 Consumer 处理多个 Partition
+Topic 分区数明显小于业务吞吐需求
+```
+
+---
+
+## 3. 增加 Partition 的风险
+
+增加 Partition 可以提升并行度，但不是无风险。
+
+风险包括：
+
+```text
+1. 会触发 Consumer Group Rebalance
+2. 使用 key 分区时，同一个 key 后续可能进入新 Partition
+3. 强顺序业务可能被影响
+4. 历史数据不会自动迁移到新 Partition
+5. 新 Partition 短期内可能数据较少
+```
+
+对于订单、账户、交易这类强依赖 key 顺序的 Topic，扩 Partition 要谨慎。
+
+更稳的做法可能是：
+
+```text
+新建 Topic v2
+规划更多 Partition
+双写或灰度迁移
+停写旧 Topic 后切换
+```
+
+---
+
+# 七、原因三：下游数据库瓶颈
+
+很多 Kafka 消费积压，看起来是 Kafka 的问题，实际上是数据库问题。
+
+典型链路：
+
+```text
+Kafka Consumer
+  -> 查询 MySQL
+  -> 更新 MySQL
+  -> 插入幂等表
+  -> 提交事务
+```
+
+如果 MySQL 慢，Consumer 就慢。
+
+此时你扩 Consumer，可能只会让更多并发打到 MySQL，导致数据库更慢。
+
+---
+
+## 1. 下游 DB 瓶颈的典型现象
+
+```text
+Consumer lag 增长
+Consumer CPU 不高
+Kafka Broker 正常
+Consumer 处理耗时主要在 DB
+MySQL CPU / IO 飙高
+慢 SQL 增多
+连接池耗尽
+锁等待增加
+死锁增加
+```
+
+---
+
+## 2. 如何定位？
+
+看 Consumer 分段耗时：
+
+```text
+update_order=300ms
+insert_record=200ms
+commit_tx=150ms
+```
+
+再看数据库指标：
+
+```text
+QPS
+TPS
+慢 SQL
+行锁等待
+连接池 active
+连接池 wait
+CPU
+IO
+buffer pool 命中率
+主从延迟
+```
+
+如果 Consumer 处理时间主要花在数据库，Kafka 调参意义不大。
+
+---
+
+## 3. 治理方式
+
+### 第一，批量写入
+
+把逐条写改成批量写。
+
+例如每 100 条消息批量写一次。
+
+### 第二，减少事务范围
+
+不要在一个数据库事务里做太多外部调用。
+
+错误方式：
+
+```text
+开启 DB 事务
+  -> 更新订单
+  -> 调 RPC
+  -> 写积分
+  -> 调通知
+提交 DB 事务
+```
+
+正确方式：
+
+```text
+DB 事务只包本地数据变更；
+外部副作用通过事件异步处理。
+```
+
+### 第三，优化索引和 SQL
+
+消费端高频更新必须有合适索引。
+
+例如：
+
+```sql
+UPDATE orders
+SET status = 'PAID'
+WHERE order_id = ?
+  AND status = 'CREATED';
+```
+
+需要关注：
+
+```text
+order_id 是否有索引
+status 是否影响过滤效率
+是否存在热点行
+是否存在大事务
+```
+
+### 第四，削峰限流
+
+如果下游 DB 扛不住，不应该无限扩 Consumer。
+
+可以做：
+
+```text
+限制 Consumer 并发
+控制批量大小
+限速消费
+让 lag 暂时增长
+保护数据库
+```
+
+Kafka 的一个价值就是缓冲。
+
+有时正确策略不是“立刻清空 lag”，而是“让 Kafka 承接峰值，保护数据库”。
+
+---
+
+# 八、原因四：Rebalance 频繁
+
+Rebalance 是 Consumer Group 重新分配 Partition 的过程。
+
+触发原因包括：
+
+```text
+Consumer 加入 Group
+Consumer 离开 Group
+Consumer 心跳超时
+Consumer 处理太久超过 max.poll.interval.ms
+Topic Partition 数变化
+订阅 Topic 元数据变化
+滚动发布
+扩缩容
+```
+
+Rebalance 期间，Consumer 可能暂停消费，重新分配 Partition。
+
+如果 Rebalance 频繁，会导致：
+
+```text
+消费停顿
+lag 增长
+重复消费增加
+offset 提交失败
+业务延迟抖动
+```
+
+---
+
+## 1. 如何判断 Rebalance 频繁？
+
+看 Consumer 日志：
+
+```text
+Revoking previously assigned partitions
+Assigned partitions
+Member ... sending LeaveGroup
+Attempt to heartbeat failed
+Max poll interval exceeded
+```
+
+看监控：
+
+```text
+rebalance 次数
+rebalance 耗时
+consumer group member 变化
+consumer restart 次数
+poll 间隔
+处理批次耗时
+```
+
+---
+
+## 2. max.poll.interval.ms 的影响
+
+`max.poll.interval.ms` 表示 Consumer 两次 poll 之间允许的最大间隔。
+
+如果业务处理一批消息太久，超过这个时间，Broker 会认为 Consumer 不健康，把它踢出 Consumer Group，触发 Rebalance。
+
+典型事故：
+
+```text
+max.poll.records=1000
+每条处理 500ms
+一批最多处理 500s
+max.poll.interval.ms=300s
+Consumer 被踢出 Group
+触发 Rebalance
+lag 继续增长
+```
+
+治理方式：
+
+```text
+降低 max.poll.records
+优化单条处理耗时
+提高 max.poll.interval.ms
+把处理和 poll 解耦，但要控制 offset 提交
+批量处理下游
+```
+
+---
+
+## 3. 滚动发布导致 Rebalance
+
+如果一次性重启大量 Consumer 实例，会导致 Group 成员频繁变化。
+
+治理方式：
+
+```text
+滚动发布控制并发
+优雅关闭 Consumer
+关闭前提交 offset
+等待当前批次处理完成
+使用静态成员机制
+使用 cooperative sticky assignor
+```
+
+---
+
+# 九、原因五：消息体过大
+
+Kafka 更适合传事件，不适合传大对象。
+
+如果消息体很大，例如每条消息几 MB，会导致：
+
+```text
+Producer 发送慢
+Broker 网络压力大
+Broker 磁盘写入大
+Consumer 拉取慢
+反序列化慢
+GC 压力大
+批量数量下降
+单批处理耗时增加
+```
+
+---
+
+## 1. 典型现象
+
+```text
+单条消息处理耗时高
+Consumer 内存上涨
+GC 频繁
+fetch 请求耗时高
+网络出入流量大
+Broker bytes out 高
+max.poll.records 不大但单批耗时很长
+```
+
+---
+
+## 2. 治理方式
+
+建议：
+
+```text
+Kafka 里只放事件和引用
+大对象放对象存储或数据库
+Kafka 消息里放 objectId / fileUrl / resourceId
+使用压缩
+拆分超大消息
+限制消息大小
+```
+
+错误方式：
+
+```json
+{
+  "eventType": "ReportGenerated",
+  "fullExcelBase64": "几十 MB 的 base64..."
+}
+```
+
+正确方式：
+
+```json
+{
+  "eventType": "ReportGenerated",
+  "reportId": "R1001",
+  "ossKey": "reports/2026/06/R1001.xlsx"
+}
+```
+
+---
+
+# 十、原因六：批量消费不合理
+
+Kafka Consumer 是批量 poll 的。
+
+但很多业务代码仍然逐条处理、逐条提交、逐条写库。
+
+这会大幅降低吞吐。
+
+---
+
+## 1. max.poll.records
+
+`max.poll.records` 控制一次 poll 最多返回多少条记录。
+
+如果设置太小：
+
+```text
+每次拉取数据少
+网络和 poll 开销变大
+吞吐上不去
+```
+
+如果设置太大：
+
+```text
+单批处理耗时长
+可能超过 max.poll.interval.ms
+失败重试成本大
+内存占用高
+```
+
+所以要结合业务处理能力调整。
+
+---
+
+## 2. 批量写下游
+
+例如消费订单支付事件，原来逐条处理：
+
+```text
+每条消息：
+  insert consume_record
+  update order
+  insert points_record
+  commit
+```
+
+可以优化为：
+
+```text
+一批消息：
+  批量插入 consume_record
+  批量查询订单
+  批量更新订单
+  批量插入 points_record
+  批量提交 offset
+```
+
+批量处理的收益：
+
+```text
+减少 DB 往返
+减少事务提交次数
+减少网络开销
+提高吞吐
+```
+
+但批量处理要注意：
+
+```text
+单条失败如何处理
+批次部分成功如何回滚
+幂等如何设计
+offset 如何提交
+顺序是否敏感
+```
+
+---
+
+# 十一、原因七：热点 Partition
+
+如果 Topic 的消息 key 分布不均，会导致某些 Partition 特别热。
+
+例如：
+
+```text
+90% 的消息 key 都是 tenantId=big_customer
+```
+
+那么这些消息可能集中到一个 Partition。
+
+结果是：
+
+```text
+Partition 3 lag 很高
+其他 Partition lag 很低
+Consumer 整体看似有很多实例
+但瓶颈卡在一个 Partition
+```
+
+---
+
+## 1. 如何识别热点 Partition？
+
+看每个 Partition 的 lag：
+
+```text
+Partition 0 lag = 100
+Partition 1 lag = 200
+Partition 2 lag = 50000
+Partition 3 lag = 150
+```
+
+看 Producer key 分布：
+
+```text
+Top key
+Top tenant
+Top user
+Top sku
+Top merchant
+```
+
+看 Broker 分区流量：
+
+```text
+某个 Partition bytes in 特别高
+某个 Consumer claim 处理特别慢
+```
+
+---
+
+## 2. 治理方式
+
+### 第一，优化 key 设计
+
+如果原来：
+
+```text
+key = tenantId
+```
+
+导致大租户热点，可以改成：
+
+```text
+key = tenantId + ":" + hash(orderId) % bucketCount
+```
+
+代价是：
+
+```text
+不再保证 tenant 级全局有序；
+只能保证更细粒度 bucket 内有序。
+```
+
+### 第二，拆 Topic
+
+大客户或大业务单独 Topic：
+
+```text
+payment_events_normal
+payment_events_big_tenant
+```
+
+### 第三，业务分桶
+
+对热点实体进行逻辑分桶：
+
+```text
+merchantId + bucketId
+skuId + bucketId
+```
+
+---
+
+# 十二、实战案例：订单支付事件 Consumer Lag 突增
+
+## 1. 事故背景
+
+电商系统中，支付服务发送支付成功事件：
+
+```text
+Topic: payment_events
+Partition: 8
+Consumer Group: order-service-group
+Consumer 实例数: 8
+```
+
+订单服务消费后：
+
+```text
+1. 更新订单状态 CREATED -> PAID
+2. 写消费记录表
+3. 写积分流水
+4. 提交 Kafka offset
+```
+
+某天活动开始后，监控告警：
+
+```text
+order-service-group consumer lag 从 0 增长到 300 万
+订单支付后状态延迟 5~10 分钟
+用户投诉支付成功但订单仍显示待支付
+```
+
+---
+
+## 2. 第一步：确认积压范围
+
+执行：
+
+```bash
+kafka-consumer-groups.sh \
+  --bootstrap-server broker:9092 \
+  --describe \
+  --group order-service-group
+```
+
+发现：
+
+```text
+payment_events partition 0 lag = 380000
+payment_events partition 1 lag = 410000
+payment_events partition 2 lag = 390000
+payment_events partition 3 lag = 405000
+payment_events partition 4 lag = 370000
+payment_events partition 5 lag = 420000
+payment_events partition 6 lag = 390000
+payment_events partition 7 lag = 410000
+```
+
+结论：
+
+```text
+所有 Partition 都积压，不是单个热点 Partition。
+```
+
+---
+
+## 3. 第二步：看生产和消费速率
+
+监控显示：
+
+```text
+Producer 写入速率：50000 msg/s
+Consumer 消费速率：18000 msg/s
+积压增长：32000 msg/s
+```
+
+说明：
+
+```text
+Consumer 整体处理能力不足。
+```
+
+---
+
+## 4. 第三步：扩 Consumer 是否有效？
+
+当前：
+
+```text
+Partition = 8
+Consumer = 8
+```
+
+团队临时把 Consumer 扩到 16。
+
+结果：
+
+```text
+仍然只有 8 个 Consumer 有 Partition；
+另外 8 个空闲；
+lag 没明显下降。
+```
+
+原因：
+
+```text
+Consumer 并行度受 Partition 数限制。
+```
+
+短期扩 Consumer 无效。
+
+---
+
+## 5. 第四步：看单条处理耗时
+
+Consumer 埋点显示：
+
+```text
+deserialize=1ms
+insert_consume_record=8ms
+update_order=35ms
+insert_points=20ms
+tx_commit=15ms
+total=79ms
+```
+
+单个 Consumer 单线程处理能力大约：
+
+```text
+1000ms / 79ms ≈ 12 msg/s
+```
+
+8 个 Consumer 理论只有：
+
+```text
+96 msg/s
+```
+
+但实际监控是 18000 msg/s，说明 Consumer 内部已经有 worker pool 并发处理。
+
+继续看 DB：
+
+```text
+MySQL CPU 95%
+订单表 update 慢 SQL 增多
+积分流水 insert 等待增加
+连接池 active 打满
+```
+
+真正瓶颈是：
+
+```text
+下游 MySQL。
+```
+
+---
+
+## 6. 第五步：看 Rebalance
+
+Consumer 日志中频繁出现：
+
+```text
+max poll interval exceeded
+revoking partitions
+assigned partitions
+```
+
+原因是：
+
+```text
+max.poll.records=1000
+单批处理在活动高峰期超过 max.poll.interval.ms=300s
+Consumer 被踢出 Group
+Rebalance 频繁
+进一步加剧积压
+```
+
+这属于：
+
+```text
+下游慢 -> 批次处理慢 -> poll 间隔过长 -> Rebalance -> 消费停顿 -> lag 更大
+```
+
+---
+
+## 7. 临时止血方案
+
+### 第一，保护数据库
+
+先不要盲目扩 Consumer。
+
+限制 Consumer 并发：
+
+```text
+每实例 worker 从 200 降到 80
+保护 MySQL
+```
+
+### 第二，降低单批处理时间
+
+调整：
+
+```text
+max.poll.records: 1000 -> 200
+```
+
+避免单批处理超过 `max.poll.interval.ms`。
+
+### 第三，提高 max.poll.interval.ms
+
+临时调整：
+
+```text
+max.poll.interval.ms: 300s -> 900s
+```
+
+降低因批处理慢导致的 Rebalance。
+
+### 第四，关闭非核心副作用
+
+积分发放改为独立 Consumer Group 延后处理。
+
+订单服务 Consumer 只做：
+
+```text
+更新订单状态
+写消费记录
+提交 offset
+```
+
+减少单条处理耗时。
+
+### 第五，限流活动入口
+
+适当限制支付后事件产生速度，避免数据库继续恶化。
+
+---
+
+## 8. 长期治理方案
+
+### 第一，拆分职责
+
+原来：
+
+```text
+order-service-group:
+  更新订单
+  发积分
+  发通知
+```
+
+改成：
+
+```text
+order-service-group:
+  只更新订单状态
+
+point-service-group:
+  独立消费发积分
+
+notification-service-group:
+  独立消费发通知
+```
+
+### 第二，增加 Partition
+
+活动类 Topic 从：
+
+```text
+8 Partition
+```
+
+扩展到：
+
+```text
+32 Partition
+```
+
+但由于 payment_events 使用 orderId 作为 key，需要评估扩容对顺序的影响。
+
+更稳方案：
+
+```text
+新建 payment_events_v2，32 Partition；
+新事件写 v2；
+旧 Topic 消费清空后下线。
+```
+
+### 第三，批量写库
+
+将积分流水、消费记录改为批量插入。
+
+订单状态更新按批次聚合。
+
+### 第四，优化表结构
+
+消费记录表按时间分区，避免单表过大。
+
+订单表更新索引优化：
+
+```text
+order_id 唯一索引
+status 条件更新
+避免无索引扫描
+```
+
+### 第五，建立 lag 分级告警
+
+例如：
+
+```text
+lag < 10 万：观察
+lag 10 万 ~ 100 万：告警
+lag > 100 万：降级非核心消费
+lag > 500 万：限制生产入口 / 扩容 / 启动应急预案
+```
+
+---
+
+# 十三、消费者扩容策略
+
+消费者扩容不是简单加实例。
+
+要先判断瓶颈。
+
+## 1. 可以扩 Consumer 的前提
+
+```text
+Partition 数量足够
+下游系统能承受更多并发
+Consumer CPU 是瓶颈
+单个 Consumer 处理能力不足
+```
+
+## 2. 扩 Consumer 无效的情况
+
+```text
+Consumer 数量已经超过 Partition 数
+下游数据库已经瓶颈
+热点 Partition 严重
+Rebalance 频繁
+消息处理是串行且顺序敏感
+```
+
+## 3. 扩容顺序建议
+
+```text
+先看 lag 按 Partition 分布
+再看 Consumer 处理耗时
+再看下游系统瓶颈
+再决定是否扩 Consumer
+必要时增加 Partition
+最后优化业务处理和批量写
+```
+
+---
+
+# 十四、Go Sarama 视角：积压排查关注点
+
+在 Go Sarama Consumer Group 中，核心消费逻辑通常是：
+
+```go
+func (h *Handler) ConsumeClaim(
+    session sarama.ConsumerGroupSession,
+    claim sarama.ConsumerGroupClaim,
+) error {
+    for msg := range claim.Messages() {
+        err := h.process(msg)
+        if err == nil {
+            session.MarkMessage(msg, "")
+        }
+    }
+    return nil
+}
+```
+
+排查积压时要关注：
+
+```text
+process 是否太慢
+是否每条都同步写 DB
+是否在 ConsumeClaim 中无限重试
+是否 process 失败后阻塞 Partition
+是否无控制地开 goroutine
+是否 MarkMessage 太早
+是否 Rebalance 时无法及时退出
+是否 Offset 提交延迟过大
+```
+
+错误写法：
+
+```go
+for msg := range claim.Messages() {
+    go h.process(msg)
+    session.MarkMessage(msg, "")
+}
+```
+
+问题：
+
+```text
+业务还没处理完就标记 offset；
+进程崩溃可能丢消息；
+并发无上限可能打爆 DB；
+同一 Partition 顺序被破坏。
+```
+
+改进方式：
+
+```go
+for msg := range claim.Messages() {
+    err := h.process(msg)
+    if err != nil {
+        h.sendToRetryTopic(msg, err)
+        continue
+    }
+
+    session.MarkMessage(msg, "")
+}
+```
+
+如果要并发，可以使用有界 worker pool，并设计 offset 连续提交机制。
+
+---
+
+# 十五、源码视角：消费积压看哪些模块？
+
+## 1. Kafka Java Consumer
+
+重点看：
+
+```text
+KafkaConsumer
+Fetcher
+ConsumerNetworkClient
+ConsumerCoordinator
+SubscriptionState
+OffsetCommitRequest
+```
+
+关注：
+
+```text
+poll 如何拉取消息
+fetch 请求如何发出
+records 如何缓存并返回
+offset 如何提交
+rebalance 如何触发
+```
+
+## 2. Broker 侧
+
+重点看：
+
+```text
+KafkaApis
+ReplicaManager
+GroupCoordinator
+FetchRequest
+OffsetCommit
+__consumer_offsets
+```
+
+关注：
+
+```text
+FetchRequest 如何按 Partition 返回数据
+Consumer Group offset 如何存储
+GroupCoordinator 如何管理成员和分配
+```
+
+## 3. Sarama
+
+重点看：
+
+```text
+consumer_group.go
+consumer.go
+offset_manager.go
+broker.go
+fetch_request.go
+offset_commit_request.go
+```
+
+关注：
+
+```text
+ConsumeClaim 如何消费 Partition
+MarkMessage 如何标记 offset
+offset_manager 如何提交 offset
+Rebalance 时如何关闭旧 claim
+FetchRequest 如何拉取消息
+```
+
+---
+
+# 十六、生产监控指标
+
+必须监控：
+
+```text
+consumer lag 总量
+consumer lag 按 Partition 分布
+lag 增长速度
+消费速率 msg/s
+生产速率 msg/s
+单条处理耗时
+批次处理耗时
+Consumer 实例数
+Partition 数
+Rebalance 次数
+Rebalance 耗时
+poll 间隔
+offset commit 失败数
+下游 DB QPS
+下游 DB 慢 SQL
+下游连接池等待
+消息体大小
+死信队列数量
+重试 Topic 数量
+```
+
+建议建立几个派生指标：
+
+```text
+积压清空预计时间 = 当前 lag / 消费净速率
+消费净速率 = 消费速率 - 生产速率
+单 Partition 最大 lag
+lag 最大 Partition / 平均 Partition lag
+```
+
+这些指标能帮助判断：
+
+```text
+是整体消费慢，还是热点 Partition？
+是 Consumer 不够，还是下游慢？
+是短暂峰值，还是持续恶化？
+```
+
+---
+
+# 十七、大厂实践：消费积压治理规范
+
+## 1. Topic 设计阶段预留 Partition
+
+不要等积压后才发现 Partition 太少。
+
+设计时根据：
+
+```text
+目标生产吞吐
+目标消费吞吐
+单 Consumer 处理能力
+顺序性要求
+未来增长
+```
+
+提前规划 Partition。
+
+---
+
+## 2. Consumer 逻辑必须可观测
+
+每个 Consumer 都要埋点：
+
+```text
+消费耗时
+业务处理耗时
+DB 耗时
+RPC 耗时
+失败原因
+重试次数
+幂等命中次数
+offset 提交耗时
+```
+
+---
+
+## 3. 核心消费和非核心消费拆分
+
+不要一个 Consumer 做所有事。
+
+例如支付成功事件：
+
+```text
+订单状态更新：核心
+积分发放：次核心
+短信通知：非核心
+数据分析：非核心
+```
+
+应该拆成多个 Consumer Group。
+
+---
+
+## 4. 失败消息不能无限阻塞
+
+要有：
+
+```text
+重试 Topic
+死信队列
+异常表
+告警
+人工补偿
+```
+
+---
+
+## 5. 扩容要保护下游
+
+扩 Consumer 前先确认下游能扛住。
+
+如果下游 DB 已经满负载，扩 Consumer 会让事故更严重。
+
+---
+
+# 十八、面试表达
+
+## 1. Kafka 消费积压怎么排查？
+
+可以这样回答：
+
+> 我会先用 kafka-consumer-groups 查看具体 Topic、Consumer Group 和 Partition 级别的 lag，判断是所有 Partition 都积压还是某几个 Partition 积压。然后对比生产速率和消费速率。如果所有 Partition 都积压，通常是 Consumer 整体处理能力不足或下游瓶颈；如果只有少数 Partition 积压，可能是 key 分布不均导致热点 Partition。接着看 Consumer 单条处理耗时、DB/RPC 耗时、Rebalance 次数、max.poll.interval.ms 是否触发，以及 Partition 数和 Consumer 数是否匹配。最后根据瓶颈决定是扩 Consumer、加 Partition、批量处理、优化 DB，还是限流和降级。
+
+---
+
+## 2. Consumer lag 很高，直接加 Consumer 有用吗？
+
+可以这样回答：
+
+> 不一定。Kafka 同一个 Consumer Group 的并行度受 Partition 数限制。如果 Topic 只有 8 个 Partition，那么同一个 Group 最多只有 8 个 Consumer 并行工作，多加 Consumer 会空闲。另外，如果瓶颈在下游数据库，扩 Consumer 可能把数据库打得更慢。所以扩容前要先看 Partition 数、Consumer 分配、单条处理耗时和下游资源瓶颈。
+
+---
+
+## 3. Rebalance 为什么会导致积压？
+
+可以这样回答：
+
+> Rebalance 期间 Consumer Group 会重新分配 Partition，部分 Consumer 会暂停消费。如果 Rebalance 频繁，比如 Consumer 处理一批消息太久超过 max.poll.interval.ms，或者实例频繁重启，就会导致消费不断停顿，lag 增长。同时 Rebalance 后可能出现重复消费和 offset 提交失败，进一步加重系统压力。
+
+---
+
+## 4. 下游数据库慢为什么会导致 Kafka 积压？
+
+可以这样回答：
+
+> Kafka Consumer 的吞吐不只取决于 Kafka 拉取速度，还取决于业务处理速度。如果每条消息都要写 MySQL，而 MySQL 出现慢 SQL、锁等待或连接池耗尽，Consumer 处理一条消息的时间就会变长。即使 Kafka Broker 正常，Consumer 也无法及时提交 offset，lag 会持续增长。此时盲目扩 Consumer 可能会进一步打爆数据库，应该先优化 SQL、批量写入、降低并发或拆分消费职责。
+
+---
+
+## 5. 如何优化 Kafka 消费吞吐？
+
+可以这样回答：
+
+> 优化方向包括增加 Partition 提高并行度，扩 Consumer 但不能超过 Partition 上限，优化单条处理逻辑，减少同步 RPC，批量写数据库，合理调整 max.poll.records、fetch.min.bytes、fetch.max.wait.ms 等参数，避免频繁 Rebalance，控制消息体大小，并对失败消息使用重试 Topic 或死信队列，避免阻塞主消费链路。
+
+---
+
+# 十九、总结
+
+Kafka 消费积压的本质是：
+
+```text
+生产速度大于消费速度。
+```
+
+但根因可能在不同层：
+
+```text
+Consumer 代码慢
+Partition 数不足
+Consumer 数超过 Partition 后空闲
+下游数据库慢
+Rebalance 频繁
+消息体过大
+批量消费不足
+热点 Partition
+offset 提交异常
+```
+
+排查时不要只盯 Kafka，要按链路看：
+
+```text
+Producer 写入速率
+Broker 状态
+Topic Partition 分布
+Consumer Group lag
+Consumer 处理耗时
+Rebalance 状态
+下游 DB / RPC
+offset 提交
+重试和死信
+```
+
+生产治理的核心原则是：
+
+```text
+先定位瓶颈，再决定扩容；
+能批量就批量；
+能拆职责就拆职责；
+能保护下游就不要盲目追 lag；
+能用 Kafka 承接峰值，就不要让数据库硬抗瞬时流量。
+```
+
+一句话总结：
+
+```text
+Kafka 消费积压不是一个“加 Consumer”就能解决的问题，而是 Topic 分区、Consumer 处理能力、下游承载能力和 Rebalance 稳定性的综合问题。
+```

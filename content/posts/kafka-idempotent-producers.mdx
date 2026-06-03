@@ -1,0 +1,1293 @@
+# Kafka 消费语义与幂等设计：自动提交、手动提交、至少一次、至多一次、精确一次与订单支付事件实战
+
+## 前言
+
+Kafka 可靠性问题不能只看 Producer 和 Broker。
+
+很多线上事故不是消息没有写进 Kafka，而是发生在 Consumer 端：
+
+```text
+消息已经在 Kafka 里；
+Consumer 也拉到了；
+但业务处理失败了；
+offset 却已经提交了。
+```
+
+或者：
+
+```text
+业务已经处理成功；
+但 offset 还没提交；
+Consumer 宕机重启后又消费了一遍。
+```
+
+于是面试里经常会问：
+
+```text
+Kafka 消费端会不会丢消息？
+Kafka 消费端会不会重复消费？
+自动提交 offset 有什么风险？
+为什么生产中更推荐手动提交？
+至少一次、至多一次、精确一次分别是什么意思？
+消费端幂等怎么做？
+消费记录表和数据库唯一索引怎么设计？
+```
+
+这些问题，本质上都围绕一个核心概念：
+
+```text
+Offset 提交时机。
+```
+
+Kafka Consumer 的消费语义不是单靠 Kafka 保证的，而是由下面几件事共同决定：
+
+```text
+1. 消息什么时候拉取？
+2. 业务什么时候处理？
+3. offset 什么时候提交？
+4. 处理失败怎么重试？
+5. 重复消费怎么幂等？
+6. 下游数据库怎么兜底？
+```
+
+本文从开发、架构和源码视角拆解 Kafka 消费语义，并用一个订单支付事件消费模块说明生产中如何落地。
+
+---
+
+# 一、Kafka Consumer 的基本消费流程
+
+Kafka Consumer 的典型流程是：
+
+```text
+1. poll 拉取消息
+2. 业务处理消息
+3. 提交 offset
+4. 继续下一轮 poll
+```
+
+伪代码：
+
+```go
+for {
+    records := consumer.Poll()
+    for record := range records {
+        process(record)
+    }
+    commitOffset()
+}
+```
+
+其中最关键的是：
+
+```text
+offset 提交代表 Consumer 认为这条消息已经消费完成。
+```
+
+Kafka 本身并不知道你的业务逻辑是否真的处理成功。
+
+Kafka 只知道：
+
+```text
+这个 Consumer Group 提交到了哪个 offset。
+```
+
+例如：
+
+```text
+Partition 0:
+offset 100 -> msgA
+offset 101 -> msgB
+offset 102 -> msgC
+```
+
+如果 Consumer 提交了 offset 103，表示：
+
+```text
+下次从 offset 103 开始消费。
+```
+
+也就意味着：
+
+```text
+offset 100、101、102 被认为已经处理完。
+```
+
+如果其中某条业务其实失败了，但 offset 已经提交，这条消息就很可能不会再被消费。
+
+---
+
+# 二、自动提交 offset
+
+Kafka Consumer 支持自动提交 offset。
+
+配置：
+
+```text
+enable.auto.commit=true
+auto.commit.interval.ms=5000
+```
+
+含义：
+
+```text
+Consumer 会按照 auto.commit.interval.ms 周期自动提交当前消费进度。
+```
+
+Kafka 官方 Consumer 配置文档说明，`auto.commit.interval.ms` 表示当 `enable.auto.commit=true` 时，Consumer 自动提交 offset 的频率，默认值是 5000ms。
+
+---
+
+## 1. 自动提交的优点
+
+自动提交很方便。
+
+优点：
+
+```text
+代码简单
+不需要开发者显式 commit
+适合低可靠要求场景
+```
+
+例如：
+
+```text
+普通日志消费
+非核心埋点
+允许少量丢失的监控数据
+```
+
+---
+
+## 2. 自动提交的风险
+
+自动提交最大的问题是：
+
+```text
+offset 提交和业务处理不是严格绑定的。
+```
+
+假设流程如下：
+
+```text
+1. Consumer poll 到 100 条消息
+2. 自动提交线程提交了 offset
+3. 业务还没处理完
+4. Consumer 进程崩溃
+5. 重启后从已提交 offset 后面继续消费
+6. 未处理完的消息丢失
+```
+
+从 Kafka 角度看，这些消息已经消费过。
+
+从业务角度看，它们没有处理成功。
+
+这就是自动提交可能导致消息丢失的原因。
+
+---
+
+## 3. 自动提交适合什么场景？
+
+适合：
+
+```text
+允许少量丢失
+业务无强一致要求
+处理失败影响不大
+日志类、监控类、埋点类数据
+```
+
+不适合：
+
+```text
+订单事件
+支付事件
+库存变更
+发券事件
+积分事件
+资金流水
+审计日志
+```
+
+生产中，核心业务一般不建议使用自动提交。
+
+---
+
+# 三、手动提交 offset
+
+手动提交是生产中更常见的方式。
+
+配置：
+
+```text
+enable.auto.commit=false
+```
+
+处理流程：
+
+```text
+1. poll 消息
+2. 执行业务逻辑
+3. 业务处理成功
+4. 手动提交 offset
+```
+
+KafkaConsumer API 文档说明，`commitSync` 和 `commitAsync` 让消费者可以控制什么时候一条记录被认为已经消费。
+
+---
+
+## 1. commitSync
+
+同步提交 offset。
+
+特点：
+
+```text
+提交成功才返回
+失败会抛异常或阻塞重试
+语义更清晰
+延迟更高
+```
+
+适合：
+
+```text
+核心业务
+关闭前最后一次提交
+批量处理后确认提交
+```
+
+伪代码：
+
+```java
+while (true) {
+    ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(1000));
+
+    for (ConsumerRecord<String, String> record : records) {
+        process(record);
+    }
+
+    consumer.commitSync();
+}
+```
+
+---
+
+## 2. commitAsync
+
+异步提交 offset。
+
+特点：
+
+```text
+不阻塞消费主流程
+吞吐更好
+提交失败需要 callback 处理
+可能存在提交乱序问题
+```
+
+例如：
+
+```text
+commit offset 100 异步失败
+commit offset 200 异步成功
+之后 offset 100 retry 成功
+可能覆盖更新进度
+```
+
+所以异步提交要谨慎处理 callback 和提交顺序。
+
+常见实践是：
+
+```text
+正常消费中使用 commitAsync
+Consumer 关闭或 Rebalance 前使用 commitSync 兜底
+```
+
+---
+
+## 3. 手动提交仍然会重复消费
+
+手动提交能降低“处理失败但 offset 已提交”的风险。
+
+但它不能避免重复消费。
+
+典型流程：
+
+```text
+1. Consumer 拉到消息 offset=100
+2. 业务处理成功
+3. 还没来得及提交 offset
+4. Consumer 宕机
+5. 重启后又从 offset=100 开始消费
+6. 消息被重复处理
+```
+
+所以手动提交一般对应的是：
+
+```text
+至少一次语义。
+```
+
+也就是：
+
+```text
+消息尽量不丢，但可能重复。
+```
+
+---
+
+# 四、至多一次、至少一次、精确一次
+
+Kafka 消费语义通常分三类。
+
+```text
+至多一次：最多处理一次，可能丢
+至少一次：至少处理一次，可能重复
+精确一次：看起来处理一次，但实现条件严格
+```
+
+---
+
+## 1. 至多一次
+
+至多一次的典型流程是：
+
+```text
+1. 先提交 offset
+2. 再处理业务
+```
+
+如果提交 offset 后，业务处理前 Consumer 宕机，那么消息就丢了。
+
+流程：
+
+```text
+poll offset=100
+commit offset=101
+process offset=100
+进程崩溃
+```
+
+结果：
+
+```text
+offset=100 不会再被消费
+业务也没处理成功
+```
+
+这就是至多一次。
+
+特点：
+
+```text
+不会重复
+可能丢消息
+```
+
+适合：
+
+```text
+对数据完整性要求很低的场景
+```
+
+核心业务一般不用。
+
+---
+
+## 2. 至少一次
+
+至少一次的典型流程是：
+
+```text
+1. 先处理业务
+2. 处理成功后提交 offset
+```
+
+如果业务处理成功，但提交 offset 前宕机，那么消息会重复消费。
+
+特点：
+
+```text
+不容易丢
+可能重复
+```
+
+这是生产中最常见的选择。
+
+为什么？
+
+因为重复可以通过幂等解决，而丢消息通常更难恢复。
+
+大厂实践里常见模式是：
+
+```text
+Kafka 至少一次 + 消费端幂等 + 数据库唯一索引 / 状态机兜底
+```
+
+---
+
+## 3. 精确一次
+
+Kafka 的精确一次语义更复杂。
+
+它通常指 Kafka 内部的消费-处理-生产链路可以通过事务机制实现：
+
+```text
+从 input topic 消费
+处理
+写 output topic
+提交 input offset
+```
+
+事务 Producer 支持 `sendOffsetsToTransaction`，可以把消费 offset 作为当前事务的一部分提交。
+
+流程：
+
+```text
+beginTransaction
+  consume input
+  process
+  produce output
+  sendOffsetsToTransaction
+commitTransaction
+```
+
+如果事务提交成功：
+
+```text
+输出消息和 offset 一起生效。
+```
+
+如果事务失败：
+
+```text
+输出消息和 offset 都不生效。
+```
+
+这适合 Kafka 到 Kafka 的流处理链路。
+
+但要注意：
+
+```text
+Kafka 事务不能自动保证 Kafka 和外部数据库之间的分布式事务。
+```
+
+比如：
+
+```text
+消费 Kafka
+写 MySQL
+提交 Kafka offset
+```
+
+这个场景不因为 Kafka 事务就自动 exactly-once。
+
+仍然需要消费端幂等、业务状态机、唯一索引、Outbox 或补偿机制。
+
+---
+
+# 五、重复消费为什么一定要面对？
+
+Kafka 消费端重复消费是非常常见的。
+
+典型原因：
+
+```text
+业务处理成功但 offset 提交失败
+Consumer 处理成功后宕机
+Rebalance 发生，Partition 被分配给其他 Consumer
+commitAsync 提交失败
+Consumer 超过 max.poll.interval.ms 被踢出 Group
+网络抖动导致提交超时
+```
+
+所以生产系统不能假设：
+
+```text
+一条 Kafka 消息只会被消费一次。
+```
+
+更成熟的假设是：
+
+```text
+消息可能重复；
+重复必须不影响最终业务结果。
+```
+
+这就是消费端幂等设计的核心。
+
+---
+
+# 六、消费端幂等的常见方案
+
+消费端幂等的目标是：
+
+```text
+同一条消息被消费多次，最终业务效果只发生一次。
+```
+
+常见方案有四类：
+
+```text
+1. eventId 去重
+2. 消费记录表
+3. 数据库唯一索引
+4. 业务状态机条件更新
+```
+
+---
+
+## 1. eventId 去重
+
+Producer 发送消息时携带唯一事件 ID：
+
+```json
+{
+  "eventId": "evt_20260603_000001",
+  "eventType": "PaymentSuccess",
+  "orderId": "O1001",
+  "paidAmount": 19900
+}
+```
+
+Consumer 处理前先判断 eventId 是否处理过。
+
+如果处理过，直接跳过。
+
+---
+
+## 2. 消费记录表
+
+消费记录表是一种非常常用的幂等方案。
+
+表结构示例：
+
+```sql
+CREATE TABLE kafka_consume_record (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    consumer_group VARCHAR(128) NOT NULL,
+    topic VARCHAR(128) NOT NULL,
+    partition_id INT NOT NULL,
+    message_offset BIGINT NOT NULL,
+    event_id VARCHAR(128) NOT NULL,
+    status VARCHAR(32) NOT NULL,
+    create_time DATETIME NOT NULL,
+    update_time DATETIME NOT NULL,
+    UNIQUE KEY uk_event_consumer (consumer_group, event_id),
+    UNIQUE KEY uk_topic_offset (consumer_group, topic, partition_id, message_offset)
+);
+```
+
+可以按两种维度去重：
+
+```text
+eventId 去重
+topic + partition + offset 去重
+```
+
+两者区别：
+
+```text
+eventId：业务事件级去重，跨 Topic/重放也可识别
+topic + partition + offset：Kafka 消费位置级去重
+```
+
+生产中更推荐业务事件带 `eventId`，因为 offset 是 Kafka 层概念，重放、迁移、Topic 切换后不一定稳定。
+
+---
+
+## 3. 数据库唯一索引
+
+很多业务天然可以用唯一索引保证幂等。
+
+例如发放积分：
+
+```sql
+CREATE TABLE user_points_record (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    user_id BIGINT NOT NULL,
+    order_id VARCHAR(64) NOT NULL,
+    points INT NOT NULL,
+    source_type VARCHAR(32) NOT NULL,
+    create_time DATETIME NOT NULL,
+    UNIQUE KEY uk_order_points (order_id, source_type)
+);
+```
+
+同一个订单支付成功后，只允许发放一次积分。
+
+如果 Kafka 消息重复消费，第二次插入会触发唯一索引冲突。
+
+应用捕获 DuplicateKey 后，可以认为已经处理过。
+
+这种方式非常可靠，因为最终由数据库约束兜底。
+
+---
+
+## 4. 状态机条件更新
+
+订单状态更新适合用状态机。
+
+例如支付成功事件：
+
+```sql
+UPDATE orders
+SET status = 'PAID',
+    paid_time = NOW()
+WHERE order_id = ?
+  AND status = 'CREATED';
+```
+
+如果消息重复消费：
+
+```text
+第一次：CREATED -> PAID，更新成功
+第二次：当前已经是 PAID，WHERE status='CREATED' 不满足，更新 0 行
+```
+
+这样重复消费不会反复推进状态。
+
+状态机适合：
+
+```text
+订单状态
+支付状态
+退款状态
+发货状态
+任务状态
+审批状态
+```
+
+---
+
+# 七、实战案例：订单支付成功事件消费模块
+
+下面设计一个真实项目里常见的小模块。
+
+## 1. 业务背景
+
+支付服务在订单支付成功后发送 Kafka 消息：
+
+```text
+Topic: payment_events
+Event: PaymentSuccess
+```
+
+消息内容：
+
+```json
+{
+  "eventId": "pay_evt_20260603_000001",
+  "eventType": "PaymentSuccess",
+  "orderId": "O1001",
+  "userId": 1001,
+  "paidAmount": 19900,
+  "paidTime": "2026-06-03T10:00:00+09:00"
+}
+```
+
+订单服务消费这个事件后要做两件事：
+
+```text
+1. 更新订单状态为 PAID
+2. 给用户发放积分
+```
+
+要求：
+
+```text
+不能漏处理支付成功事件
+不能重复发积分
+订单状态不能乱
+Kafka 消息重复消费时业务结果只能发生一次
+```
+
+---
+
+## 2. 错误实现
+
+错误做法：
+
+```go
+func ConsumePaymentSuccess(msg PaymentSuccessEvent) error {
+    orderDao.UpdateStatus(msg.OrderId, "PAID")
+    pointDao.AddPoints(msg.UserId, msg.OrderId, msg.PaidAmount/100)
+    return nil
+}
+```
+
+问题：
+
+```text
+Kafka 重复消费时，会重复发积分。
+订单状态可能被重复更新。
+如果积分发放成功但 offset 提交失败，重启后会再次发积分。
+```
+
+---
+
+## 3. 正确设计：状态机 + 唯一索引 + 消费记录表
+
+需要三层幂等。
+
+第一层：消费记录表防重复事件。
+
+```sql
+CREATE TABLE kafka_consume_record (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    consumer_group VARCHAR(128) NOT NULL,
+    event_id VARCHAR(128) NOT NULL,
+    topic VARCHAR(128) NOT NULL,
+    partition_id INT NOT NULL,
+    message_offset BIGINT NOT NULL,
+    status VARCHAR(32) NOT NULL,
+    create_time DATETIME NOT NULL,
+    update_time DATETIME NOT NULL,
+    UNIQUE KEY uk_consumer_event (consumer_group, event_id)
+);
+```
+
+第二层：订单状态机。
+
+```sql
+UPDATE orders
+SET status = 'PAID',
+    paid_time = ?
+WHERE order_id = ?
+  AND status = 'CREATED';
+```
+
+第三层：积分流水唯一索引。
+
+```sql
+CREATE TABLE user_points_record (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    user_id BIGINT NOT NULL,
+    order_id VARCHAR(64) NOT NULL,
+    points INT NOT NULL,
+    source_type VARCHAR(32) NOT NULL,
+    create_time DATETIME NOT NULL,
+    UNIQUE KEY uk_order_points (order_id, source_type)
+);
+```
+
+---
+
+## 4. 消费处理流程
+
+完整流程：
+
+```text
+1. Consumer poll 到 PaymentSuccess 消息
+2. 开启本地数据库事务
+3. 插入 kafka_consume_record，eventId 唯一
+4. 如果唯一键冲突，说明处理过，直接跳过
+5. 更新订单状态 CREATED -> PAID
+6. 插入积分流水，orderId + sourceType 唯一
+7. 提交数据库事务
+8. 手动提交 Kafka offset
+```
+
+关键点：
+
+```text
+业务数据库事务先提交；
+Kafka offset 后提交。
+```
+
+为什么？
+
+因为如果反过来，先提交 offset，再提交数据库事务，一旦数据库失败，消息就丢了。
+
+先提交数据库，再提交 offset，最坏情况是：
+
+```text
+数据库成功
+offset 提交失败
+消息重复消费
+```
+
+重复消费可以通过消费记录表和唯一索引兜底。
+
+这是典型的至少一次 + 幂等设计。
+
+---
+
+## 5. Go 风格伪代码
+
+```go
+func HandlePaymentSuccess(ctx context.Context, msg KafkaMessage, event PaymentSuccessEvent) error {
+    tx, err := db.BeginTx(ctx, nil)
+    if err != nil {
+        return err
+    }
+
+    defer tx.Rollback()
+
+    inserted, err := insertConsumeRecord(ctx, tx, ConsumeRecord{
+        ConsumerGroup: "order-service",
+        EventID:       event.EventID,
+        Topic:         msg.Topic,
+        Partition:     msg.Partition,
+        Offset:        msg.Offset,
+        Status:        "PROCESSING",
+    })
+
+    if err != nil {
+        return err
+    }
+
+    if !inserted {
+        // 说明 eventId 已处理过
+        return nil
+    }
+
+    // 状态机更新：只允许 CREATED -> PAID
+    affected, err := updateOrderPaid(ctx, tx, event.OrderID, event.PaidTime)
+    if err != nil {
+        return err
+    }
+
+    if affected == 0 {
+        // 订单可能已经是 PAID，或者状态异常
+        // 可以记录日志，按业务决定是否进入异常表
+    }
+
+    // 积分流水唯一索引兜底
+    err = insertPointRecord(ctx, tx, PointRecord{
+        UserID:     event.UserID,
+        OrderID:    event.OrderID,
+        Points:     event.PaidAmount / 100,
+        SourceType: "ORDER_PAY",
+    })
+
+    if isDuplicateKey(err) {
+        // 积分已经发过，认为幂等成功
+        err = nil
+    }
+
+    if err != nil {
+        return err
+    }
+
+    err = updateConsumeRecordSuccess(ctx, tx, event.EventID)
+    if err != nil {
+        return err
+    }
+
+    if err := tx.Commit(); err != nil {
+        return err
+    }
+
+    // 数据库事务成功后，再提交 Kafka offset
+    return commitKafkaOffset(ctx, msg)
+}
+```
+
+这段流程的核心思想是：
+
+```text
+Kafka 允许重复；
+数据库保证幂等；
+offset 提交只代表“可以不再重放”，而不是业务正确性的唯一保障。
+```
+
+---
+
+# 八、为什么不直接依赖 offset 去重？
+
+可以用：
+
+```text
+consumer_group + topic + partition + offset
+```
+
+作为唯一键。
+
+但它有几个问题：
+
+```text
+1. 业务事件重发到新 Topic 后 offset 会变
+2. 数据迁移后 offset 会变
+3. 同一个业务事件可能被重新发布
+4. 死信队列重放后 offset 不同
+```
+
+所以更推荐：
+
+```text
+业务事件必须携带 eventId。
+```
+
+eventId 是业务去重的核心。
+
+offset 是 Kafka 消费进度，不应该是唯一的业务幂等依据。
+
+---
+
+# 九、消费失败怎么处理？
+
+消费失败不能无限重试阻塞主流程。
+
+常见策略：
+
+```text
+有限重试
+指数退避
+重试 Topic
+死信队列
+异常表
+人工补偿
+```
+
+例如：
+
+```text
+payment_events
+payment_events_retry_1m
+payment_events_retry_10m
+payment_events_dead_letter
+```
+
+流程：
+
+```text
+主 Topic 消费失败
+  -> 投递到 retry_1m
+  -> 再失败投递到 retry_10m
+  -> 仍失败进入 dead_letter
+  -> 告警和人工处理
+```
+
+不要在 Consumer 线程里对同一条消息无限 sleep 重试，否则会阻塞该 Partition 后续消息。
+
+特别是顺序敏感 Topic，要权衡：
+
+```text
+保证顺序：失败消息阻塞后续消息
+保证吞吐：失败消息转移到 retry / DLQ，后续消息继续
+```
+
+这是业务取舍。
+
+---
+
+# 十、自动提交、手动提交与语义对比
+
+| 模式       | offset 提交时机      | 结果          | 风险                    |
+| -------- | ---------------- | ----------- | --------------------- |
+| 自动提交     | 周期自动提交           | 简单          | 业务未完成但 offset 已提交，可能丢 |
+| 先提交后处理   | 处理前提交            | 至多一次        | 可能丢                   |
+| 先处理后提交   | 处理成功后提交          | 至少一次        | 可能重复                  |
+| Kafka 事务 | 输出消息和 offset 同事务 | Kafka 内精确一次 | 不自动覆盖外部 DB            |
+| 业务幂等     | 重复处理无副作用         | 工程上最常用      | 需要表设计和状态机             |
+
+生产核心建议：
+
+```text
+关闭自动提交；
+业务处理成功后手动提交；
+消费端必须幂等；
+外部数据库用唯一索引和状态机兜底。
+```
+
+---
+
+# 十一、Go Sarama 消费端设计要点
+
+Go Sarama Consumer Group 常见处理方式是：
+
+```go
+func (h *Handler) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
+    for msg := range claim.Messages() {
+        err := h.process(msg)
+        if err == nil {
+            session.MarkMessage(msg, "")
+        }
+    }
+    return nil
+}
+```
+
+这里 `MarkMessage` 不是立即同步提交到 Broker，而是标记该消息已处理，后续由 Sarama 按配置提交。
+
+生产中要注意：
+
+```text
+1. process 成功后再 MarkMessage
+2. process 失败不要 MarkMessage
+3. ConsumeClaim 中不要无控制地开 goroutine 并发处理同一 Partition
+4. Rebalance 时要尽快退出 ConsumeClaim
+5. 关闭前要等待关键处理完成
+6. 幂等不能依赖 MarkMessage 本身
+```
+
+如果你在 `ConsumeClaim` 中这样写：
+
+```go
+for msg := range claim.Messages() {
+    go h.process(msg)
+    session.MarkMessage(msg, "")
+}
+```
+
+这是危险的。
+
+因为：
+
+```text
+业务还没处理完，offset 已经被标记；
+进程崩溃后消息可能丢。
+```
+
+正确方式是：
+
+```go
+for msg := range claim.Messages() {
+    err := h.process(msg)
+    if err == nil {
+        session.MarkMessage(msg, "")
+    }
+}
+```
+
+如果需要并发，要设计 Partition 内 offset 连续提交机制，否则容易乱序提交或跳过失败消息。
+
+---
+
+# 十二、源码视角：消费语义看哪些模块？
+
+## 1. Kafka Java Consumer
+
+重点看：
+
+```text
+KafkaConsumer
+ConsumerCoordinator
+SubscriptionState
+Fetcher
+OffsetCommitRequest
+OffsetFetchRequest
+```
+
+关注问题：
+
+```text
+poll 如何拉取消息？
+offset 如何在本地维护？
+commitSync / commitAsync 如何发送提交请求？
+Rebalance 时如何 revoke 和 assign Partition？
+```
+
+## 2. Broker 侧 Offset 存储
+
+Kafka 的 Consumer Group offset 存储在内部 Topic：
+
+```text
+__consumer_offsets
+```
+
+Consumer 提交 offset，本质上是向 Kafka 的内部 offset 存储写入消费进度。
+
+重点关注：
+
+```text
+GroupCoordinator
+OffsetCommit
+OffsetFetch
+__consumer_offsets
+```
+
+## 3. Sarama 客户端
+
+重点看：
+
+```text
+consumer_group.go
+consumer.go
+offset_manager.go
+broker.go
+fetch_request.go
+offset_commit_request.go
+```
+
+关注问题：
+
+```text
+ConsumeClaim 如何对应 Partition 消费？
+MarkMessage 如何标记 offset？
+OffsetManager 如何批量提交？
+Rebalance 时如何清理和重新分配？
+```
+
+---
+
+# 十三、大厂实践：Kafka 消费端可靠性规范
+
+## 1. 核心业务关闭自动提交
+
+```text
+enable.auto.commit=false
+```
+
+或者在 Sarama 中使用处理成功后 `MarkMessage` 的方式控制提交。
+
+---
+
+## 2. 所有业务事件必须有 eventId
+
+消息结构至少包含：
+
+```json
+{
+  "eventId": "全局唯一事件 ID",
+  "eventType": "事件类型",
+  "eventTime": "事件时间",
+  "bizId": "业务主键",
+  "payload": {}
+}
+```
+
+没有 eventId 的消息，很难做业务级幂等。
+
+---
+
+## 3. 消费端必须幂等
+
+幂等手段：
+
+```text
+消费记录表
+数据库唯一索引
+状态机条件更新
+业务流水去重
+幂等接口
+```
+
+---
+
+## 4. offset 提交必须晚于业务成功
+
+核心原则：
+
+```text
+业务成功后再提交 offset。
+```
+
+接受重复，不接受丢失。
+
+---
+
+## 5. 失败消息要有去处
+
+不能无限阻塞，也不能直接丢。
+
+要有：
+
+```text
+重试 Topic
+死信队列
+异常表
+告警
+人工补偿
+```
+
+---
+
+## 6. 监控必须覆盖消费链路
+
+必须监控：
+
+```text
+consumer lag
+消费成功数
+消费失败数
+重复消费数
+幂等命中数
+死信消息数
+单条处理耗时
+批处理耗时
+offset commit 失败数
+rebalance 次数
+下游数据库耗时
+```
+
+---
+
+# 十四、面试表达
+
+## 1. Kafka 自动提交 offset 有什么风险？
+
+可以这样回答：
+
+> 自动提交 offset 的风险是 offset 提交和业务处理不是强绑定的。Consumer 可能已经自动提交了 offset，但业务逻辑还没处理完成，此时如果进程宕机，重启后会从已提交 offset 之后继续消费，导致未处理成功的消息丢失。因此核心业务一般关闭自动提交，改为业务处理成功后手动提交 offset。
+
+---
+
+## 2. Kafka 至少一次和至多一次有什么区别？
+
+可以这样回答：
+
+> 至多一次是先提交 offset 再处理业务，这样消息最多处理一次，但如果提交后业务失败，消息就丢了。至少一次是先处理业务，成功后再提交 offset，这样消息不容易丢，但如果业务成功后提交 offset 前宕机，消息会重复消费。生产中核心业务通常选择至少一次，再通过消费端幂等解决重复问题。
+
+---
+
+## 3. Kafka 消费端如何做幂等？
+
+可以这样回答：
+
+> 消费端幂等的核心是让同一条业务事件重复消费时，最终业务结果只发生一次。常见做法是消息携带全局唯一 eventId，消费端用消费记录表做去重；业务表用唯一索引兜底，比如 orderId + sourceType 防止重复发积分；状态类业务用状态机条件更新，比如订单只能从 CREATED 更新到 PAID。这样即使 Kafka 重复投递，也不会导致重复业务效果。
+
+---
+
+## 4. 消费记录表怎么设计？
+
+可以这样回答：
+
+> 消费记录表一般包含 consumer_group、event_id、topic、partition、offset、status、create_time、update_time，并对 consumer_group + event_id 建唯一索引。处理消息时在同一个数据库事务中插入消费记录、执行业务更新、更新消费记录状态。如果 eventId 唯一索引冲突，说明消息已经处理过，可以直接跳过。
+
+---
+
+## 5. Kafka 精确一次是否能解决数据库幂等？
+
+可以这样回答：
+
+> Kafka 的精确一次主要解决 Kafka 内部的消费-处理-生产链路，比如读 input topic、写 output topic，并把 offset 提交放到同一个 Kafka 事务中。它不能自动解决 Kafka 和外部数据库之间的分布式事务。如果 Consumer 要写 MySQL，仍然需要本地事务、消费记录表、唯一索引、状态机和补偿机制。
+
+---
+
+# 十五、总结
+
+Kafka 消费语义的核心不是“Kafka 会不会重复”，而是：
+
+```text
+你能不能接受重复，并让重复没有副作用。
+```
+
+核心结论：
+
+```text
+自动提交 offset：简单，但可能丢消息
+先提交后处理：至多一次，可能丢
+先处理后提交：至少一次，可能重复
+Kafka 事务：适合 Kafka 内部消费-处理-生产链路
+外部数据库：必须靠幂等、唯一索引、状态机和补偿
+```
+
+生产中最常见、最稳妥的模型是：
+
+```text
+Kafka 至少一次
++ 手动提交 offset
++ 消费端幂等
++ 数据库唯一索引
++ 状态机条件更新
++ 失败重试和死信队列
+```
+
+一句话总结：
+
+```text
+Kafka 可以保证消息被可靠投递到消费端，但业务最终只处理一次，要靠消费端幂等设计。
+```

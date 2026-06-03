@@ -1,0 +1,1462 @@
+# 缓存穿透、击穿、雪崩：从业务事故到架构治理的 Redis 缓存稳定性实践
+
+## 前言
+
+在后端系统里，Redis 缓存通常是数据库前面最重要的一道保护层。
+
+一个典型读链路是：
+
+```text
+请求进入服务
+  -> 查询 Redis
+  -> 命中，直接返回
+  -> 未命中，查询数据库
+  -> 回写 Redis
+  -> 返回结果
+```
+
+这个模型看起来很简单，但真实生产环境里，很多事故都发生在“缓存未命中”的瞬间。
+
+常见三类问题是：
+
+```text
+缓存穿透
+缓存击穿
+缓存雪崩
+```
+
+这三个词很像，但本质完全不同。
+
+可以先用一句话区分：
+
+```text
+缓存穿透：查一个根本不存在的数据，请求绕过缓存持续打到数据库。
+缓存击穿：一个热点 key 失效，大量并发同时打到数据库。
+缓存雪崩：大量 key 同时失效，或者缓存层整体不可用，数据库被流量压垮。
+```
+
+从开发角度看，这是缓存代码怎么写的问题。
+
+从架构角度看，这是系统如何保护数据库、如何削峰、如何降级、如何避免单点崩溃的问题。
+
+从源码角度看，这又和 Redis 的过期机制、单线程命令执行、TTL、锁命令、布隆过滤器、热点 key、大 key 治理有关。
+
+本文重点拆解：
+
+```text
+1. 缓存穿透是什么？
+2. 缓存击穿是什么？
+3. 缓存雪崩是什么？
+4. 三者分别怎么解决？
+5. 空值缓存怎么用？
+6. 布隆过滤器怎么用？
+7. 互斥锁重建缓存怎么实现？
+8. TTL 随机化为什么有效？
+9. 大厂生产环境怎么做缓存稳定性治理？
+10. 面试中怎么讲得有深度？
+```
+
+---
+
+# 一、缓存系统的基本模型
+
+先看最常见的 Cache Aside 模式，也叫旁路缓存模式。
+
+伪代码如下：
+
+```go
+func GetProduct(ctx context.Context, productId int64) (*Product, error) {
+    cacheKey := fmt.Sprintf("product:detail:%d", productId)
+
+    // 1. 先查缓存
+    val, err := redis.Get(ctx, cacheKey).Result()
+    if err == nil {
+        return DecodeProduct(val), nil
+    }
+
+    // 2. 缓存未命中，查数据库
+    product, err := db.QueryProduct(ctx, productId)
+    if err != nil {
+        return nil, err
+    }
+
+    // 3. 回写缓存
+    redis.Set(ctx, cacheKey, EncodeProduct(product), 5*time.Minute)
+
+    return product, nil
+}
+```
+
+这个模型正常情况下没有问题。
+
+但它有一个天然风险：
+
+```text
+只要 Redis 没命中，请求就会进入数据库。
+```
+
+如果未命中是少量随机发生，数据库可以承受。
+
+如果未命中在同一时间集中发生，数据库可能瞬间被打爆。
+
+缓存三大问题，本质上都是不同形式的“缓存未命中风暴”。
+
+---
+
+# 二、缓存穿透：查询不存在的数据
+
+## 1. 什么是缓存穿透？
+
+缓存穿透指的是：
+
+```text
+请求查询的数据在 Redis 中不存在，在数据库中也不存在。
+```
+
+因为数据库查不到数据，所以通常不会回写缓存。
+
+下一次相同请求进来，Redis 仍然没有，继续查数据库。
+
+如果有人恶意构造大量不存在的 ID，例如：
+
+```text
+productId = -1
+productId = 999999999999
+userId = random_uuid
+orderId = fake_id
+```
+
+这些请求会绕过缓存，持续打到数据库。
+
+这就是缓存穿透。
+
+---
+
+## 2. 缓存穿透的典型事故场景
+
+常见场景包括：
+
+```text
+1. 恶意攻击者随机请求不存在的商品 ID
+2. 爬虫扫描大量不存在的用户 ID
+3. 前端参数异常导致大量非法 ID 请求
+4. 老链接访问已经删除的数据
+5. 业务迁移后历史 ID 找不到
+6. 接口没有参数校验，导致无效请求进入 DB
+```
+
+例如商品详情接口：
+
+```text
+GET /product/detail?id=999999999999
+```
+
+Redis 没有这个 key。
+
+数据库也没有这个商品。
+
+如果接口没有任何保护，每次请求都会查数据库。
+
+---
+
+## 3. 缓存穿透的本质
+
+缓存穿透的本质是：
+
+```text
+缓存只缓存存在的数据；
+不存在的数据没有被缓存；
+不存在数据的请求每次都落到数据库。
+```
+
+所以解决方向有三个：
+
+```text
+1. 在入口拦截明显非法请求；
+2. 对不存在的数据也做缓存；
+3. 在查缓存之前先判断这个 ID 是否可能存在。
+```
+
+对应方案就是：
+
+```text
+参数校验
+空值缓存
+布隆过滤器
+限流和风控
+```
+
+---
+
+# 三、缓存穿透解决方案一：参数校验
+
+参数校验是最容易被忽略，但最应该优先做的方案。
+
+例如：
+
+```go
+func ValidateProductId(productId int64) error {
+    if productId <= 0 {
+        return errors.New("invalid product id")
+    }
+
+    if productId > MaxProductId {
+        return errors.New("invalid product id")
+    }
+
+    return nil
+}
+```
+
+入口层能拦截的，就不要放到缓存层和数据库层。
+
+常见校验包括：
+
+```text
+ID 是否为正数
+ID 长度是否合法
+UUID 格式是否合法
+枚举值是否合法
+分页参数是否合法
+用户是否有权限访问该资源
+```
+
+大厂实践里，参数校验通常会放在多层：
+
+```text
+网关层：基础格式校验、黑名单、限流
+应用层：业务参数校验
+DAO 层：防御性兜底
+```
+
+缓存穿透不是只靠 Redis 解决，最前面的非法流量应该尽早拦截。
+
+---
+
+# 四、缓存穿透解决方案二：空值缓存
+
+## 1. 什么是空值缓存？
+
+空值缓存是指：
+
+```text
+数据库查不到数据时，也往 Redis 写一个空标记。
+```
+
+例如：
+
+```text
+SET product:detail:999999999999 "__NULL__" EX 60
+```
+
+下一次相同请求进来，Redis 命中空值，直接返回不存在，不再查数据库。
+
+伪代码：
+
+```go
+const NullValue = "__NULL__"
+
+func GetProduct(ctx context.Context, productId int64) (*Product, error) {
+    cacheKey := fmt.Sprintf("product:detail:%d", productId)
+
+    val, err := redis.Get(ctx, cacheKey).Result()
+    if err == nil {
+        if val == NullValue {
+            return nil, ErrNotFound
+        }
+        return DecodeProduct(val), nil
+    }
+
+    product, err := db.QueryProduct(ctx, productId)
+    if err != nil {
+        if errors.Is(err, sql.ErrNoRows) {
+            redis.Set(ctx, cacheKey, NullValue, 60*time.Second)
+            return nil, ErrNotFound
+        }
+        return nil, err
+    }
+
+    redis.Set(ctx, cacheKey, EncodeProduct(product), 5*time.Minute)
+    return product, nil
+}
+```
+
+---
+
+## 2. 空值缓存的优点
+
+```text
+实现简单
+对重复查询同一个不存在 ID 非常有效
+不依赖额外组件
+能快速降低数据库压力
+```
+
+比如某个不存在商品 ID 被爬虫反复请求，空值缓存可以直接挡住。
+
+---
+
+## 3. 空值缓存的问题
+
+空值缓存也有副作用。
+
+### 第一，可能缓存大量无效 key
+
+如果攻击者不断构造随机 ID：
+
+```text
+product:detail:fake_1
+product:detail:fake_2
+product:detail:fake_3
+...
+```
+
+系统会产生大量空值缓存 key。
+
+这会占用 Redis 内存。
+
+所以空值缓存 TTL 一般要短。
+
+例如：
+
+```text
+正常数据 TTL：5 分钟到 30 分钟
+空值缓存 TTL：30 秒到 2 分钟
+```
+
+### 第二，可能造成短暂不一致
+
+假设用户第一次查商品 1001，数据库不存在，于是缓存空值 60 秒。
+
+10 秒后商品 1001 被创建了。
+
+但在空值缓存过期前，查询仍然返回不存在。
+
+解决方式：
+
+```text
+1. 空值 TTL 设置短一点；
+2. 创建数据时主动删除对应空值缓存；
+3. 对强一致接口不使用空值缓存；
+4. 写操作完成后发布缓存失效事件。
+```
+
+### 第三，空值标记要和真实值区分
+
+不要用空字符串随便表示空值。
+
+应该定义明确的空值标记，例如：
+
+```text
+__NULL__
+```
+
+或者缓存一个带状态的 JSON：
+
+```json
+{"exists":false}
+```
+
+这样避免和真实业务数据混淆。
+
+---
+
+# 五、缓存穿透解决方案三：布隆过滤器
+
+## 1. 布隆过滤器是什么？
+
+布隆过滤器是一种概率型数据结构，用于判断一个元素是否可能存在于集合中。
+
+它的结论有两个：
+
+```text
+一定不存在
+可能存在
+```
+
+注意，它不能说“一定存在”。
+
+布隆过滤器可能有误判。
+
+也就是说：
+
+```text
+如果布隆过滤器判断不存在，那一定不存在；
+如果布隆过滤器判断存在，可能存在，也可能是假阳性。
+```
+
+Redis 官方 Bloom Filter 文档也说明，Bloom Filter 用很小固定内存存储元素的哈希表示，牺牲一定精度换取空间效率和速度。
+
+---
+
+## 2. 布隆过滤器怎么防穿透？
+
+以商品详情为例。
+
+系统启动或定时任务把所有合法商品 ID 加入布隆过滤器：
+
+```text
+BF.ADD product:bf 1001
+BF.ADD product:bf 1002
+BF.ADD product:bf 1003
+```
+
+请求进来时：
+
+```text
+1. 先查布隆过滤器；
+2. 如果判断一定不存在，直接返回；
+3. 如果判断可能存在，再查 Redis；
+4. Redis 未命中再查数据库。
+```
+
+流程：
+
+```text
+请求 productId
+  -> Bloom Filter 判断
+      -> 不存在：直接返回
+      -> 可能存在：查 Redis
+          -> 命中：返回
+          -> 未命中：查 DB
+```
+
+伪代码：
+
+```go
+func GetProduct(ctx context.Context, productId int64) (*Product, error) {
+    exists, err := redis.BFExists(ctx, "product:bf", productId).Result()
+    if err == nil && !exists {
+        return nil, ErrNotFound
+    }
+
+    cacheKey := fmt.Sprintf("product:detail:%d", productId)
+
+    val, err := redis.Get(ctx, cacheKey).Result()
+    if err == nil {
+        if val == NullValue {
+            return nil, ErrNotFound
+        }
+        return DecodeProduct(val), nil
+    }
+
+    product, err := db.QueryProduct(ctx, productId)
+    if err != nil {
+        if errors.Is(err, sql.ErrNoRows) {
+            redis.Set(ctx, cacheKey, NullValue, 60*time.Second)
+            return nil, ErrNotFound
+        }
+        return nil, err
+    }
+
+    redis.Set(ctx, cacheKey, EncodeProduct(product), 5*time.Minute)
+    return product, nil
+}
+```
+
+---
+
+## 3. 布隆过滤器适合什么场景？
+
+适合：
+
+```text
+数据总量大
+查询 key 空间大
+非法请求多
+可以接受少量误判
+只需要判断是否可能存在
+```
+
+典型场景：
+
+```text
+商品 ID 是否存在
+用户 ID 是否存在
+文章 ID 是否存在
+订单号格式合法后是否可能存在
+活动 ID 是否存在
+黑名单粗过滤
+```
+
+---
+
+## 4. 布隆过滤器的局限
+
+布隆过滤器不是银弹。
+
+### 第一，有误判
+
+如果布隆过滤器误判某个不存在 ID 为“可能存在”，请求仍然会进入 Redis 和数据库。
+
+所以它不能完全替代空值缓存。
+
+常见组合是：
+
+```text
+布隆过滤器挡大部分非法 ID；
+空值缓存挡误判后反复访问的不存在 ID。
+```
+
+### 第二，删除困难
+
+普通布隆过滤器不擅长删除元素。
+
+如果商品下架了，布隆过滤器里仍然可能认为它存在。
+
+解决方案：
+
+```text
+1. 接受短期误判，后面靠 Redis / DB 兜底；
+2. 定期重建布隆过滤器；
+3. 使用 Counting Bloom Filter；
+4. 使用 Cuckoo Filter；
+5. 删除场景不强依赖布隆过滤器结果。
+```
+
+### 第三，初始化和增量同步要设计
+
+布隆过滤器需要预热已有数据，也需要处理新增数据。
+
+常见方案：
+
+```text
+系统启动全量加载 ID
+新增数据时同步 BF.ADD
+定时任务校验和重建
+通过 MQ 订阅新增事件
+```
+
+---
+
+# 六、缓存击穿：热点 key 失效
+
+## 1. 什么是缓存击穿？
+
+缓存击穿指的是：
+
+```text
+某个热点 key 在某一刻过期，大量并发请求同时发现缓存未命中，然后一起打到数据库。
+```
+
+注意，击穿通常针对一个热点 key。
+
+例如：
+
+```text
+product:detail:1001
+```
+
+这是一个爆款商品，每秒几万请求。
+
+正常情况下请求都命中 Redis。
+
+但某一刻这个 key 过期了。
+
+此时大量请求同时进入数据库：
+
+```text
+请求 1：缓存未命中 -> 查 DB
+请求 2：缓存未命中 -> 查 DB
+请求 3：缓存未命中 -> 查 DB
+...
+```
+
+数据库瞬间被击穿。
+
+---
+
+## 2. 缓存击穿和缓存穿透的区别
+
+| 对比项    | 缓存穿透                 | 缓存击穿            |
+| ------ | -------------------- | --------------- |
+| 数据是否存在 | 数据不存在                | 数据存在            |
+| 触发原因   | 查询非法/不存在数据           | 热点 key 过期       |
+| 请求分布   | 大量不同非法 key 或重复非法 key | 集中访问一个热点 key    |
+| 主要风险   | 数据库被无效查询打爆           | 数据库被热点查询打爆      |
+| 常见解法   | 参数校验、空值缓存、布隆过滤器      | 互斥锁、逻辑过期、热点永不过期 |
+
+一句话：
+
+```text
+穿透是查不存在；
+击穿是热点失效。
+```
+
+---
+
+# 七、缓存击穿解决方案一：互斥锁重建缓存
+
+## 1. 核心思路
+
+当热点 key 过期后，不让所有请求都去查数据库。
+
+只允许一个线程重建缓存。
+
+其他线程等待、重试、返回旧值或降级。
+
+流程：
+
+```text
+请求发现缓存未命中
+  -> 尝试获取重建锁
+      -> 获取成功：查 DB，写缓存，释放锁
+      -> 获取失败：等待一小段时间后重试缓存
+```
+
+---
+
+## 2. Redis 锁实现
+
+Redis 官方 `SET` 命令文档提到，`SET resource-name value NX EX max-lock-time` 是实现锁的一种常见方式。
+
+加锁：
+
+```text
+SET lock:product:detail:1001 requestId NX EX 10
+```
+
+含义：
+
+```text
+NX：只有 key 不存在才设置成功
+EX 10：锁 10 秒后自动过期
+requestId：锁的唯一持有者标识
+```
+
+释放锁不能直接 `DEL`。
+
+因为可能出现：
+
+```text
+线程 A 获取锁，业务执行太久，锁过期；
+线程 B 获取新锁；
+线程 A 执行完，直接 DEL，把线程 B 的锁删了。
+```
+
+所以释放锁要校验 value。
+
+Lua 脚本：
+
+```lua
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("DEL", KEYS[1])
+else
+    return 0
+end
+```
+
+---
+
+## 3. Go 风格伪代码
+
+```go
+func GetProductWithMutex(ctx context.Context, productId int64) (*Product, error) {
+    cacheKey := fmt.Sprintf("product:detail:%d", productId)
+    lockKey := fmt.Sprintf("lock:product:detail:%d", productId)
+
+    // 1. 查缓存
+    val, err := redis.Get(ctx, cacheKey).Result()
+    if err == nil {
+        return DecodeProduct(val), nil
+    }
+
+    requestId := uuid.NewString()
+
+    // 2. 尝试抢重建锁
+    locked, err := redis.SetNX(ctx, lockKey, requestId, 10*time.Second).Result()
+    if err != nil {
+        return nil, err
+    }
+
+    if locked {
+        defer Unlock(ctx, lockKey, requestId)
+
+        // 3. 双重检查，避免锁等待期间别人已经重建
+        val, err = redis.Get(ctx, cacheKey).Result()
+        if err == nil {
+            return DecodeProduct(val), nil
+        }
+
+        // 4. 查 DB
+        product, err := db.QueryProduct(ctx, productId)
+        if err != nil {
+            return nil, err
+        }
+
+        // 5. 写缓存
+        ttl := 5*time.Minute + time.Duration(rand.Intn(60))*time.Second
+        redis.Set(ctx, cacheKey, EncodeProduct(product), ttl)
+
+        return product, nil
+    }
+
+    // 6. 没抢到锁，短暂等待后重试缓存
+    time.Sleep(50 * time.Millisecond)
+
+    val, err = redis.Get(ctx, cacheKey).Result()
+    if err == nil {
+        return DecodeProduct(val), nil
+    }
+
+    // 7. 兜底：返回降级、错误，或者少量请求查 DB
+    return nil, ErrCacheRebuilding
+}
+```
+
+---
+
+## 4. 互斥锁方案的注意事项
+
+### 第一，锁时间要合理
+
+锁时间太短：
+
+```text
+缓存还没重建完，锁过期，其他请求又进来重建。
+```
+
+锁时间太长：
+
+```text
+重建线程挂了，其他请求长时间无法重建。
+```
+
+要根据数据库查询耗时、P99 延迟、下游 RPC 耗时设置。
+
+### 第二，要做双重检查
+
+获取锁后再查一次缓存。
+
+因为在你等待锁或抢锁过程中，可能其他线程已经重建好了缓存。
+
+### 第三，等待请求不能无限阻塞
+
+没有拿到锁的请求不要一直等。
+
+可以：
+
+```text
+短暂 sleep 后重试缓存
+返回旧值
+返回降级结果
+进入本地限流
+```
+
+### 第四，重建逻辑必须限流
+
+即使用锁，也要防止锁失效、Redis 抖动、DB 抖动时请求大量进入数据库。
+
+---
+
+# 八、缓存击穿解决方案二：逻辑过期
+
+## 1. 什么是逻辑过期？
+
+逻辑过期是指：
+
+```text
+Redis key 本身不设置过期时间，或者设置较长过期时间；
+value 里存一个 expireTime；
+请求读取时判断逻辑时间是否过期。
+```
+
+示例缓存值：
+
+```json
+{
+  "data": {
+    "id": 1001,
+    "name": "iPhone"
+  },
+  "expireTime": 1717392000
+}
+```
+
+读取流程：
+
+```text
+1. 查 Redis；
+2. 如果不存在，走初始化或兜底；
+3. 如果存在且逻辑未过期，直接返回；
+4. 如果存在但逻辑已过期，先返回旧值；
+5. 异步抢锁重建缓存。
+```
+
+---
+
+## 2. 逻辑过期伪代码
+
+```go
+func GetProductWithLogicalExpire(ctx context.Context, productId int64) (*Product, error) {
+    cacheKey := fmt.Sprintf("product:detail:%d", productId)
+
+    val, err := redis.Get(ctx, cacheKey).Result()
+    if err != nil {
+        return nil, ErrCacheNotReady
+    }
+
+    cacheObj := DecodeCacheObject(val)
+
+    // 未过期，直接返回
+    if cacheObj.ExpireTime.After(time.Now()) {
+        return cacheObj.Data, nil
+    }
+
+    // 已逻辑过期，尝试异步重建
+    lockKey := fmt.Sprintf("lock:product:detail:%d", productId)
+    requestId := uuid.NewString()
+
+    locked, _ := redis.SetNX(ctx, lockKey, requestId, 10*time.Second).Result()
+    if locked {
+        go func() {
+            defer Unlock(context.Background(), lockKey, requestId)
+
+            product, err := db.QueryProduct(context.Background(), productId)
+            if err != nil {
+                return
+            }
+
+            newObj := CacheObject{
+                Data:       product,
+                ExpireTime: time.Now().Add(5 * time.Minute),
+            }
+
+            redis.Set(context.Background(), cacheKey, EncodeCacheObject(newObj), 24*time.Hour)
+        }()
+    }
+
+    // 先返回旧值
+    return cacheObj.Data, nil
+}
+```
+
+---
+
+## 3. 逻辑过期的优点
+
+```text
+热点 key 不会在物理层面突然消失
+请求不会同时打到数据库
+用户可以快速拿到旧值
+缓存重建异步进行
+适合热点数据
+```
+
+典型场景：
+
+```text
+热门商品详情
+首页配置
+活动页数据
+直播间信息
+热门榜单
+```
+
+---
+
+## 4. 逻辑过期的问题
+
+```text
+可能返回旧数据
+代码复杂度更高
+需要异步线程池
+需要处理重建失败
+需要监控逻辑过期时间
+```
+
+所以逻辑过期适合：
+
+```text
+读多写少
+允许短暂旧值
+热点明显
+数据库保护优先级高
+```
+
+不适合：
+
+```text
+强一致价格
+强一致库存
+支付状态
+订单核心状态
+```
+
+---
+
+# 九、缓存击穿解决方案三：热点 key 永不过期
+
+对于极少数核心热点 key，可以设计为不过期。
+
+例如：
+
+```text
+首页配置
+热门活动配置
+全局开关
+热门商品详情
+```
+
+做法：
+
+```text
+Redis key 不设置 TTL；
+通过后台任务定时刷新；
+写操作时主动更新或删除缓存；
+异常时继续返回旧值。
+```
+
+优点：
+
+```text
+不会因为 TTL 到期导致击穿
+读请求稳定
+适合极热点数据
+```
+
+缺点：
+
+```text
+需要额外刷新机制
+可能返回旧数据
+内存需要治理
+更新链路要可靠
+```
+
+大厂实践中，“物理不过期 + 逻辑过期 + 异步刷新”是热点缓存非常常见的组合。
+
+---
+
+# 十、缓存雪崩：大量 key 同时失效或缓存层整体故障
+
+## 1. 什么是缓存雪崩？
+
+缓存雪崩指的是：
+
+```text
+大量缓存 key 在同一时间失效，或者 Redis 集群整体不可用，导致大量请求同时打到数据库。
+```
+
+和击穿不同，击穿通常是一个热点 key。
+
+雪崩是大量 key 或整个缓存层。
+
+典型场景：
+
+```text
+1. 大量 key 设置了相同 TTL，同时过期；
+2. Redis 实例宕机；
+3. Redis Cluster 多个分片异常；
+4. 缓存预热失败；
+5. 发布后统一清理缓存；
+6. 活动开始前缓存集中失效；
+7. 网络故障导致应用访问 Redis 超时。
+```
+
+---
+
+## 2. 雪崩的危害
+
+雪崩的危害是链式的：
+
+```text
+Redis 大量未命中
+  -> 请求打到数据库
+  -> 数据库连接池耗尽
+  -> DB 响应变慢
+  -> 应用线程阻塞
+  -> 请求超时
+  -> 调用方重试
+  -> 流量进一步放大
+  -> 系统整体不可用
+```
+
+这就是为什么它叫“雪崩”。
+
+它不是单个接口慢，而是可能拖垮整个系统。
+
+---
+
+# 十一、缓存雪崩解决方案一：TTL 随机化
+
+## 1. 为什么 TTL 随机化有效？
+
+如果大量 key 都设置相同 TTL：
+
+```text
+SET product:1 value EX 300
+SET product:2 value EX 300
+SET product:3 value EX 300
+...
+```
+
+这些 key 可能在同一时间集中失效。
+
+如果每个 key 的 TTL 加一个随机偏移：
+
+```text
+TTL = baseTTL + random(0, jitter)
+```
+
+例如：
+
+```text
+TTL = 300 秒 + random(0, 120 秒)
+```
+
+那么 key 的过期时间会分散到一个时间窗口里。
+
+原本：
+
+```text
+第 300 秒：100 万个 key 同时过期
+```
+
+变成：
+
+```text
+第 300~420 秒：100 万个 key 分散过期
+```
+
+数据库压力被摊平。
+
+这就是 TTL 随机化的本质：
+
+```text
+把同一时刻的集中失效，打散成一段时间内的均匀失效。
+```
+
+---
+
+## 2. TTL 随机化代码
+
+```go
+func RandomTTL(base time.Duration, jitter time.Duration) time.Duration {
+    return base + time.Duration(rand.Int63n(int64(jitter)))
+}
+
+ttl := RandomTTL(5*time.Minute, 2*time.Minute)
+redis.Set(ctx, cacheKey, value, ttl)
+```
+
+---
+
+## 3. TTL 随机化适合什么？
+
+适合：
+
+```text
+批量缓存预热
+大量同类 key
+商品详情缓存
+用户资料缓存
+文章详情缓存
+配置类缓存
+```
+
+不适合单独解决：
+
+```text
+Redis 整体宕机
+热点 key 击穿
+数据库本身慢
+缓存重建很重
+```
+
+TTL 随机化是防止“同一批 key 同时过期”的基础手段，但不是完整高可用方案。
+
+---
+
+# 十二、缓存雪崩解决方案二：多级缓存
+
+多级缓存是大厂非常常见的架构。
+
+典型结构：
+
+```text
+本地缓存
+  -> Redis
+  -> 数据库
+```
+
+更复杂的读链路：
+
+```text
+CDN
+  -> 网关缓存
+  -> 应用本地缓存
+  -> Redis
+  -> 数据库
+```
+
+本地缓存可以用：
+
+```text
+Caffeine
+Guava Cache
+go-cache
+ristretto
+自研本地 LRU
+```
+
+优点：
+
+```text
+Redis 故障时，本地缓存还能扛一部分读流量
+热点 key 不会全部打到 Redis
+降低 Redis QPS
+降低 P99 延迟
+```
+
+缺点：
+
+```text
+一致性更复杂
+应用实例内存增加
+缓存更新链路变复杂
+需要短 TTL 或版本号机制
+```
+
+适合：
+
+```text
+读多写少
+允许短暂不一致
+热点明显
+配置类、详情类、字典类数据
+```
+
+---
+
+# 十三、缓存雪崩解决方案三：限流、熔断、降级
+
+缓存雪崩时，最重要的是保护数据库。
+
+不能让所有请求都穿透到 DB。
+
+常见手段：
+
+```text
+接口限流
+用户维度限流
+热点资源维度限流
+DB 查询限流
+线程池隔离
+熔断下游
+返回默认值
+返回旧缓存
+排队削峰
+```
+
+例如商品详情服务：
+
+```text
+Redis 故障
+  -> 本地缓存有值，返回本地旧值
+  -> 本地缓存无值，只允许少量请求查 DB
+  -> DB 查询超过阈值，直接降级
+```
+
+伪代码：
+
+```go
+if redisUnavailable {
+    val, ok := localCache.Get(cacheKey)
+    if ok {
+        return val, nil
+    }
+
+    if !dbLimiter.Allow() {
+        return DefaultProduct(), nil
+    }
+
+    return db.QueryProduct(ctx, productId)
+}
+```
+
+大厂实践中，缓存系统必须有“缓存不可用时数据库不会被打死”的保护机制。
+
+---
+
+# 十四、缓存雪崩解决方案四：缓存预热
+
+很多雪崩发生在系统刚发布、活动刚开始、Redis 刚重启之后。
+
+此时缓存是空的，所有请求都去查数据库。
+
+解决方案是缓存预热。
+
+常见预热方式：
+
+```text
+发布前预热热点数据
+活动开始前预热商品详情
+服务启动后异步加载配置
+Redis 重启后从持久化或数据库恢复热点 key
+定时任务刷新 Top N 热点缓存
+```
+
+例如电商活动：
+
+```text
+活动开始前 30 分钟：
+  -> 查询活动商品列表
+  -> 批量加载商品详情
+  -> 写入 Redis
+  -> 设置随机 TTL
+  -> 预热本地缓存
+```
+
+缓存预热要注意：
+
+```text
+控制预热速率
+避免预热本身打爆数据库
+预热失败要告警
+预热数据要有 TTL 随机化
+热点数据优先
+```
+
+---
+
+# 十五、Redis 过期机制和源码关联
+
+缓存雪崩和 TTL 有直接关系，所以需要理解 Redis 过期机制。
+
+Redis 不是每个 key 一到过期时间就立即删除。
+
+它主要有两类过期删除方式：
+
+```text
+惰性删除
+定期删除
+```
+
+## 1. 惰性删除
+
+当客户端访问某个 key 时，Redis 会检查这个 key 是否过期。
+
+如果过期，就删除并返回不存在。
+
+这就是惰性删除。
+
+## 2. 定期删除
+
+Redis 会周期性抽样检查设置了过期时间的 key，并删除其中过期的 key。
+
+源码上可以重点看：
+
+```text
+src/expire.c
+activeExpireCycle()
+expireIfNeeded()
+```
+
+可以简单理解：
+
+```text
+expireIfNeeded：访问 key 时判断是否过期；
+activeExpireCycle：后台周期性抽样清理过期 key。
+```
+
+这和缓存雪崩的关系是：
+
+```text
+大量 key 设置相同 TTL 后，Redis 不一定同一毫秒全部删除；
+但从业务视角看，这些 key 在同一时间窗口内都会变成未命中。
+```
+
+所以 TTL 随机化仍然非常重要。
+
+---
+
+# 十六、三大问题对比总结
+
+| 问题   | 本质                  | 数据是否存在 | 影响范围        | 典型解法                 |
+| ---- | ------------------- | ------ | ----------- | -------------------- |
+| 缓存穿透 | 查询不存在数据             | 不存在    | 单个或大量非法 key | 参数校验、空值缓存、布隆过滤器      |
+| 缓存击穿 | 热点 key 过期           | 存在     | 单个热点 key    | 互斥锁、逻辑过期、热点不过期       |
+| 缓存雪崩 | 大量 key 失效或 Redis 故障 | 多数存在   | 大量 key 或缓存层 | TTL 随机化、多级缓存、限流降级、预热 |
+
+记忆方式：
+
+```text
+穿透：没有这个数据。
+击穿：有这个数据，但是热点 key 突然失效。
+雪崩：很多缓存一起失效，或者缓存层挂了。
+```
+
+---
+
+# 十七、大厂缓存稳定性治理实践
+
+## 1. 缓存 key 规范
+
+```text
+业务前缀清晰
+key 粒度合理
+避免大 key
+避免热 key
+缓存类 key 必须有 TTL
+空值缓存 TTL 要短
+热点 key 使用逻辑过期
+```
+
+示例：
+
+```text
+product:detail:{productId}
+user:profile:{userId}
+article:detail:{articleId}
+rank:article:hot:{yyyyMMdd}
+lock:cache:rebuild:{biz}:{id}
+```
+
+---
+
+## 2. 缓存读写模板统一封装
+
+不要每个业务自己写一套缓存逻辑。
+
+应该封装统一组件：
+
+```text
+GetOrLoad
+GetOrLoadWithNullCache
+GetOrLoadWithMutex
+GetOrLoadWithLogicalExpire
+BatchGetOrLoad
+```
+
+统一处理：
+
+```text
+空值缓存
+TTL 随机化
+互斥锁
+监控埋点
+错误降级
+序列化
+反序列化
+```
+
+---
+
+## 3. 监控指标
+
+必须监控：
+
+```text
+缓存命中率
+Redis QPS
+Redis P99 延迟
+DB QPS
+DB 慢查询
+空值缓存命中次数
+布隆过滤器拦截次数
+缓存重建次数
+重建锁竞争次数
+热点 key
+大 key
+Redis 连接池耗尽
+Redis 超时次数
+```
+
+缓存问题往往不是 Redis 自己先报警，而是数据库、应用线程池、接口 P99 先出问题。
+
+---
+
+## 4. 故障演练
+
+缓存系统要做演练：
+
+```text
+Redis 单节点故障
+Redis Cluster 分片故障
+缓存全部清空
+热点 key 过期
+数据库慢查询
+布隆过滤器失效
+缓存重建线程池满
+```
+
+目标是验证：
+
+```text
+Redis 不可用时，数据库是否会被打爆？
+热点 key 失效时，是否只有一个请求重建？
+大量 key 过期时，请求是否被限流？
+本地缓存是否能兜底？
+降级策略是否生效？
+```
+
+---
+
+# 十八、面试表达
+
+## 1. 缓存穿透怎么回答？
+
+缓存穿透是指请求查询一个缓存和数据库都不存在的数据，因为数据库查不到，所以不会回写缓存，导致后续相同或类似请求每次都打到数据库。解决方式包括参数校验、空值缓存、布隆过滤器和限流。空值缓存适合挡重复的不存在 key，但 TTL 要短，防止缓存大量无效 key。布隆过滤器适合在请求进入缓存和数据库前判断 ID 是否可能存在，它能用很小内存过滤大量非法请求，但存在误判，不能删除或需要定期重建。
+
+## 2. 缓存击穿怎么回答？
+
+缓存击穿是指一个热点 key 在过期瞬间，大量并发请求同时未命中缓存，然后一起查询数据库。解决方式包括互斥锁重建缓存、逻辑过期和热点 key 不过期。互斥锁的核心是只允许一个请求查数据库并回写缓存，其他请求等待或返回旧值。锁可以用 Redis `SET key value NX EX ttl` 实现，释放锁时必须校验 value，通常用 Lua 脚本保证原子性。
+
+## 3. 缓存雪崩怎么回答？
+
+缓存雪崩是指大量 key 在同一时间失效，或者 Redis 整体不可用，导致大量请求同时打到数据库。解决方式包括 TTL 随机化、多级缓存、缓存预热、限流、熔断和降级。TTL 随机化的作用是把集中失效打散到一个时间窗口里，避免同一时刻大量缓存一起过期。
+
+## 4. TTL 随机化为什么有效？
+
+如果大量 key 使用相同 TTL，它们可能在同一时间窗口集中失效，导致数据库瞬时压力升高。TTL 随机化是在基础过期时间上增加一个随机偏移，比如 `300s + random(0, 120s)`，让 key 分散过期，从而平滑数据库压力。
+
+## 5. 互斥锁重建缓存有什么坑？
+
+主要有几个坑：锁超时时间太短会导致重复重建，太长会影响恢复；释放锁不能直接 DEL，必须校验 value；拿到锁后要二次检查缓存；没拿到锁的请求不能无限等待；重建失败要有降级；热点 key 更适合逻辑过期或异步刷新。
+
+---
+
+# 十九、总结
+
+缓存三大问题，本质都是缓存未命中导致数据库压力异常放大。
+
+可以总结为：
+
+```text
+缓存穿透：
+  查询不存在数据。
+  解法：参数校验、空值缓存、布隆过滤器。
+
+缓存击穿：
+  热点 key 过期。
+  解法：互斥锁、逻辑过期、热点不过期。
+
+缓存雪崩：
+  大量 key 同时失效或缓存层故障。
+  解法：TTL 随机化、多级缓存、预热、限流、熔断、降级。
+```
+
+真正成熟的缓存设计，不是简单加一层 Redis，而是要回答这些问题：
+
+```text
+非法请求能不能在入口被挡住？
+不存在的数据会不会反复打 DB？
+热点 key 过期时谁来重建？
+大量 key 会不会同时过期？
+Redis 故障时数据库会不会被打爆？
+缓存重建失败时系统怎么降级？
+缓存命中率和重建行为有没有监控？
+```
+
+从开发角度看，缓存是性能优化。
+
+从架构角度看，缓存是数据库保护层。
+
+从稳定性角度看，缓存设计的目标不是“尽量快”，而是：
+
+```text
+在高并发、热点、故障和异常流量下，系统仍然可控。
+```
+
+这才是缓存穿透、击穿、雪崩这个专题真正的价值。

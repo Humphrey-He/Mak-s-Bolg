@@ -1,0 +1,1399 @@
+# Kafka 与数据库一致性：Outbox Pattern、CDC、事务消息、最终一致性与补偿机制
+
+## 前言
+
+在真实业务系统里，Kafka 很少单独存在。
+
+它经常和数据库一起出现：
+
+```text
+创建订单 -> 写 MySQL -> 发 Kafka 订单事件
+支付成功 -> 更新 MySQL -> 发 Kafka 支付事件
+库存扣减 -> 写库存流水 -> 发 Kafka 库存事件
+用户注册 -> 写用户表 -> 发 Kafka 用户注册事件
+```
+
+这时最经典的问题就出现了：
+
+```text
+数据库写成功了，但 Kafka 消息发送失败怎么办？
+Kafka 消息发送成功了，但数据库事务回滚怎么办？
+消息发出去了，但消费者处理失败怎么办？
+消费者重复消费导致数据库重复更新怎么办？
+```
+
+这些问题本质上是：
+
+```text
+本地事务和消息发送的一致性问题。
+```
+
+很多人会直接想到“分布式事务”，但在大规模互联网系统里，更多时候不会用强 XA 分布式事务去把数据库和 Kafka 绑在一起，而是采用：
+
+```text
+本地事务
+Outbox Pattern
+CDC
+Debezium / Canal
+事务消息
+最终一致性
+幂等消费
+补偿机制
+```
+
+这篇文章站在开发和架构角度，系统拆解 Kafka 与数据库一致性问题，并引入一个小型实战案例：**订单创建后写数据库，并可靠发布 OrderCreated 事件**。
+
+---
+
+# 一、问题从哪里来：数据库和 Kafka 是两个系统
+
+假设订单服务创建订单：
+
+```text
+1. 写 MySQL orders 表
+2. 发送 Kafka OrderCreated 消息
+```
+
+直觉代码可能这样写：
+
+```go
+func CreateOrder(ctx context.Context, req CreateOrderRequest) error {
+    tx := db.Begin()
+
+    order := buildOrder(req)
+    err := orderDao.Insert(ctx, tx, order)
+    if err != nil {
+        tx.Rollback()
+        return err
+    }
+
+    tx.Commit()
+
+    event := OrderCreatedEvent{
+        EventID: uuid.NewString(),
+        OrderID: order.ID,
+        UserID:  order.UserID,
+    }
+
+    return kafkaProducer.Send(ctx, "order_events", event)
+}
+```
+
+看起来很自然：
+
+```text
+先写数据库；
+再发 Kafka。
+```
+
+但这里有一个严重问题：
+
+```text
+数据库事务提交成功后，Kafka 发送可能失败。
+```
+
+比如：
+
+```text
+MySQL commit 成功
+Kafka Broker 网络超时
+Producer 发送失败
+服务进程崩溃
+```
+
+结果是：
+
+```text
+数据库里有订单；
+但下游服务永远收不到 OrderCreated 事件。
+```
+
+库存服务不会预占库存，通知服务不会发通知，数仓不会同步订单。
+
+这就是典型的数据和消息不一致。
+
+---
+
+# 二、反过来先发 Kafka 行不行？
+
+有人会说：
+
+```text
+那我先发 Kafka，再提交数据库事务。
+```
+
+代码变成：
+
+```go
+func CreateOrder(ctx context.Context, req CreateOrderRequest) error {
+    tx := db.Begin()
+
+    order := buildOrder(req)
+    err := orderDao.Insert(ctx, tx, order)
+    if err != nil {
+        tx.Rollback()
+        return err
+    }
+
+    event := OrderCreatedEvent{
+        EventID: uuid.NewString(),
+        OrderID: order.ID,
+        UserID:  order.UserID,
+    }
+
+    err = kafkaProducer.Send(ctx, "order_events", event)
+    if err != nil {
+        tx.Rollback()
+        return err
+    }
+
+    return tx.Commit()
+}
+```
+
+这也有问题。
+
+如果：
+
+```text
+Kafka 消息发送成功；
+MySQL commit 失败；
+或者服务在 Kafka 发送成功后、DB commit 前崩溃；
+```
+
+结果是：
+
+```text
+下游消费到了 OrderCreated；
+但数据库里没有这笔订单。
+```
+
+库存服务、通知服务、风控服务都会看到一个“幽灵订单”。
+
+所以：
+
+```text
+先写 DB 再发 Kafka，会出现 DB 成功但消息丢；
+先发 Kafka 再写 DB，会出现消息成功但 DB 回滚。
+```
+
+这就是双写一致性问题。
+
+---
+
+# 三、为什么 Kafka 事务不能直接解决数据库一致性？
+
+Kafka 支持事务 Producer。
+
+事务 Producer 能做到：
+
+```text
+多条 Kafka 消息原子写入多个 Topic / Partition；
+消费 input topic、写 output topic、提交 input offset 形成 Kafka 内部事务。
+```
+
+例如：
+
+```text
+beginTransaction
+  send topicA
+  send topicB
+  sendOffsetsToTransaction
+commitTransaction
+```
+
+这可以解决 Kafka 内部的原子性问题。
+
+但它不能自动解决：
+
+```text
+MySQL commit
+和
+Kafka transaction commit
+```
+
+之间的一致性。
+
+因为 MySQL 和 Kafka 是两个独立事务系统。
+
+你仍然会遇到：
+
+```text
+MySQL commit 成功，Kafka transaction commit 失败；
+Kafka transaction commit 成功，MySQL commit 失败；
+服务在两个 commit 中间崩溃。
+```
+
+除非引入 XA/2PC 这种跨资源分布式事务，但在高并发业务系统里，它通常带来：
+
+```text
+性能损耗
+锁持有时间长
+实现复杂
+可用性下降
+故障恢复复杂
+```
+
+所以工程上更常用的思想是：
+
+```text
+不要强行让数据库和 Kafka 同时强一致提交；
+而是让数据库成为事实源，再通过可靠事件发布实现最终一致。
+```
+
+---
+
+# 四、错误方案总结
+
+常见错误方案有三种。
+
+## 1. DB 成功后直接发 Kafka
+
+问题：
+
+```text
+DB commit 成功后服务崩溃，Kafka 消息丢失。
+```
+
+适合吗？
+
+```text
+只适合非核心、允许丢事件的场景。
+```
+
+不适合：
+
+```text
+订单
+支付
+库存
+积分
+审计
+资金流水
+```
+
+---
+
+## 2. Kafka 成功后再 commit DB
+
+问题：
+
+```text
+Kafka 消息被消费，但 DB 事务可能失败。
+```
+
+下游会看到不存在或未提交的数据。
+
+---
+
+## 3. 在 DB 事务里发 Kafka
+
+例如：
+
+```text
+BEGIN
+  INSERT order
+  kafka send
+COMMIT
+```
+
+问题：
+
+```text
+Kafka 发送是外部网络操作；
+可能阻塞数据库事务；
+事务持有时间变长；
+发送成功后 DB 仍可能 commit 失败；
+发送失败后事务回滚可能影响主流程延迟。
+```
+
+这不是可靠的一致性方案。
+
+---
+
+# 五、Outbox Pattern：最常用的可靠事件发布模式
+
+Outbox Pattern，也叫本地消息表模式。
+
+核心思想是：
+
+```text
+业务数据和待发送消息写在同一个数据库事务里。
+```
+
+也就是说，不是在业务事务里直接发 Kafka，而是把“要发的事件”先写入数据库 outbox 表。
+
+流程：
+
+```text
+1. 开启本地数据库事务
+2. 写业务表 orders
+3. 写 outbox_event 表
+4. 提交本地事务
+5. 后台任务扫描 outbox_event
+6. 发送 Kafka
+7. 发送成功后标记 outbox_event 为 SENT
+```
+
+这样能保证：
+
+```text
+只要订单写入成功，对应事件一定会被记录在 outbox 表里。
+```
+
+即使 Kafka 当时不可用，事件也不会丢，因为它已经在数据库里。
+
+---
+
+# 六、Outbox 表设计
+
+一个典型 outbox 表：
+
+```sql
+CREATE TABLE outbox_event (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    event_id VARCHAR(128) NOT NULL,
+    aggregate_type VARCHAR(64) NOT NULL,
+    aggregate_id VARCHAR(128) NOT NULL,
+    event_type VARCHAR(128) NOT NULL,
+    topic VARCHAR(128) NOT NULL,
+    message_key VARCHAR(128) NOT NULL,
+    payload JSON NOT NULL,
+    status VARCHAR(32) NOT NULL,
+    retry_count INT NOT NULL DEFAULT 0,
+    next_retry_time DATETIME NOT NULL,
+    create_time DATETIME NOT NULL,
+    update_time DATETIME NOT NULL,
+    UNIQUE KEY uk_event_id (event_id),
+    KEY idx_status_retry_time (status, next_retry_time),
+    KEY idx_aggregate (aggregate_type, aggregate_id)
+);
+```
+
+字段含义：
+
+```text
+event_id：全局唯一事件 ID，用于幂等
+aggregate_type：聚合根类型，例如 Order
+aggregate_id：聚合根 ID，例如 orderId
+event_type：事件类型，例如 OrderCreated
+topic：要发送的 Kafka Topic
+message_key：Kafka message key，例如 orderId
+payload：事件内容
+status：INIT / SENDING / SENT / FAILED
+retry_count：重试次数
+next_retry_time：下次重试时间
+```
+
+---
+
+# 七、实战案例：订单创建后可靠发布 OrderCreated 事件
+
+## 1. 业务目标
+
+订单服务创建订单时，需要：
+
+```text
+1. 写 orders 表
+2. 发布 OrderCreated 事件到 Kafka
+3. 库存服务消费事件预占库存
+4. 通知服务消费事件发送通知
+5. 数仓服务消费事件同步分析
+```
+
+要求：
+
+```text
+订单创建成功后，OrderCreated 事件不能丢；
+事件可以重复发送，但消费者必须幂等；
+Kafka 短暂不可用不能导致订单创建失败；
+下游最终能收到事件。
+```
+
+---
+
+## 2. 订单创建事务
+
+核心代码：
+
+```go
+func CreateOrder(ctx context.Context, req CreateOrderRequest) error {
+    tx, err := db.BeginTx(ctx, nil)
+    if err != nil {
+        return err
+    }
+
+    defer tx.Rollback()
+
+    order := Order{
+        ID:     NewOrderID(),
+        UserID: req.UserID,
+        Status: "CREATED",
+        Amount: req.Amount,
+    }
+
+    if err := orderDao.Insert(ctx, tx, order); err != nil {
+        return err
+    }
+
+    event := OrderCreatedEvent{
+        EventID:   uuid.NewString(),
+        EventType: "OrderCreated",
+        OrderID:   order.ID,
+        UserID:    order.UserID,
+        Amount:    order.Amount,
+        CreatedAt: time.Now(),
+    }
+
+    outbox := OutboxEvent{
+        EventID:       event.EventID,
+        AggregateType: "Order",
+        AggregateID:   order.ID,
+        EventType:     "OrderCreated",
+        Topic:         "order_events",
+        MessageKey:    order.ID,
+        Payload:       MustMarshalJSON(event),
+        Status:        "INIT",
+        RetryCount:    0,
+        NextRetryTime: time.Now(),
+    }
+
+    if err := outboxDao.Insert(ctx, tx, outbox); err != nil {
+        return err
+    }
+
+    return tx.Commit()
+}
+```
+
+这段代码的关键是：
+
+```text
+orders 表和 outbox_event 表在同一个本地事务里提交。
+```
+
+因此不存在：
+
+```text
+订单写成功但事件记录没写成功。
+```
+
+如果事务失败：
+
+```text
+订单和 outbox 都失败。
+```
+
+如果事务成功：
+
+```text
+订单和 outbox 都成功。
+```
+
+---
+
+## 3. Outbox 发送任务
+
+后台任务扫描待发送事件：
+
+```go
+func DispatchOutboxEvents(ctx context.Context) {
+    for {
+        events, err := outboxDao.QueryPending(ctx, 100)
+        if err != nil {
+            log.Error(err)
+            time.Sleep(time.Second)
+            continue
+        }
+
+        for _, event := range events {
+            handleOneOutboxEvent(ctx, event)
+        }
+    }
+}
+```
+
+发送单条事件：
+
+```go
+func handleOneOutboxEvent(ctx context.Context, event OutboxEvent) {
+    locked, err := outboxDao.MarkSending(ctx, event.ID)
+    if err != nil || !locked {
+        return
+    }
+
+    err = kafkaProducer.Send(ctx, event.Topic, event.MessageKey, event.Payload)
+
+    if err != nil {
+        outboxDao.MarkRetry(ctx, event.ID, nextRetryTime(event.RetryCount), err.Error())
+        return
+    }
+
+    outboxDao.MarkSent(ctx, event.ID)
+}
+```
+
+这里要注意：
+
+```text
+发送 Kafka 成功后，标记 SENT 可能失败。
+```
+
+如果发生：
+
+```text
+Kafka 发送成功；
+服务在 MarkSent 前崩溃；
+```
+
+那么这条 outbox 记录仍然是 SENDING 或 INIT，之后会被再次发送。
+
+所以 Outbox Pattern 通常保证的是：
+
+```text
+事件至少发送一次。
+```
+
+不是天然只发送一次。
+
+因此下游消费者必须幂等。
+
+---
+
+# 八、Outbox Pattern 的一致性边界
+
+Outbox Pattern 解决的是：
+
+```text
+业务数据和“待发送事件记录”一致。
+```
+
+它不保证：
+
+```text
+Kafka 中永远只有一条事件。
+```
+
+因为发送成功但更新 outbox 状态失败时，会导致重复发送。
+
+所以 Outbox 的典型语义是：
+
+```text
+不丢消息；
+可能重复；
+消费者幂等。
+```
+
+这和 Kafka 消费端“至少一次 + 幂等”的思想是一致的。
+
+Outbox 的完整闭环是：
+
+```text
+生产端：
+业务表 + outbox 表同事务，保证事件不丢。
+
+发送端：
+后台任务重试发送，保证最终投递 Kafka。
+
+消费端：
+eventId 去重、唯一索引、状态机，保证重复无副作用。
+```
+
+---
+
+# 九、Outbox 轮询方案的缺点
+
+最简单的 Outbox 实现是定时扫描数据库。
+
+例如每 1 秒扫一次：
+
+```sql
+SELECT *
+FROM outbox_event
+WHERE status IN ('INIT', 'FAILED')
+  AND next_retry_time <= NOW()
+ORDER BY id
+LIMIT 100;
+```
+
+这种方案简单可靠，但有缺点：
+
+```text
+数据库轮询压力
+事件发送延迟
+多实例扫描并发控制复杂
+状态机字段更新频繁
+outbox 表可能快速膨胀
+历史数据清理成本
+```
+
+适合中小规模场景。
+
+如果事件量很大，可能需要进一步升级为：
+
+```text
+Outbox + CDC
+```
+
+也就是写 outbox 表后，不靠业务服务轮询，而是通过 binlog 捕获 outbox 表变更并发送 Kafka。
+
+---
+
+# 十、CDC：Change Data Capture
+
+CDC 是 Change Data Capture，变更数据捕获。
+
+核心思想是：
+
+```text
+业务只写数据库；
+CDC 系统监听数据库变更日志；
+把变更转换成事件写入 Kafka。
+```
+
+对于 MySQL，CDC 通常基于 binlog。
+
+流程：
+
+```text
+业务服务
+  -> 写 MySQL
+  -> MySQL binlog
+  -> CDC Connector
+  -> Kafka Topic
+  -> 下游消费者
+```
+
+CDC 的优势是：
+
+```text
+业务代码侵入低
+不会在业务事务里发 Kafka
+数据库 commit 成功后，binlog 一定有记录
+适合数据同步、缓存刷新、搜索索引、数仓同步
+```
+
+---
+
+# 十一、Debezium：基于 CDC 的事件发布
+
+Debezium 是一个开源 CDC 平台，可以捕获数据库提交的 insert、update、delete 变更，并写入 Kafka。
+
+典型架构：
+
+```text
+MySQL
+  -> Debezium MySQL Connector
+  -> Kafka Connect
+  -> Kafka Topic
+  -> Consumer
+```
+
+如果结合 Outbox Pattern，可以这样设计：
+
+```text
+业务服务写 orders 表和 outbox_event 表；
+Debezium 监听 outbox_event 表 binlog；
+Debezium Outbox Event Router 把 outbox 记录转换成业务事件；
+事件写入 Kafka order_events；
+下游服务消费。
+```
+
+这样就不需要业务服务自己扫描 outbox 表发送 Kafka。
+
+架构变成：
+
+```text
+订单服务
+  -> MySQL 本地事务
+      -> orders
+      -> outbox_event
+  -> MySQL binlog
+  -> Debezium
+  -> Kafka order_events
+```
+
+优点：
+
+```text
+业务服务只关心本地事务；
+事件发送由 CDC 基础设施负责；
+避免业务服务轮询 outbox；
+事件不会因为服务崩溃丢失；
+更适合大规模事件发布。
+```
+
+---
+
+# 十二、Canal：MySQL binlog 增量订阅
+
+Canal 是阿里开源的 MySQL binlog 增量订阅和消费组件。
+
+典型用途包括：
+
+```text
+数据库镜像
+实时备份
+搜索索引同步
+缓存刷新
+异构数据同步
+业务增量处理
+```
+
+Canal 的工作方式可以理解为：
+
+```text
+模拟 MySQL Slave；
+订阅 MySQL binlog；
+解析变更；
+推送给下游，例如 Kafka、应用消费端、同步任务。
+```
+
+在国内很多系统中，Canal 常用于：
+
+```text
+MySQL -> Kafka
+MySQL -> Elasticsearch
+MySQL -> Redis cache refresh
+MySQL -> 数据仓库
+```
+
+和 Debezium 类似，Canal 的核心价值也是：
+
+```text
+从数据库提交日志中捕获真实变更，降低业务双写风险。
+```
+
+---
+
+# 十三、Outbox 轮询 vs Outbox + CDC
+
+| 方案                | 优点                        | 缺点                 | 适合场景                  |
+| ----------------- | ------------------------- | ------------------ | --------------------- |
+| Outbox 轮询         | 简单、容易落地、无需 CDC 平台         | 有轮询延迟、DB 压力、状态管理复杂 | 中小规模业务、快速落地           |
+| Outbox + Debezium | 可靠、延迟低、业务侵入小、扩展性好         | 基础设施复杂、运维成本高       | 大规模事件驱动架构             |
+| Outbox + Canal    | 适合 MySQL binlog 订阅、国内生态常见 | 需要维护 Canal 集群和消费链路 | MySQL 增量同步、缓存/索引/消息发布 |
+| 直接 CDC 业务表        | 业务侵入低                     | 事件语义弱，表结构变化影响下游    | 数据同步、数仓、搜索索引          |
+| 手动发 Kafka         | 简单                        | 双写不一致风险高           | 非核心、可丢事件              |
+
+---
+
+# 十四、直接 CDC 业务表有什么问题？
+
+有些团队会直接监听业务表，比如 orders 表。
+
+```text
+orders 表变更
+  -> Debezium / Canal
+  -> Kafka orders_change_log
+```
+
+这种方式适合数据同步，但不一定适合领域事件。
+
+因为数据库表变更是数据层事件，业务事件是领域语义。
+
+例如：
+
+```text
+UPDATE orders SET status='PAID'
+```
+
+CDC 只能看到：
+
+```text
+orders.status 从 CREATED 变成 PAID
+```
+
+但业务事件可能是：
+
+```text
+OrderPaid
+PaymentConfirmed
+UserFirstOrderCompleted
+```
+
+一个表变更不一定等于一个业务事件。
+
+直接 CDC 业务表的问题：
+
+```text
+下游强依赖表结构
+表字段变化会影响消费者
+业务语义不清晰
+一次业务操作可能产生多张表变更
+下游需要自己推断事件含义
+```
+
+所以更推荐：
+
+```text
+业务服务显式写 outbox_event；
+outbox_event 表承载清晰业务事件语义；
+CDC 只负责可靠搬运事件。
+```
+
+这就是 Outbox + CDC 的价值。
+
+---
+
+# 十五、事务消息是什么？
+
+事务消息通常指消息队列和本地事务之间的一种一致性机制。
+
+以一些 MQ 产品为例，事务消息大致流程是：
+
+```text
+1. 发送半消息
+2. 执行业务本地事务
+3. 根据本地事务结果提交或回滚消息
+4. 如果 Producer 崩溃，Broker 回查本地事务状态
+```
+
+它试图解决：
+
+```text
+本地事务和消息发送一致性。
+```
+
+Kafka 本身有事务 Producer，但它主要解决 Kafka 内部事务，不像某些 MQ 产品那样内置“事务回查本地事务状态”的完整业务事务消息模型。
+
+所以在 Kafka 生态里，数据库一致性更多使用：
+
+```text
+Outbox Pattern
+CDC
+Debezium
+Canal
+幂等消费
+补偿机制
+```
+
+而不是直接依赖 Kafka 事务解决数据库双写。
+
+---
+
+# 十六、最终一致性：不是不一致，而是有恢复路径
+
+很多架构讨论里会说：
+
+```text
+Kafka 和数据库采用最终一致性。
+```
+
+这句话不能停在口号层面。
+
+最终一致性的真正含义是：
+
+```text
+系统允许短时间不一致；
+但必须有机制保证最终收敛到正确状态。
+```
+
+例如订单创建后：
+
+```text
+orders 表已经有订单；
+OrderCreated 事件可能暂时还没发到 Kafka；
+库存服务可能暂时还没收到；
+但 outbox_event 里有待发送记录；
+后台任务或 CDC 会最终把事件发出去；
+下游幂等消费后最终完成库存预占。
+```
+
+这才是最终一致性。
+
+最终一致性必须具备几个条件：
+
+```text
+状态可查询
+失败可重试
+重复可幂等
+超时可补偿
+异常可告警
+人工可介入
+链路可追踪
+```
+
+如果只是说“最终一致”，但没有重试、补偿、监控，那只是“不一致”。
+
+---
+
+# 十七、补偿机制怎么设计？
+
+补偿机制用于修复异常状态。
+
+常见补偿任务：
+
+```text
+扫描 outbox_event 中长时间未发送的事件
+扫描订单已创建但没有库存预占记录的订单
+扫描支付成功但订单未更新的订单
+扫描 Kafka 消费失败的死信消息
+扫描状态长时间卡在中间态的业务单
+```
+
+例如订单事件补偿：
+
+```sql
+SELECT *
+FROM outbox_event
+WHERE status IN ('INIT', 'FAILED', 'SENDING')
+  AND update_time < NOW() - INTERVAL 5 MINUTE
+LIMIT 100;
+```
+
+对这些事件重新发送 Kafka。
+
+再比如订单状态补偿：
+
+```sql
+SELECT o.*
+FROM orders o
+LEFT JOIN inventory_reservation r
+  ON o.order_id = r.order_id
+WHERE o.status = 'CREATED'
+  AND r.id IS NULL
+  AND o.create_time < NOW() - INTERVAL 10 MINUTE;
+```
+
+找到订单已创建但库存未预占的异常单，重新触发库存预占事件或进入人工处理。
+
+补偿任务要注意：
+
+```text
+必须幂等
+必须限速
+必须有告警
+必须记录补偿日志
+必须避免重复放大故障
+```
+
+---
+
+# 十八、消费者侧也要幂等
+
+Outbox 和 CDC 解决的是事件可靠发布。
+
+但它们不能避免下游重复消费。
+
+重复来源包括：
+
+```text
+Outbox 发送成功但 MarkSent 失败
+CDC Connector 重启重复投递
+Kafka Consumer offset 提交失败
+Consumer 处理成功后宕机
+Rebalance 导致重复处理
+```
+
+所以消费者必须幂等。
+
+常见做法：
+
+```text
+eventId 去重
+消费记录表
+数据库唯一索引
+业务状态机
+幂等接口
+```
+
+例如库存服务消费 OrderCreated：
+
+```sql
+CREATE TABLE inventory_reservation (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    order_id VARCHAR(64) NOT NULL,
+    sku_id VARCHAR(64) NOT NULL,
+    quantity INT NOT NULL,
+    status VARCHAR(32) NOT NULL,
+    create_time DATETIME NOT NULL,
+    UNIQUE KEY uk_order_sku (order_id, sku_id)
+);
+```
+
+重复消费同一个订单事件时，唯一索引会阻止重复预占库存。
+
+---
+
+# 十九、架构案例：订单创建事件最终一致性闭环
+
+完整链路：
+
+```text
+用户提交订单
+  -> 订单服务开启本地事务
+      -> INSERT orders
+      -> INSERT outbox_event(OrderCreated)
+  -> 提交 MySQL 事务
+  -> Debezium / Canal 监听 outbox_event binlog
+  -> 写入 Kafka order_events
+  -> 库存服务消费 OrderCreated
+      -> 幂等插入 inventory_reservation
+      -> 扣减可用库存或预占库存
+  -> 通知服务消费 OrderCreated
+      -> 幂等发送通知
+  -> 数仓服务消费 OrderCreated
+      -> 同步分析
+  -> 补偿任务扫描异常状态
+```
+
+这个架构的关键点：
+
+```text
+订单写入和事件记录同事务；
+事件发布由 CDC 保证可靠搬运；
+Kafka 提供异步解耦；
+消费者用 eventId / 唯一索引 / 状态机保证幂等；
+补偿任务保证最终收敛。
+```
+
+它解决了：
+
+```text
+DB 成功但消息丢失
+Kafka 短暂不可用
+Producer 服务崩溃
+消息重复投递
+Consumer 重复消费
+下游短暂失败
+```
+
+不能解决或仍需额外设计的是：
+
+```text
+业务语义错误
+错误事件内容
+数据库误删
+Topic 误删
+长期 CDC 中断且无告警
+消费者没有幂等导致重复副作用
+```
+
+---
+
+# 二十、源码视角：Kafka 与数据库一致性看哪些模块？
+
+## 1. Kafka Producer 事务
+
+重点看：
+
+```text
+KafkaProducer
+TransactionManager
+Sender
+ProducerBatch
+ProducerId
+SequenceNumber
+TransactionCoordinator
+__transaction_state
+```
+
+关注：
+
+```text
+事务 Producer 如何 begin / commit / abort？
+transactional.id 如何绑定 ProducerId？
+事务状态如何写入 __transaction_state？
+commit marker / abort marker 如何影响 Consumer 可见性？
+```
+
+## 2. Consumer 事务读取
+
+重点看：
+
+```text
+isolation.level=read_committed
+Fetcher
+CompletedFetch
+Transaction markers
+```
+
+关注：
+
+```text
+Consumer 如何过滤未提交事务消息？
+read_committed 和 read_uncommitted 有什么区别？
+```
+
+## 3. Debezium
+
+重点看：
+
+```text
+MySQL connector
+Binlog reader
+Offset storage
+Schema history
+Outbox Event Router SMT
+Kafka Connect task
+```
+
+关注：
+
+```text
+Debezium 如何读取 binlog？
+如何记录读取位置？
+Connector 重启如何恢复？
+Outbox Event Router 如何把 outbox 表转换成业务事件？
+```
+
+## 4. Canal
+
+重点看：
+
+```text
+Canal Server
+MySQL binlog dump
+Canal Instance
+Canal Client
+Kafka adapter
+```
+
+关注：
+
+```text
+Canal 如何模拟 MySQL Slave 拉取 binlog？
+如何解析 row event？
+如何投递到下游？
+消费位点如何保存？
+```
+
+## 5. 业务 Outbox
+
+重点看：
+
+```text
+outbox_event 表状态机
+发送任务抢占
+重试策略
+幂等 eventId
+历史清理
+补偿扫描
+```
+
+---
+
+# 二十一、大厂实践规范
+
+## 1. 核心事件不要直接双写
+
+不推荐：
+
+```text
+DB commit 后直接 kafka send
+```
+
+推荐：
+
+```text
+业务表 + outbox 表同事务；
+Outbox 轮询或 CDC 发布 Kafka。
+```
+
+---
+
+## 2. 所有事件必须有 eventId
+
+事件结构：
+
+```json
+{
+  "eventId": "evt_xxx",
+  "eventType": "OrderCreated",
+  "eventTime": "2026-06-03T10:00:00+09:00",
+  "aggregateType": "Order",
+  "aggregateId": "O1001",
+  "payload": {}
+}
+```
+
+eventId 用于：
+
+```text
+生产端去重
+消费端幂等
+链路追踪
+补偿重放
+问题排查
+```
+
+---
+
+## 3. 事件必须可重放
+
+Kafka 事件应该是自包含的，或者至少能通过业务 ID 查到完整状态。
+
+不要发送含糊事件：
+
+```json
+{
+  "orderId": "O1001",
+  "status": "changed"
+}
+```
+
+更推荐：
+
+```json
+{
+  "eventId": "evt_001",
+  "eventType": "OrderCreated",
+  "orderId": "O1001",
+  "userId": 1001,
+  "amount": 19900,
+  "items": [
+    {"skuId": "S1", "quantity": 2}
+  ],
+  "createdAt": "2026-06-03T10:00:00+09:00"
+}
+```
+
+---
+
+## 4. 消费端必须幂等
+
+不能假设 Kafka 只投递一次。
+
+必须设计：
+
+```text
+消费记录表
+业务唯一索引
+状态机条件更新
+重复消息识别
+```
+
+---
+
+## 5. 补偿任务必须独立建设
+
+补偿不是临时脚本，而应该是系统能力。
+
+包括：
+
+```text
+Outbox 卡住补偿
+CDC 延迟告警
+死信队列补偿
+业务中间态补偿
+人工处理后台
+```
+
+---
+
+## 6. 监控必须覆盖全链路
+
+必须监控：
+
+```text
+outbox INIT 数量
+outbox FAILED 数量
+outbox 最老未发送时间
+CDC 延迟
+Kafka producer 发送失败数
+Kafka topic lag
+Consumer 失败数
+Consumer 幂等命中数
+死信队列数量
+补偿任务执行数
+业务状态长时间卡住数量
+```
+
+---
+
+# 二十二、面试表达
+
+## 1. 数据库写成功但 Kafka 发送失败怎么办？
+
+可以这样回答：
+
+> 这是典型的数据库和消息双写一致性问题。不能简单地 DB commit 后直接发 Kafka，因为 commit 成功后服务可能崩溃或 Kafka 发送失败，导致消息丢失。常见做法是 Outbox Pattern，也就是在同一个本地数据库事务里同时写业务表和 outbox_event 表。事务成功后，后台任务或 CDC 组件再把 outbox 事件发送到 Kafka。这样可以保证业务数据成功时，对应事件也一定被记录下来，后续可以重试发送。
+
+---
+
+## 2. Outbox Pattern 有什么缺点？
+
+可以这样回答：
+
+> Outbox Pattern 能保证业务数据和待发送事件记录一致，但它通常只能保证事件至少发送一次，不能保证只发送一次。比如 Kafka 发送成功后，服务在标记 outbox 为 SENT 前崩溃，后续任务会再次发送该事件。因此消费者必须基于 eventId、唯一索引或状态机做幂等。另外，轮询 outbox 表会带来数据库压力和发送延迟，大规模场景通常会结合 CDC，比如 Debezium 或 Canal，从 binlog 中捕获 outbox 表变更并发送到 Kafka。
+
+---
+
+## 3. CDC 和 Outbox 有什么区别？
+
+可以这样回答：
+
+> Outbox 是一种业务侧模式，它要求业务服务在本地事务中写业务表和 outbox_event 表。CDC 是一种数据捕获机制，它通过监听数据库 binlog 捕获已经提交的变更并发送到 Kafka。两者可以结合：业务服务写 outbox 表，Debezium 或 Canal 监听 outbox 表的 binlog，把事件发布到 Kafka。这样既保留了清晰的业务事件语义，又避免业务服务自己轮询发送消息。
+
+---
+
+## 4. 为什么不直接监听业务表？
+
+可以这样回答：
+
+> 直接监听业务表适合数据同步，比如同步到搜索索引或数仓。但它不一定适合领域事件，因为表变更是数据层语义，业务事件是领域语义。一次业务操作可能修改多张表，一个表更新也不一定能表达清楚业务含义。Outbox 表可以显式记录 OrderCreated、OrderPaid 这类业务事件，事件结构稳定，对下游更友好。
+
+---
+
+## 5. Kafka 事务能不能解决数据库一致性？
+
+可以这样回答：
+
+> Kafka 事务主要解决 Kafka 内部多 Topic、多 Partition 写入，以及消费 offset 和输出消息的原子性。它不能自动解决 MySQL 和 Kafka 之间的分布式事务。如果业务流程是写 MySQL 再发 Kafka，仍然会遇到 MySQL commit 成功但 Kafka commit 失败，或者反过来的问题。因此数据库和 Kafka 的一致性通常用 Outbox、CDC、幂等消费和补偿机制解决。
+
+---
+
+# 二十三、总结
+
+Kafka 与数据库一致性问题，本质是：
+
+```text
+数据库事务和消息发送不是同一个原子操作。
+```
+
+错误做法：
+
+```text
+DB 成功后直接发 Kafka；
+Kafka 成功后再 commit DB；
+在 DB 事务中同步发 Kafka。
+```
+
+常见正确架构：
+
+```text
+Outbox Pattern：
+业务表 + outbox 表同事务。
+
+Outbox 轮询：
+后台任务扫描 outbox 发送 Kafka。
+
+Outbox + CDC：
+Debezium / Canal 监听 outbox binlog，发布 Kafka。
+
+Consumer 幂等：
+eventId、唯一索引、状态机。
+
+补偿机制：
+扫描异常状态，保证最终收敛。
+```
+
+一句话总结：
+
+```text
+Kafka 与数据库一致性，不是靠一次双写解决，而是靠本地事务记录事件、可靠发布、幂等消费和补偿机制共同保证最终一致。
+```
+
+真正成熟的架构不是承诺“永远不会不一致”，而是清楚知道：
+
+```text
+哪里可能不一致；
+不一致如何被发现；
+消息如何重试；
+重复如何幂等；
+异常如何补偿；
+最终如何收敛。
+```
+
+这才是 Kafka 在分布式系统中正确落地的方式。

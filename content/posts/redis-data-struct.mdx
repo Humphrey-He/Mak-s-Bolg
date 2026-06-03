@@ -1,0 +1,1854 @@
+# Redis 数据结构和业务场景映射：从开发实战到架构选型的系统总结
+
+## 前言
+
+很多人学习 Redis，最开始都是从几个命令入门：
+
+```text
+SET key value
+GET key
+DEL key
+EXPIRE key 60
+```
+
+于是很容易把 Redis 理解成一个“缓存工具”。
+
+但 Redis 真正强大的地方，不只是快，也不只是缓存，而是它提供了一套非常工程化的数据结构能力。
+
+从开发角度看，Redis 是一个可以直接落地业务模型的数据结构工具箱。
+
+从架构角度看，Redis 是高并发系统里承接热点访问、短生命周期状态、计数、限流、排行榜、消息流和近似统计的重要基础设施。
+
+从源码角度看，Redis 的每种数据结构背后都不是简单的抽象，而是有不同的底层编码和内存优化策略。例如小 Hash、小 ZSet 会使用更紧凑的 listpack 编码，Sorted Set 在规模变大后会切换到 skiplist，Set 在整数集合场景下可能使用 intset，String 底层依赖 SDS，List 底层使用 quicklist。Redis 官方 `OBJECT ENCODING` 文档也列出了不同对象在不同条件下可能采用的底层编码，例如 Hash 的 listpack 编码、Sorted Set 的 skiplist 编码等。
+
+本文重点不是背 Redis 命令，而是建立一套判断框架：
+
+```text
+1. 什么业务场景适合用 Redis？
+2. 每种数据结构适合解决什么问题？
+3. 为什么这个结构比其他结构更合适？
+4. 底层编码和源码实现对性能有什么影响？
+5. 大厂生产环境里怎么用、怎么避坑？
+```
+
+我们按照常见业务场景依次拆解：
+
+```text
+String：缓存、计数器、分布式锁
+Hash：对象字段
+Set：去重、关系计算
+Sorted Set：排行榜、延迟队列
+Stream：消息流
+Bitmap：签到、活跃统计
+HyperLogLog：UV 估算
+```
+
+---
+
+# 一、Redis 数据结构选型的核心原则
+
+在具体看每种结构之前，先建立一个通用选型原则。
+
+Redis 不是 MySQL，也不是 MongoDB。它适合的是：
+
+```text
+高频访问
+低延迟读写
+数据结构相对简单
+生命周期可控
+可以接受一定内存成本
+可以通过 key 设计拆分数据
+```
+
+Redis 不适合的是：
+
+```text
+复杂关系查询
+大规模全文检索
+强事务一致性
+多表 Join
+超大对象存储
+不可丢失的唯一数据源
+```
+
+所以，Redis 数据结构选型的第一步不是问：
+
+```text
+这个命令怎么用？
+```
+
+而是问：
+
+```text
+这个业务数据的访问模式是什么？
+```
+
+常见访问模式包括：
+
+```text
+单值读写：String
+对象字段读写：Hash
+去重判断：Set
+排序和 Top N：Sorted Set
+顺序事件流：Stream
+二值状态统计：Bitmap
+大规模去重估算：HyperLogLog
+```
+
+可以抽象成一句话：
+
+```text
+Redis 选型不是按数据长什么样选，而是按访问模式选。
+```
+
+例如用户对象可以存成 String，也可以存成 Hash。
+
+如果每次都是整对象读取，String 存 JSON 没问题。
+
+如果经常只更新用户对象的某个字段，Hash 更合适。
+
+这就是开发和架构视角的区别：开发看命令，架构看访问模式和演进成本。
+
+---
+
+# 二、String：缓存、计数器、分布式锁
+
+## 1. String 是什么？
+
+String 是 Redis 最基础的数据结构。
+
+它可以存：
+
+```text
+普通字符串
+JSON 字符串
+整数
+浮点数
+二进制数据
+序列化对象
+```
+
+官方文档将 String 描述为可以存储文本或二进制数据的数据类型。
+
+常用命令：
+
+```text
+SET key value
+GET key
+MGET key1 key2
+INCR key
+DECR key
+SETNX key value
+SET key value NX EX 30
+```
+
+---
+
+## 2. 业务场景一：缓存
+
+最常见的用法是缓存。
+
+例如商品详情缓存：
+
+```text
+SET product:detail:1001 "{...json...}" EX 300
+GET product:detail:1001
+```
+
+典型流程：
+
+```text
+请求商品详情
+  -> 查 Redis
+  -> 命中则返回
+  -> 未命中查数据库
+  -> 写入 Redis
+  -> 返回结果
+```
+
+适合 String 缓存的场景：
+
+```text
+整对象读取
+更新频率不高
+数据可以序列化为 JSON
+不需要频繁修改局部字段
+```
+
+例如：
+
+```text
+商品详情
+文章详情
+首页配置
+用户权限快照
+接口聚合结果
+```
+
+String 缓存的优点是简单，客户端序列化和反序列化即可。
+
+缺点是局部更新不方便。
+
+如果用户对象有 30 个字段，而业务只想更新昵称，String 方式通常需要：
+
+```text
+GET 整个 JSON
+反序列化
+修改 nickname
+重新序列化
+SET 整个 JSON
+```
+
+这时 Hash 可能更合适。
+
+---
+
+## 3. 业务场景二：计数器
+
+String 也可以存整数。
+
+Redis 提供原子递增命令：
+
+```text
+INCR article:1001:view_count
+DECR stock:sku:2001
+INCRBY user:1001:points 10
+```
+
+适合场景：
+
+```text
+文章阅读数
+视频播放数
+点赞数
+评论数
+接口调用次数
+短信发送次数
+库存预扣减
+```
+
+为什么 Redis 适合做计数器？
+
+因为 Redis 核心命令执行是顺序的，`INCR` 这类单命令天然具备原子性。
+
+如果用数据库直接做高频计数：
+
+```sql
+UPDATE article SET view_count = view_count + 1 WHERE id = 1001;
+```
+
+高并发下数据库行锁压力会很大。
+
+Redis 可以把高频计数先接住，再异步落库或定期聚合。
+
+常见架构：
+
+```text
+用户点击
+  -> Redis INCR
+  -> 定时任务批量读取 Redis 计数
+  -> 聚合写入 MySQL
+```
+
+需要注意的是：
+
+```text
+Redis 计数适合高频、可异步落库的统计类数据；
+不适合直接作为强一致账务余额。
+```
+
+例如账户余额、支付金额、资金流水，不应该只依赖 Redis 计数。
+
+---
+
+## 4. 业务场景三：分布式锁
+
+Redis String 可以用来实现分布式锁。
+
+常见命令：
+
+```text
+SET lock:order:1001 requestId NX EX 30
+```
+
+含义是：
+
+```text
+只有 key 不存在时才设置成功
+并且设置 30 秒过期时间
+```
+
+释放锁时不能直接：
+
+```text
+DEL lock:order:1001
+```
+
+因为可能误删别人的锁。
+
+正确思路是：
+
+```text
+判断 value 是否等于自己的 requestId
+如果相等，再删除
+```
+
+通常用 Lua 脚本保证判断和删除的原子性：
+
+```lua
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("DEL", KEYS[1])
+else
+    return 0
+end
+```
+
+适合 Redis 锁的场景：
+
+```text
+防重复提交
+任务抢占
+定时任务单实例执行
+短时间互斥
+缓存重建互斥
+```
+
+不适合的场景：
+
+```text
+强一致交易锁
+长事务锁
+不可接受锁失效的核心金融场景
+```
+
+生产中要关注：
+
+```text
+锁超时时间
+业务执行时间
+锁续期
+主从切换
+锁误删
+客户端 GC 或网络抖动
+```
+
+大厂实践里，Redis 锁通常用于“辅助互斥”，而不是替代数据库事务、乐观锁或一致性协议。
+
+---
+
+## 5. 源码视角：String 底层 SDS
+
+Redis String 底层不是直接使用 C 字符串，而是 SDS，也就是 Simple Dynamic String。
+
+SDS 相比 C 字符串有几个优势：
+
+```text
+记录长度，获取长度 O(1)
+支持二进制安全
+减少频繁内存重分配
+不会依赖 \0 判断字符串结束
+```
+
+这也是 Redis String 可以存二进制数据的原因。
+
+从源码角度看，String 相关命令主要在：
+
+```text
+src/t_string.c
+src/sds.c
+src/object.c
+```
+
+对象层面，Redis 会根据 value 情况使用不同编码，例如整数可以用 int 编码，普通字符串用 embstr 或 raw 编码。小字符串使用更紧凑的 embstr，可以减少内存分配次数；大字符串使用 raw，便于扩展和修改。
+
+这说明 Redis 的性能不是只靠“内存快”，而是连对象编码、内存分配、字符串结构都做了大量优化。
+
+---
+
+# 三、Hash：对象字段存储
+
+## 1. Hash 是什么？
+
+Hash 是一个 key 内部的 field-value 映射。
+
+例如：
+
+```text
+HSET user:1001 name Tom age 20 city Tokyo
+HGET user:1001 name
+HGETALL user:1001
+```
+
+官方文档将 Hash 描述为单个 key 内部的 key-value pair，适合存储对象字段。
+
+---
+
+## 2. 业务场景：对象字段
+
+Hash 非常适合对象型数据。
+
+例如用户资料：
+
+```text
+HSET user:profile:1001 name "Tom"
+HSET user:profile:1001 age "20"
+HSET user:profile:1001 city "Tokyo"
+HGET user:profile:1001 name
+```
+
+适合场景：
+
+```text
+用户资料
+商品基础信息
+店铺信息
+设备状态
+会话字段
+购物车条目
+配置对象
+```
+
+相比 String 存 JSON，Hash 的优势是可以局部更新：
+
+```text
+HSET user:profile:1001 nickname "newName"
+```
+
+不需要读取整个 JSON 再写回。
+
+---
+
+## 3. String JSON vs Hash 怎么选？
+
+这是非常常见的架构问题。
+
+### 适合 String JSON 的情况
+
+```text
+整对象读多
+字段不常单独更新
+对象结构复杂
+客户端希望直接反序列化
+对象体积不大
+```
+
+例如：
+
+```text
+商品详情页缓存
+文章详情缓存
+聚合接口结果缓存
+```
+
+### 适合 Hash 的情况
+
+```text
+字段级读写多
+对象字段相对扁平
+需要单字段计数
+需要避免整对象反序列化
+```
+
+例如：
+
+```text
+用户在线状态
+用户基础资料
+设备实时状态
+购物车商品数量
+```
+
+### 不适合 Hash 的情况
+
+```text
+字段特别多
+单个 Hash 特别大
+需要复杂嵌套结构
+需要按字段做复杂查询
+```
+
+如果一个 Hash 里有几十万个 field，就会形成大 key。
+
+大厂实践中，Hash 的使用通常会限制 field 数量和 value 大小。
+
+---
+
+## 4. 源码视角：Hash 的 listpack 和 hashtable
+
+Redis Hash 会根据规模使用不同底层编码。
+
+小 Hash 通常使用 listpack 编码，它更加节省内存。
+
+当 Hash 规模超过配置阈值后，会转换成 hashtable 编码，以提高查询和更新性能。Redis 官方 `OBJECT ENCODING` 文档也说明，Redis 7.0 之后小 Hash 可以使用 listpack 这种节省空间的编码。
+
+可以理解为：
+
+```text
+小 Hash：listpack，省内存
+大 Hash：hashtable，查找快
+```
+
+这背后体现了 Redis 的设计思想：
+
+```text
+小数据优先节省内存
+大数据优先保证访问效率
+```
+
+对应源码主要在：
+
+```text
+src/t_hash.c
+src/listpack.c
+src/dict.c
+```
+
+---
+
+## 5. 生产避坑
+
+Hash 常见问题：
+
+```text
+HGETALL 大 Hash 阻塞主线程
+单个 Hash field 数过多形成大 key
+value 太大导致网络传输慢
+对象字段无 TTL，无法单独过期
+```
+
+注意：Redis 的 TTL 是 key 级别的，不是 Hash field 级别的。
+
+如果你希望对象中的每个字段有不同过期时间，Hash 就不合适，应该拆成多个 key。
+
+例如不推荐：
+
+```text
+HSET user:token:1001 tokenA valueA
+HSET user:token:1001 tokenB valueB
+```
+
+如果 tokenA 和 tokenB 过期时间不同，应该拆成：
+
+```text
+SET user:token:1001:tokenA valueA EX 3600
+SET user:token:1001:tokenB valueB EX 7200
+```
+
+---
+
+# 四、Set：去重、关系计算
+
+## 1. Set 是什么？
+
+Set 是无序、不重复的字符串集合。
+
+常用命令：
+
+```text
+SADD key member
+SREM key member
+SISMEMBER key member
+SCARD key
+SINTER key1 key2
+SUNION key1 key2
+SDIFF key1 key2
+```
+
+官方文档中，Set 被定义为唯一字符串集合。
+
+---
+
+## 2. 业务场景一：去重
+
+Set 最典型的用途是去重。
+
+例如文章点赞用户集合：
+
+```text
+SADD article:1001:liked_users user1001
+SISMEMBER article:1001:liked_users user1001
+SCARD article:1001:liked_users
+```
+
+适合场景：
+
+```text
+点赞用户去重
+活动参与用户去重
+抽奖用户池
+黑名单
+白名单
+已读用户集合
+去重任务 ID
+```
+
+Set 的优势是：
+
+```text
+写入自动去重
+判断是否存在很方便
+统计元素数量简单
+```
+
+例如防止用户重复领取优惠券：
+
+```text
+SADD coupon:1001:received_users user1001
+```
+
+如果返回 1，说明第一次领取。
+
+如果返回 0，说明已经领取过。
+
+---
+
+## 3. 业务场景二：关系计算
+
+Set 支持交集、并集、差集。
+
+这让它非常适合做关系计算。
+
+例如共同关注：
+
+```text
+SINTER user:1001:follows user:1002:follows
+```
+
+共同好友：
+
+```text
+SINTER user:1001:friends user:1002:friends
+```
+
+用户 A 关注但用户 B 没关注的人：
+
+```text
+SDIFF user:1001:follows user:1002:follows
+```
+
+适合场景：
+
+```text
+共同关注
+共同好友
+用户标签交集
+权限集合判断
+推荐候选集
+黑白名单过滤
+```
+
+---
+
+## 4. 源码视角：Set 的 intset 和 hashtable
+
+Set 底层也会根据元素情况选择不同编码。
+
+如果 Set 中全部是整数，并且数量较少，Redis 可以使用 intset 编码。
+
+如果元素不是纯整数，或者数量变大，会转成 hashtable。
+
+可以理解为：
+
+```text
+小整数集合：intset，省内存
+普通集合：hashtable，查找快
+```
+
+源码主要在：
+
+```text
+src/t_set.c
+src/intset.c
+src/dict.c
+```
+
+---
+
+## 5. 生产避坑
+
+Set 最大的问题是容易被误用成大集合。
+
+例如：
+
+```text
+SADD article:hot:liked_users 几千万用户
+SMEMBERS article:hot:liked_users
+```
+
+这会造成严重阻塞。
+
+生产中要注意：
+
+```text
+不要对大 Set 使用 SMEMBERS
+使用 SSCAN 分批扫描
+限制单个 Set 大小
+必要时按业务维度拆分
+关系计算要控制集合规模
+```
+
+Set 的交集、并集、差集虽然好用，但如果集合很大，会消耗大量 CPU，并阻塞 Redis 主线程。
+
+大厂实践中，大规模关系计算通常不会直接在 Redis 单实例上硬算，而是会结合离线计算、搜索系统、图数据库或推荐系统来做。
+
+Redis 更适合承接小规模、高频、在线判断型集合操作。
+
+---
+
+# 五、Sorted Set：排行榜、延迟队列
+
+## 1. Sorted Set 是什么？
+
+Sorted Set，也叫 ZSet，是带 score 的唯一成员集合。
+
+每个 member 唯一，每个 member 关联一个 score。
+
+Redis 会根据 score 排序。官方文档明确说明，Sorted Set 是带关联 score 并按 score 排序的唯一字符串集合。
+
+常用命令：
+
+```text
+ZADD key score member
+ZINCRBY key increment member
+ZRANGE key start stop WITHSCORES
+ZREVRANGE key start stop WITHSCORES
+ZRANK key member
+ZREVRANK key member
+ZREM key member
+ZRANGEBYSCORE key min max
+```
+
+---
+
+## 2. 业务场景一：排行榜
+
+Sorted Set 最经典场景就是排行榜。
+
+例如游戏积分榜：
+
+```text
+ZADD rank:game:1001 100 userA
+ZADD rank:game:1001 200 userB
+ZREVRANGE rank:game:1001 0 9 WITHSCORES
+```
+
+更新积分：
+
+```text
+ZINCRBY rank:game:1001 50 userA
+```
+
+查询用户排名：
+
+```text
+ZREVRANK rank:game:1001 userA
+```
+
+适合场景：
+
+```text
+游戏排行榜
+直播贡献榜
+文章热度榜
+商品销量榜
+用户活跃榜
+积分榜
+粉丝榜
+```
+
+Sorted Set 的优势是：
+
+```text
+自动按分数排序
+支持 Top N 查询
+支持分数更新
+支持排名查询
+支持按分数范围查询
+```
+
+如果用 MySQL 做实时排行榜，通常需要频繁排序和更新索引。
+
+Redis ZSet 更适合高频更新和实时 Top N。
+
+---
+
+## 3. 业务场景二：延迟队列
+
+Sorted Set 还可以实现延迟队列。
+
+思路是：
+
+```text
+member = 任务 ID
+score = 任务执行时间戳
+```
+
+添加任务：
+
+```text
+ZADD delay:queue 1717392000 taskId1001
+```
+
+消费任务：
+
+```text
+ZRANGEBYSCORE delay:queue 0 当前时间戳 LIMIT 0 10
+```
+
+取到任务后删除：
+
+```text
+ZREM delay:queue taskId1001
+```
+
+适合场景：
+
+```text
+订单超时取消
+优惠券过期提醒
+延迟通知
+定时重试
+异步补偿
+```
+
+但是要注意，这种延迟队列不是强可靠消息队列。
+
+需要处理：
+
+```text
+任务重复消费
+消费者宕机
+取出后删除的原子性
+任务执行失败重试
+队列堆积
+```
+
+更严谨的实现可以用 Lua 脚本保证取任务和删除任务的原子性。
+
+如果业务对消息可靠性要求很高，应该考虑 Kafka、RocketMQ、RabbitMQ 或 Redis Stream。
+
+---
+
+## 4. 源码视角：ZSet 的 listpack 和 skiplist
+
+Sorted Set 底层非常值得研究。
+
+小 ZSet 通常可以使用 listpack 编码节省内存。
+
+当数据量变大后，会转换成 skiplist 加 dict 的组合结构。Redis 源码 `t_zset.c` 中可以看到 skiplist 节点和 zskiplist 的相关实现，Sorted Set 的常规编码也包括 skiplist。
+
+为什么要 dict + skiplist？
+
+```text
+dict：根据 member 快速找到 score
+skiplist：根据 score 维护排序
+```
+
+也就是说：
+
+```text
+查某个 member 的 score -> dict
+按 score 排序、范围查询 -> skiplist
+```
+
+这就是 ZSet 能同时支持：
+
+```text
+ZINCRBY
+ZRANK
+ZRANGE
+ZRANGEBYSCORE
+```
+
+的原因。
+
+源码主要在：
+
+```text
+src/t_zset.c
+src/server.h
+src/dict.c
+src/listpack.c
+```
+
+---
+
+## 5. 生产避坑
+
+Sorted Set 常见问题：
+
+```text
+单个排行榜过大
+全量 ZRANGE
+频繁更新超大 ZSet
+score 设计不合理
+热榜 key 过热
+延迟队列重复消费
+```
+
+排行榜实践建议：
+
+```text
+只保留 Top N 或近期数据
+按周期拆 key，例如日榜、周榜、月榜
+冷热数据分离
+定期归档到数据库
+避免一次性取全量
+```
+
+例如：
+
+```text
+rank:game:daily:20260603
+rank:game:weekly:2026W23
+rank:game:monthly:202606
+```
+
+不要所有数据都塞进一个永久排行榜。
+
+---
+
+# 六、Stream：消息流
+
+## 1. Stream 是什么？
+
+Redis Stream 是 Redis 5 引入的数据结构，用于表示消息流。
+
+官方文档说明，Stream 类似 append-only log，但提供了更多能力，例如 O(1) 随机访问和消费者组，可以用于实时事件记录和分发。
+
+常用命令：
+
+```text
+XADD stream key value
+XREAD STREAMS stream id
+XGROUP CREATE stream group $
+XREADGROUP GROUP group consumer STREAMS stream >
+XACK stream group messageId
+XPENDING stream group
+```
+
+---
+
+## 2. 业务场景：轻量消息队列
+
+Stream 适合做轻量级消息流。
+
+例如订单事件：
+
+```text
+XADD order:events * orderId 1001 status created
+```
+
+消费者读取：
+
+```text
+XREADGROUP GROUP order_group consumer_1 COUNT 10 STREAMS order:events >
+```
+
+确认消费：
+
+```text
+XACK order:events order_group messageId
+```
+
+适合场景：
+
+```text
+轻量异步任务
+事件通知
+操作日志流
+实时数据采集
+小规模消息队列
+服务间简单解耦
+```
+
+---
+
+## 3. Stream vs List
+
+早期很多人用 List 做队列：
+
+```text
+LPUSH queue task
+RPOP queue
+```
+
+这种方式简单，但功能有限。
+
+Stream 相比 List 的优势：
+
+```text
+消息有唯一 ID
+支持消费者组
+支持 ACK
+支持 Pending 消息
+支持历史消息读取
+支持多个消费者分摊消费
+```
+
+如果只是单消费者简单队列，List 可以。
+
+如果需要消费者组、确认机制和消息追踪，Stream 更合适。
+
+---
+
+## 4. Stream vs Kafka / RocketMQ
+
+Stream 不是 Kafka 的完全替代品。
+
+Stream 适合：
+
+```text
+中小规模消息流
+业务内轻量异步
+低延迟事件处理
+Redis 已经是基础组件
+消息量不极端
+```
+
+Kafka / RocketMQ 更适合：
+
+```text
+超大规模消息堆积
+跨系统解耦
+强消息可靠性
+复杂消费组管理
+长时间消息保留
+高吞吐日志系统
+```
+
+架构选型时可以这样判断：
+
+```text
+业务内轻量消息：Redis Stream
+公司级消息总线：Kafka / RocketMQ
+```
+
+---
+
+## 5. 源码视角：Stream 的 radix tree 与 listpack
+
+Redis Stream 底层比较复杂，主要使用 radix tree 组织消息 ID，并使用 listpack 存储消息内容。
+
+可以理解为：
+
+```text
+radix tree：按消息 ID 索引
+listpack：紧凑存储消息字段
+```
+
+这让 Stream 能够在保留顺序访问能力的同时，降低内存开销。
+
+源码主要在：
+
+```text
+src/t_stream.c
+src/rax.c
+src/listpack.c
+```
+
+---
+
+## 6. 生产避坑
+
+Stream 常见问题：
+
+```text
+消息不裁剪导致内存膨胀
+Pending 消息长期不处理
+消费者组积压
+消费失败没有重试策略
+把 Redis Stream 当 Kafka 使用
+```
+
+生产建议：
+
+```text
+使用 MAXLEN 控制长度
+监控 XPENDING
+设计重试和死信机制
+控制单条消息大小
+定期清理历史消息
+核心链路消息慎用 Redis Stream 替代 MQ
+```
+
+示例：
+
+```text
+XADD order:events MAXLEN ~ 100000 * orderId 1001 status created
+```
+
+---
+
+# 七、Bitmap：签到、活跃统计
+
+## 1. Bitmap 是什么？
+
+Bitmap 不是一种独立的底层对象类型，本质上是 String 上的位操作。
+
+Redis 可以把 String 当作二进制位数组使用。
+
+常用命令：
+
+```text
+SETBIT key offset value
+GETBIT key offset
+BITCOUNT key
+BITOP AND dest key1 key2
+BITOP OR dest key1 key2
+```
+
+Redis 资料中通常将 Bitmap 描述为适合存储二值逻辑和状态的紧凑结构，并支持位级设置、获取以及 AND/OR/XOR/NOT 操作。
+
+---
+
+## 2. 业务场景一：用户签到
+
+例如用户每月签到：
+
+```text
+SETBIT sign:user:1001:202606 2 1
+GETBIT sign:user:1001:202606 2
+BITCOUNT sign:user:1001:202606
+```
+
+含义：
+
+```text
+offset = 日期 - 1
+value = 是否签到
+```
+
+比如 6 月 3 日签到：
+
+```text
+SETBIT sign:user:1001:202606 2 1
+```
+
+统计本月签到次数：
+
+```text
+BITCOUNT sign:user:1001:202606
+```
+
+适合场景：
+
+```text
+用户签到
+每日活跃状态
+任务完成状态
+打卡记录
+用户是否在线
+功能开关状态
+```
+
+---
+
+## 3. 业务场景二：活跃用户统计
+
+可以用日期作为 key，用户 ID 映射到 offset。
+
+例如：
+
+```text
+SETBIT active:daily:20260603 1001 1
+```
+
+统计当天活跃用户数：
+
+```text
+BITCOUNT active:daily:20260603
+```
+
+计算连续两天都活跃的用户：
+
+```text
+BITOP AND active:both:20260602_20260603 active:daily:20260602 active:daily:20260603
+BITCOUNT active:both:20260602_20260603
+```
+
+Bitmap 的优势是内存极省。
+
+假设用户 ID 最大是 1 亿，用 Bitmap 表示一天活跃状态，大约需要：
+
+```text
+100,000,000 bit ≈ 12.5 MB
+```
+
+如果用 Set 存用户 ID，内存消耗通常会大得多。
+
+---
+
+## 4. Bitmap 的限制
+
+Bitmap 最大的问题是 offset 依赖 ID 范围。
+
+如果用户 ID 很稀疏，例如最大 ID 是 10 亿，但实际用户只有 100 万，Bitmap 可能浪费大量空间。
+
+适合 Bitmap 的条件：
+
+```text
+状态是 0/1
+ID 可以映射为较连续的整数
+关注统计数量或位运算
+不需要存复杂信息
+```
+
+不适合：
+
+```text
+ID 极度稀疏
+需要存多个状态值
+需要记录复杂对象
+需要精确列出所有用户详情
+```
+
+---
+
+## 5. 生产避坑
+
+Bitmap 常见问题：
+
+```text
+offset 过大导致 String 瞬间膨胀
+用户 ID 稀疏导致内存浪费
+BITOP 大 key 计算阻塞
+没有设计好 key 粒度
+```
+
+建议：
+
+```text
+按天、月拆 key
+控制 offset 范围
+避免一次性对超大 Bitmap 做频繁 BITOP
+必要时使用分桶
+```
+
+例如：
+
+```text
+active:daily:20260603:bucket:0
+active:daily:20260603:bucket:1
+active:daily:20260603:bucket:2
+```
+
+---
+
+# 八、HyperLogLog：UV 估算
+
+## 1. HyperLogLog 是什么？
+
+HyperLogLog 是一种基数估计算法，用来估算集合中不重复元素的数量。
+
+Redis 提供对应命令：
+
+```text
+PFADD key element
+PFCOUNT key
+PFMERGE dest key1 key2
+```
+
+它适合统计：
+
+```text
+UV
+独立访客数
+独立 IP 数
+搜索词去重数
+设备去重数
+接口独立调用用户数
+```
+
+注意，HyperLogLog 是估算，不是精确统计。
+
+---
+
+## 2. 业务场景：UV 统计
+
+例如统计某篇文章的 UV：
+
+```text
+PFADD article:1001:uv user1001
+PFADD article:1001:uv user1002
+PFCOUNT article:1001:uv
+```
+
+统计站点每日 UV：
+
+```text
+PFADD site:uv:20260603 user1001
+PFADD site:uv:20260603 user1002
+PFCOUNT site:uv:20260603
+```
+
+合并多天 UV：
+
+```text
+PFMERGE site:uv:week:2026W23 site:uv:20260601 site:uv:20260602 site:uv:20260603
+PFCOUNT site:uv:week:2026W23
+```
+
+HyperLogLog 的核心优势是：
+
+```text
+用很小的固定内存估算巨大集合的去重数量。
+```
+
+如果用 Set 精确记录 1 亿个用户 ID，内存成本很高。
+
+如果只需要估算 UV，HyperLogLog 更合适。
+
+---
+
+## 3. HyperLogLog vs Set
+
+### 使用 Set
+
+优点：
+
+```text
+精确去重
+可以获取具体成员
+可以做交并差
+```
+
+缺点：
+
+```text
+内存成本高
+大集合操作风险高
+```
+
+### 使用 HyperLogLog
+
+优点：
+
+```text
+内存极省
+适合大规模 UV 估算
+支持合并统计
+```
+
+缺点：
+
+```text
+结果有误差
+不能获取具体成员
+不能判断某个用户是否存在
+不适合强精确场景
+```
+
+所以选型原则是：
+
+```text
+需要精确成员列表：Set
+只需要估算数量：HyperLogLog
+```
+
+---
+
+## 4. 生产避坑
+
+HyperLogLog 常见误用：
+
+```text
+用它判断用户是否访问过
+用它做精确计费
+用它统计必须绝对准确的数据
+用它替代所有去重集合
+```
+
+不适合：
+
+```text
+金融计数
+库存计数
+精确活动参与人数
+需要追溯用户明细的审计场景
+```
+
+适合：
+
+```text
+站点 UV
+页面 UV
+搜索 UV
+广告粗粒度曝光去重
+大盘趋势统计
+```
+
+架构上，很多公司会采用组合方案：
+
+```text
+实时大盘估算：HyperLogLog
+离线精确统计：数仓 / Flink / Hive
+小规模精确去重：Set
+```
+
+---
+
+# 九、数据结构选型速查表
+
+| 业务需求  | 推荐结构        | 核心命令                     | 说明                  |
+| ----- | ----------- | ------------------------ | ------------------- |
+| 普通缓存  | String      | GET / SET                | 适合整对象缓存             |
+| 计数器   | String      | INCR / DECR              | 单命令原子递增             |
+| 分布式锁  | String      | SET NX EX                | 需要唯一 value + Lua 释放 |
+| 对象字段  | Hash        | HSET / HGET              | 适合字段级读写             |
+| 去重    | Set         | SADD / SISMEMBER         | 自动去重                |
+| 关系计算  | Set         | SINTER / SUNION / SDIFF  | 适合小中规模集合            |
+| 排行榜   | Sorted Set  | ZADD / ZREVRANGE         | 按 score 排序          |
+| 延迟队列  | Sorted Set  | ZADD / ZRANGEBYSCORE     | score 存执行时间         |
+| 消息流   | Stream      | XADD / XREADGROUP / XACK | 轻量消息队列              |
+| 签到    | Bitmap      | SETBIT / BITCOUNT        | 二值状态统计              |
+| 活跃用户  | Bitmap      | SETBIT / BITOP           | 适合连续 ID             |
+| UV 估算 | HyperLogLog | PFADD / PFCOUNT          | 近似去重统计              |
+
+---
+
+# 十、大厂实践：Redis 数据结构使用规范
+
+## 1. 先定 key 设计，再定数据结构
+
+Redis 的 key 设计非常重要。
+
+推荐格式：
+
+```text
+业务:模块:实体:ID:维度
+```
+
+示例：
+
+```text
+user:profile:1001
+article:detail:2001
+rank:game:daily:20260603
+active:daily:20260603
+lock:order:3001
+```
+
+不推荐：
+
+```text
+data
+cache
+user
+tmp
+list
+```
+
+key 必须有业务语义，否则排查、监控、清理都会很困难。
+
+---
+
+## 2. 所有缓存类 key 必须有 TTL
+
+缓存 key 不设置 TTL，是非常典型的 Redis 反模式。Redis 官方也在反模式文章中提到缺少 TTL、大 key、热 key、`KEYS` 命令等都会伤害性能。
+
+建议：
+
+```text
+普通缓存设置 TTL
+热点缓存使用逻辑过期
+TTL 加随机扰动
+核心缓存有主动刷新机制
+```
+
+例如：
+
+```text
+SET product:detail:1001 value EX 300
+```
+
+为了避免大量 key 同时过期：
+
+```text
+TTL = 基础时间 + 随机时间
+```
+
+---
+
+## 3. 避免大 key
+
+大 key 是 Redis 生产环境最常见的问题之一。
+
+Redis 官方性能调优建议中提到，可以使用 `redis-cli --bigkeys` 和 `redis-cli --hotkeys` 检查 key 大小和热点 key。
+
+常见大 key：
+
+```text
+超大 String
+超大 Hash
+超大 Set
+超大 ZSet
+超大 Stream
+超大 Bitmap
+```
+
+治理方式：
+
+```text
+拆 key
+分桶
+分页
+限制集合长度
+定期清理
+使用 UNLINK 异步删除
+避免全量读取
+```
+
+---
+
+## 4. 避免热 key
+
+热 key 指大量请求集中访问一个 key。
+
+例如：
+
+```text
+热门商品详情
+首页配置
+秒杀库存
+直播间信息
+热门排行榜
+```
+
+治理方式：
+
+```text
+本地缓存
+多级缓存
+请求合并
+key 分片
+热点副本
+限流降级
+提前预热
+```
+
+Cluster 并不能天然解决单个热 key，因为同一个 key 只能落到一个 slot 上。
+
+---
+
+## 5. 禁止在线使用危险命令
+
+线上业务应避免：
+
+```text
+KEYS *
+HGETALL 大 Hash
+SMEMBERS 大 Set
+LRANGE 0 -1 大 List
+ZRANGE 0 -1 大 ZSet
+大集合 SINTER / SUNION / SDIFF
+复杂 Lua
+DEL 大 key
+```
+
+替代方案：
+
+```text
+SCAN
+HSCAN
+SSCAN
+ZSCAN
+分页读取
+分批处理
+UNLINK
+后台任务
+```
+
+---
+
+# 十一、源码层面的统一理解：Redis Object
+
+Redis 所有数据结构在对象层面都有统一抽象。
+
+可以简单理解为：
+
+```text
+redisObject {
+    type
+    encoding
+    ptr
+}
+```
+
+其中：
+
+```text
+type：表示对象类型，例如 string、hash、set、zset、stream
+encoding：表示底层编码，例如 raw、embstr、int、listpack、hashtable、skiplist
+ptr：指向真实底层数据结构
+```
+
+这就是为什么同样是 Hash，底层可能是 listpack，也可能是 hashtable。
+
+同样是 ZSet，底层可能是 listpack，也可能是 skiplist。
+
+Redis 的设计不是“一种类型绑定一种结构”，而是：
+
+```text
+一种逻辑类型，根据数据规模和内容，选择不同底层编码。
+```
+
+这个设计非常重要。
+
+它带来的好处是：
+
+```text
+小数据节省内存
+大数据保证性能
+对上层命令保持统一语义
+```
+
+对应源码主要分布在：
+
+```text
+src/server.h
+src/object.c
+src/t_string.c
+src/t_hash.c
+src/t_set.c
+src/t_zset.c
+src/t_stream.c
+src/listpack.c
+src/dict.c
+src/quicklist.c
+src/intset.c
+src/rax.c
+```
+
+这也是 Redis 数据结构值得深入研究的原因。
+
+---
+
+# 十二、开发视角：怎么在项目里选 Redis 结构？
+
+可以用下面这套问题判断。
+
+## 1. 是否只需要存一个值？
+
+是，优先 String。
+
+```text
+缓存 JSON
+计数器
+token
+验证码
+锁
+```
+
+## 2. 是否需要频繁读写对象中的某个字段？
+
+是，优先 Hash。
+
+```text
+用户资料
+设备状态
+购物车字段
+```
+
+## 3. 是否需要判断是否存在或去重？
+
+是，优先 Set。
+
+```text
+是否点赞
+是否报名
+是否领取
+是否在黑名单
+```
+
+## 4. 是否需要排序、排名、Top N？
+
+是，优先 Sorted Set。
+
+```text
+排行榜
+热榜
+积分榜
+延迟任务
+```
+
+## 5. 是否是消息流或事件流？
+
+是，考虑 Stream。
+
+```text
+订单事件
+异步任务
+操作日志
+服务内事件分发
+```
+
+## 6. 是否只有 0/1 状态，并且 ID 较连续？
+
+是，考虑 Bitmap。
+
+```text
+签到
+活跃状态
+是否完成任务
+```
+
+## 7. 是否只需要估算去重数量，不需要明细？
+
+是，考虑 HyperLogLog。
+
+```text
+UV
+独立 IP
+搜索词去重数量
+```
+
+---
+
+# 十三、架构视角：Redis 结构选型的边界
+
+Redis 数据结构很强，但不能滥用。
+
+## 1. Redis 不是关系型数据库
+
+不要用 Redis 做复杂查询。
+
+例如：
+
+```text
+按多个字段筛选用户
+按价格区间和库存筛商品
+多表关联查询订单
+复杂分页搜索
+```
+
+这些更适合 MySQL、Elasticsearch 或 ClickHouse。
+
+---
+
+## 2. Redis 不是大对象存储
+
+不要把大文件、大 JSON、大数组直接塞进 Redis。
+
+例如：
+
+```text
+几十 MB 的 JSON
+完整 Excel 文件
+大量图片二进制
+超大对象列表
+```
+
+这些应该放对象存储、数据库或文件系统，Redis 只存元数据或热点摘要。
+
+---
+
+## 3. Redis 不是强可靠消息系统
+
+Stream 很好用，但不是 Kafka 的完全替代。
+
+如果有：
+
+```text
+长时间消息堆积
+跨业务域消息总线
+严格顺序消费
+复杂重放
+超高吞吐
+强审计
+```
+
+更适合专业 MQ。
+
+---
+
+## 4. Redis 不是万能计数系统
+
+Redis 的 INCR 很适合高频计数，但不适合所有计数。
+
+适合：
+
+```text
+点赞数
+阅读数
+限流计数
+临时库存预扣
+```
+
+不适合：
+
+```text
+账户余额
+支付金额
+强一致库存最终扣减
+财务流水
+```
+
+强一致数据必须以数据库、事务日志或专门账务系统为准。
+
+---
+
+# 十四、面试表达：Redis 数据结构怎么选？
+
+如果面试官问：“Redis 有哪些数据结构？分别用在什么场景？”
+
+可以这样回答：
+
+> Redis 不只是简单 KV，它是一个内存数据结构服务器。String 适合普通缓存、计数器和分布式锁；Hash 适合对象字段级读写；Set 适合去重和关系计算；Sorted Set 适合排行榜、热榜和延迟队列；Stream 适合轻量消息流和消费者组；Bitmap 适合签到、活跃状态这种二值统计；HyperLogLog 适合 UV 这类大规模去重估算。实际选型时不是看数据长什么样，而是看访问模式，比如是否需要局部字段更新、是否需要排序、是否需要去重、是否需要估算、是否需要消息确认。
+
+如果面试官继续追问：“String 存 JSON 和 Hash 存对象怎么选？”
+
+可以这样回答：
+
+> 如果业务每次都是整对象读取，而且字段不需要频繁单独更新，String 存 JSON 更简单。如果业务经常只读写对象中的某几个字段，Hash 更合适，因为可以字段级更新，避免整对象序列化和反序列化。但 Hash 也要避免 field 过多形成大 key，而且 Redis 的 TTL 是 key 级别的，不是 field 级别的。
+
+如果面试官问：“Sorted Set 为什么适合排行榜？”
+
+可以这样回答：
+
+> Sorted Set 每个 member 对应一个 score，Redis 会按 score 维护有序集合。它既可以通过 dict 快速定位 member，也可以通过 skiplist 支持按 score 排序、范围查询和排名查询。所以它非常适合积分榜、热度榜、贡献榜这类需要频繁更新分数并实时查询 Top N 的场景。
+
+如果面试官问：“Bitmap 和 HyperLogLog 有什么区别？”
+
+可以这样回答：
+
+> Bitmap 适合二值状态统计，比如某个用户某天是否活跃、是否签到，它能做精确位统计和位运算，但依赖 offset 范围，ID 稀疏时可能浪费内存。HyperLogLog 适合大规模去重数量估算，比如 UV，它非常省内存，但结果有误差，不能获取具体成员，也不能判断某个用户是否存在。
+
+---
+
+# 十五、总结
+
+Redis 数据结构的核心价值，不是“命令多”，而是它把很多高频业务问题抽象成了内存中的高效数据结构操作。
+
+可以总结为：
+
+```text
+String：解决单值缓存、计数和锁
+Hash：解决对象字段级读写
+Set：解决去重和集合关系
+Sorted Set：解决排序、排名、延迟调度
+Stream：解决轻量消息流
+Bitmap：解决二值状态统计
+HyperLogLog：解决大规模去重估算
+```
+
+真正掌握 Redis 数据结构，不是记住命令，而是理解：
+
+```text
+业务访问模式是什么？
+数据规模会不会变大？
+是否需要 TTL？
+是否会形成大 key？
+是否存在热点 key？
+是否要求强一致？
+是否需要精确结果？
+是否需要获取明细？
+```
+
+从开发角度看，Redis 是提升性能的工具。
+
+从架构角度看，Redis 是高并发系统中的数据建模组件。
+
+从源码角度看，Redis 是一套根据数据规模动态选择编码的数据结构系统。
+
+这就是 Redis 数据结构值得深入研究的原因。

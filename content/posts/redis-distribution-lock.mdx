@@ -1,0 +1,1342 @@
+# Redis 分布式锁的正确与错误用法：从 SET NX EX 到 Redisson、RedLock 与生产边界
+
+## 前言
+
+Redis 分布式锁是后端面试和生产系统里非常高频的话题。
+
+很多人会这样回答：
+
+```text
+用 SETNX 加锁，用 DEL 解锁。
+```
+
+这个答案在面试里通常是不够的，在生产里甚至是危险的。
+
+Redis 分布式锁真正要解决的问题是：
+
+```text
+在分布式系统中，多个进程、多个服务实例、多个机器同时竞争同一份资源时，如何保证同一时刻只有一个执行者进入临界区。
+```
+
+典型场景包括：
+
+```text
+防止重复提交
+订单状态流转互斥
+定时任务抢占
+缓存重建互斥
+库存预扣减保护
+幂等处理
+任务调度抢锁
+第三方接口调用限频
+```
+
+但是，Redis 锁不是万能锁。
+
+它适合解决的是：
+
+```text
+短时间、低成本、可容忍一定异常补偿的互斥问题。
+```
+
+它不适合直接承担：
+
+```text
+强一致交易锁
+资金账务锁
+不可重复执行的核心写入锁
+长事务锁
+跨多资源复杂事务锁
+```
+
+本文从开发、架构和源码三个角度拆解 Redis 分布式锁：
+
+```text
+1. Redis 锁解决什么问题？
+2. 常见错误写法有哪些？
+3. 正确的 SET NX EX 写法是什么？
+4. 为什么 value 必须唯一？
+5. 为什么释放锁必须用 Lua？
+6. 锁超时和业务执行时间怎么设计？
+7. 锁续期怎么做？
+8. Redisson 看门狗机制是什么？
+9. 主从切换为什么会导致锁安全问题？
+10. RedLock 到底解决了什么，又有什么争议？
+11. 大厂生产环境如何使用 Redis 锁？
+12. 面试怎么回答才有深度？
+```
+
+---
+
+# 一、Redis 分布式锁到底解决什么问题？
+
+先看一个典型问题。
+
+假设有多个服务实例同时处理同一个订单：
+
+```text
+服务 A：处理 orderId = 1001
+服务 B：处理 orderId = 1001
+服务 C：处理 orderId = 1001
+```
+
+如果没有互斥控制，可能出现：
+
+```text
+重复扣库存
+重复发优惠券
+重复调用支付回调
+重复执行定时任务
+重复重建缓存
+```
+
+分布式锁的目标是：
+
+```text
+同一时刻，只允许一个服务实例处理同一个资源。
+```
+
+资源通常可以抽象成一个 lock key：
+
+```text
+lock:order:1001
+lock:cache:product:1001
+lock:job:daily_report
+lock:sku:stock:2001
+```
+
+锁的本质不是 Redis 命令，而是业务临界区的边界设计。
+
+一个完整的锁模型包含：
+
+```text
+1. 加锁
+2. 执行业务
+3. 解锁
+4. 锁超时兜底
+5. 异常恢复
+6. 幂等保护
+```
+
+只写 `SETNX` 不是完整的分布式锁。
+
+---
+
+# 二、错误用法一：SETNX 后再 EXPIRE
+
+很多人第一版会这样写：
+
+```text
+SETNX lock:order:1001 1
+EXPIRE lock:order:1001 30
+```
+
+看起来没问题：先加锁，再设置过期时间。
+
+但这是错误写法。
+
+问题在于：
+
+```text
+SETNX 和 EXPIRE 是两个命令，不具备原子性。
+```
+
+如果执行完 `SETNX` 后，应用进程崩溃，还没来得及执行 `EXPIRE`，这个锁就永远不会过期。
+
+流程如下：
+
+```text
+客户端 A 执行 SETNX 成功
+客户端 A 进程崩溃
+EXPIRE 没有执行
+lock:order:1001 永久存在
+其他客户端永远拿不到锁
+```
+
+这就是死锁。
+
+所以，不能用 `SETNX + EXPIRE` 两条命令实现锁。
+
+---
+
+# 三、正确加锁：SET key value NX EX
+
+Redis 官方推荐的单实例锁基本写法是：
+
+```text
+SET lock:order:1001 requestId NX EX 30
+```
+
+含义是：
+
+```text
+NX：只有 key 不存在时才设置成功
+EX 30：锁 30 秒后自动过期
+requestId：锁的唯一持有者标识
+```
+
+这条命令是原子的。
+
+也就是说：
+
+```text
+加锁和设置过期时间在一个 Redis 命令里完成。
+```
+
+这避免了 `SETNX` 成功但 `EXPIRE` 失败导致的死锁问题。
+
+Go 风格伪代码：
+
+```go
+func TryLock(ctx context.Context, key string, value string, ttl time.Duration) (bool, error) {
+    return redis.SetNX(ctx, key, value, ttl).Result()
+}
+```
+
+使用方式：
+
+```go
+requestId := uuid.NewString()
+locked, err := TryLock(ctx, "lock:order:1001", requestId, 30*time.Second)
+if err != nil {
+    return err
+}
+
+if !locked {
+    return ErrLockFailed
+}
+```
+
+这里有一个关键点：
+
+```text
+value 不能随便写 1，必须写唯一值。
+```
+
+---
+
+# 四、为什么锁 value 必须唯一？
+
+很多错误写法是：
+
+```text
+SET lock:order:1001 1 NX EX 30
+```
+
+然后释放锁：
+
+```text
+DEL lock:order:1001
+```
+
+这很危险。
+
+因为锁可能已经过期，并被其他客户端重新获取。
+
+来看一个事故流程：
+
+```text
+1. 客户端 A 获取锁，value = 1，过期时间 30 秒
+2. 客户端 A 业务执行太久，超过 30 秒
+3. Redis 锁自动过期
+4. 客户端 B 获取同一个锁，value = 1
+5. 客户端 A 业务执行完，执行 DEL lock
+6. 客户端 A 删除了客户端 B 的锁
+7. 客户端 C 又获取锁
+8. 客户端 B 和客户端 C 同时执行临界区
+```
+
+问题出在：
+
+```text
+释放锁时没有确认这把锁是不是自己的。
+```
+
+所以 value 必须是唯一标识，例如：
+
+```text
+requestId = UUID
+requestId = traceId + instanceId + goroutineId
+requestId = snowflakeId
+```
+
+加锁：
+
+```text
+SET lock:order:1001 "clientA-uuid" NX EX 30
+```
+
+释放锁时必须判断：
+
+```text
+如果 GET lock 的 value 等于自己的 requestId，才允许删除。
+```
+
+---
+
+# 五、错误用法二：GET 判断后 DEL
+
+有人会这样解锁：
+
+```go
+if redis.Get(ctx, lockKey).Val() == requestId {
+    redis.Del(ctx, lockKey)
+}
+```
+
+这仍然是错误的。
+
+因为 `GET` 和 `DEL` 是两个命令，不具备原子性。
+
+事故流程：
+
+```text
+1. 客户端 A 执行 GET，发现 value 是自己的 requestId
+2. 客户端 A 准备 DEL
+3. 此时客户端 A 卡顿，锁过期
+4. 客户端 B 获取锁
+5. 客户端 A 恢复执行 DEL
+6. 客户端 A 删除了客户端 B 的锁
+```
+
+所以释放锁必须把“判断 value + 删除 key”合成一个原子操作。
+
+最常见方式是 Lua 脚本。
+
+---
+
+# 六、正确解锁：Lua 校验 value 后删除
+
+释放锁 Lua 脚本：
+
+```lua
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("DEL", KEYS[1])
+else
+    return 0
+end
+```
+
+含义：
+
+```text
+如果锁的 value 等于当前客户端 requestId，就删除；
+否则不删除。
+```
+
+因为 Lua 脚本在 Redis 中执行时具有原子性，所以不会被其他命令插入打断。
+
+Go 风格伪代码：
+
+```go
+var unlockScript = redis.NewScript(`
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("DEL", KEYS[1])
+else
+    return 0
+end
+`)
+
+func Unlock(ctx context.Context, key string, value string) error {
+    _, err := unlockScript.Run(ctx, redisClient, []string{key}, value).Result()
+    return err
+}
+```
+
+完整使用方式：
+
+```go
+func ProcessOrder(ctx context.Context, orderId int64) error {
+    lockKey := fmt.Sprintf("lock:order:%d", orderId)
+    requestId := uuid.NewString()
+
+    locked, err := redis.SetNX(ctx, lockKey, requestId, 30*time.Second).Result()
+    if err != nil {
+        return err
+    }
+
+    if !locked {
+        return ErrLockFailed
+    }
+
+    defer Unlock(ctx, lockKey, requestId)
+
+    return doBusiness(ctx, orderId)
+}
+```
+
+这才是 Redis 单实例锁的基本正确写法。
+
+---
+
+# 七、锁超时时间怎么设置？
+
+锁必须有过期时间，否则客户端崩溃后会死锁。
+
+但过期时间设置太短也会出问题。
+
+例如：
+
+```text
+锁 TTL = 5 秒
+业务执行 = 10 秒
+```
+
+流程：
+
+```text
+1. 客户端 A 获取锁，TTL 5 秒
+2. 客户端 A 业务还没执行完
+3. 锁自动过期
+4. 客户端 B 获取锁
+5. A 和 B 同时执行临界区
+```
+
+这叫锁提前过期。
+
+所以锁 TTL 应该大于业务执行时间。
+
+一个经验公式：
+
+```text
+锁 TTL > 业务 P99 执行时间 + 网络抖动 + GC/调度抖动 + 安全冗余
+```
+
+例如：
+
+```text
+业务平均耗时：200ms
+业务 P99：2s
+下游偶发抖动：3s
+安全冗余：5s
+
+锁 TTL 可以设置 10s ~ 15s
+```
+
+但 TTL 也不能无限长。
+
+TTL 太长的问题是：
+
+```text
+客户端崩溃后，其他请求要等很久才能继续。
+```
+
+所以锁 TTL 是一个可靠性和可用性的取舍。
+
+---
+
+# 八、锁续期：业务时间不确定怎么办？
+
+如果业务执行时间不确定，比如：
+
+```text
+调用多个下游 RPC
+处理大文件
+批量任务
+执行时间可能从几秒到几分钟
+```
+
+固定 TTL 很难设置。
+
+这时可以考虑锁续期。
+
+思路是：
+
+```text
+客户端持有锁期间，后台定时检查锁是否还是自己的；
+如果是自己的，就延长过期时间。
+```
+
+续期 Lua 脚本：
+
+```lua
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("PEXPIRE", KEYS[1], ARGV[2])
+else
+    return 0
+end
+```
+
+伪代码：
+
+```go
+func StartRenewal(ctx context.Context, lockKey, requestId string, ttl time.Duration) context.CancelFunc {
+    renewCtx, cancel := context.WithCancel(ctx)
+
+    go func() {
+        ticker := time.NewTicker(ttl / 3)
+        defer ticker.Stop()
+
+        for {
+            select {
+            case <-ticker.C:
+                RenewLock(renewCtx, lockKey, requestId, ttl)
+            case <-renewCtx.Done():
+                return
+            }
+        }
+    }()
+
+    return cancel
+}
+```
+
+使用：
+
+```go
+locked, _ := redis.SetNX(ctx, lockKey, requestId, 30*time.Second).Result()
+if !locked {
+    return ErrLockFailed
+}
+
+cancelRenewal := StartRenewal(ctx, lockKey, requestId, 30*time.Second)
+defer cancelRenewal()
+defer Unlock(ctx, lockKey, requestId)
+
+doBusiness()
+```
+
+续期要注意：
+
+```text
+1. 续期必须校验 value
+2. 业务结束必须停止续期
+3. 续期线程异常要告警
+4. 续期失败不能盲目继续执行业务
+5. 长时间任务最好不要只依赖 Redis 锁
+```
+
+---
+
+# 九、Redisson 看门狗机制
+
+Java 生态里，很多公司使用 Redisson 实现 Redis 分布式锁。
+
+Redisson 的一个核心能力是 Watchdog，也叫看门狗。
+
+Redisson 官方文档说明，如果持有锁的 Redisson 实例仍然存活，看门狗会持续延长锁过期时间；默认 watchdog 超时时间是 30 秒，可以通过 `Config.lockWatchdogTimeout` 调整。
+
+可以理解为：
+
+```text
+Redisson 加锁成功后，如果没有显式指定 leaseTime，
+它会启动看门狗自动续期。
+```
+
+默认逻辑大致是：
+
+```text
+锁默认过期时间 30 秒；
+每隔约 10 秒续期一次；
+只要客户端还活着，就继续续期；
+客户端崩溃后，无法续期，锁最终过期释放。
+```
+
+这解决了固定 TTL 不好估算的问题。
+
+但 Watchdog 不是万能的。
+
+需要注意：
+
+```text
+1. 如果业务线程阻塞，但 Redisson 进程还活着，锁可能持续续期；
+2. 如果网络分区，续期可能失败；
+3. 如果 Redis 抖动，续期可能失败；
+4. 如果业务逻辑死循环，锁可能长期不释放；
+5. 如果显式传了 leaseTime，部分场景下不会启用自动续期。
+```
+
+生产建议：
+
+```text
+短任务：可以使用固定 leaseTime；
+不确定耗时任务：可以使用 Watchdog；
+长任务：更推荐任务状态机 + 幂等 + 补偿，而不是长期持有 Redis 锁。
+```
+
+---
+
+# 十、Redis 锁适合哪些场景？
+
+Redis 锁适合“效率型锁”和“弱互斥锁”。
+
+例如：
+
+```text
+缓存重建互斥
+防止重复提交
+定时任务抢占
+短时间任务互斥
+接口调用防并发
+临时资源占用
+轻量状态流转保护
+```
+
+这些场景的特点是：
+
+```text
+1. 锁持有时间短
+2. 即使极端情况下重复执行，也可以幂等或补偿
+3. 不涉及资金级强一致
+4. 对性能要求较高
+5. 可以接受最终一致
+```
+
+例如缓存重建：
+
+```text
+热点 key 失效后，只希望一个线程查数据库重建缓存。
+即使锁异常导致两个线程都查了数据库，最多是多查几次，不会造成核心数据错误。
+```
+
+这种非常适合 Redis 锁。
+
+---
+
+# 十一、Redis 锁不适合哪些场景？
+
+Redis 锁不适合“正确性完全依赖锁”的核心场景。
+
+例如：
+
+```text
+账户余额扣减
+支付状态最终确认
+订单最终状态变更
+库存最终扣减
+唯一资源强占用
+金融交易流水
+不可重复发货
+```
+
+这些场景里，如果锁失效导致两个客户端同时进入临界区，可能造成严重业务错误。
+
+正确做法通常是：
+
+```text
+数据库唯一约束
+数据库事务
+乐观锁 version
+状态机 CAS
+幂等表
+消息事务
+强一致协调服务
+业务补偿
+```
+
+例如订单状态更新，不应该只靠 Redis 锁：
+
+```sql
+UPDATE orders
+SET status = 'PAID'
+WHERE id = 1001 AND status = 'INIT';
+```
+
+用数据库状态条件保证最终正确性。
+
+Redis 锁可以作为减少并发冲突的优化，但不能作为唯一正确性保障。
+
+---
+
+# 十二、主从切换下 Redis 锁的安全问题
+
+单实例 Redis 锁有一个重要风险：主从复制是异步的。
+
+事故流程：
+
+```text
+1. 客户端 A 在 Master 上获取锁成功
+2. Master 还没把锁同步到 Replica
+3. Master 宕机
+4. Replica 被提升为新 Master
+5. 新 Master 上没有这把锁
+6. 客户端 B 获取同一把锁成功
+7. A 和 B 同时认为自己持有锁
+```
+
+这就是 Redis 单主从架构下锁安全性的核心问题。
+
+它说明：
+
+```text
+Redis 主从高可用不能保证锁的强一致语义。
+```
+
+如果锁只是用于缓存重建、防重复提交这类效率优化，通常可以接受。
+
+如果锁用于资金、订单、库存等强正确性场景，这个风险不可接受。
+
+---
+
+# 十三、RedLock 是什么？
+
+RedLock 是 Redis 官方文档提出的一种分布式锁算法，用多个独立 Redis 节点来降低单点故障和异步复制风险。官方文档描述 RedLock 会在多个独立 Redis master 上尝试获取同一个锁，只有在多数节点加锁成功，并且总耗时小于锁有效期时，才认为获取锁成功。
+
+基本思路：
+
+```text
+准备 5 个相互独立的 Redis Master；
+客户端依次向 5 个节点尝试加锁；
+如果至少 3 个节点加锁成功；
+并且加锁总耗时小于锁 TTL；
+则认为加锁成功。
+```
+
+释放锁时，需要向所有节点发送释放脚本。
+
+RedLock 试图解决的问题是：
+
+```text
+单 Redis 实例挂掉或主从切换导致锁丢失。
+```
+
+---
+
+# 十四、RedLock 的争议
+
+RedLock 并不是没有争议。
+
+Martin Kleppmann 在经典文章《How to do distributed locking》中提出，使用分布式锁要先区分锁的目的：如果锁只是为了效率，单 Redis 锁通常已经足够；如果锁是为了正确性，那么需要非常谨慎，因为在网络延迟、进程暂停、时钟问题等场景下，RedLock 仍然不能替代真正的一致性系统。
+
+这个观点很重要。
+
+可以这样理解：
+
+```text
+如果锁失效只会导致重复做一点工作，这是效率问题；
+如果锁失效会导致数据损坏，这是正确性问题。
+```
+
+对于效率问题：
+
+```text
+Redis 单实例锁或 Redisson 锁通常够用。
+```
+
+对于正确性问题：
+
+```text
+应该使用数据库事务、唯一约束、CAS、ZooKeeper/etcd、共识协议或业务状态机。
+```
+
+RedLock 的争议本质不是“能不能用”，而是：
+
+```text
+不要把 RedLock 当成强一致分布式事务锁。
+```
+
+---
+
+# 十五、源码视角：Redis 为什么能保证单命令原子性？
+
+Redis 锁依赖一个关键前提：
+
+```text
+SET NX EX 是单命令原子执行的。
+Lua 脚本也是原子执行的。
+```
+
+Redis 核心命令执行由主线程顺序处理。
+
+一个命令执行期间，其他命令不会插入执行。
+
+所以：
+
+```text
+SET lock value NX EX 30
+```
+
+不会被拆成两半。
+
+Lua 脚本：
+
+```lua
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("DEL", KEYS[1])
+else
+    return 0
+end
+```
+
+也会作为整体执行。
+
+源码上可以关注：
+
+```text
+src/t_string.c：SET 命令实现
+src/eval.c：Lua 脚本执行
+src/server.c：命令执行主流程
+src/db.c：key 读写和过期处理
+src/expire.c：过期 key 处理
+```
+
+大致链路：
+
+```text
+客户端请求
+  -> readQueryFromClient
+  -> processInputBuffer
+  -> processCommand
+  -> call
+  -> setCommand / evalCommand
+  -> 修改 Redis 内存数据
+```
+
+锁的原子性来自 Redis 命令执行模型，而不是来自客户端。
+
+---
+
+# 十六、Redis 锁和数据库锁的关系
+
+Redis 锁不是数据库锁的替代品。
+
+更合理的关系是：
+
+```text
+Redis 锁：减少并发进入，降低冲突，保护外部资源。
+数据库约束：保证最终正确性。
+```
+
+例如优惠券领取：
+
+错误做法：
+
+```text
+只用 Redis 锁保证一个用户只能领取一次。
+```
+
+正确做法：
+
+```text
+Redis 锁减少并发；
+数据库唯一索引保证 userId + couponId 唯一；
+业务幂等处理重复请求。
+```
+
+数据库表：
+
+```sql
+CREATE UNIQUE INDEX uk_user_coupon ON user_coupon(user_id, coupon_id);
+```
+
+业务逻辑：
+
+```text
+1. 尝试获取 Redis 锁
+2. 查询是否已领取
+3. 插入领取记录
+4. 如果唯一索引冲突，说明已经领过
+5. 释放锁
+```
+
+即使 Redis 锁极端情况下失效，数据库唯一约束仍然兜底。
+
+这就是大厂实践里非常重要的思想：
+
+```text
+Redis 锁做前置削峰；
+数据库约束做最终防线。
+```
+
+---
+
+# 十七、生产级 Redis 锁模板
+
+一个相对完整的 Redis 锁封装应该包含：
+
+```text
+1. tryLock
+2. unlock
+3. 唯一 requestId
+4. TTL
+5. Lua 解锁
+6. 可选续期
+7. 重试策略
+8. 超时控制
+9. 指标监控
+10. 业务幂等兜底
+```
+
+Go 风格接口：
+
+```go
+type DistributedLock interface {
+    TryLock(ctx context.Context, key string, ttl time.Duration) (LockToken, bool, error)
+    Unlock(ctx context.Context, token LockToken) error
+}
+
+type LockToken struct {
+    Key   string
+    Value string
+}
+```
+
+实现：
+
+```go
+func (l *RedisLock) TryLock(ctx context.Context, key string, ttl time.Duration) (LockToken, bool, error) {
+    value := uuid.NewString()
+
+    ok, err := l.client.SetNX(ctx, key, value, ttl).Result()
+    if err != nil {
+        return LockToken{}, false, err
+    }
+
+    return LockToken{Key: key, Value: value}, ok, nil
+}
+```
+
+解锁：
+
+```go
+func (l *RedisLock) Unlock(ctx context.Context, token LockToken) error {
+    script := `
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("DEL", KEYS[1])
+else
+    return 0
+end`
+
+    _, err := l.client.Eval(ctx, script, []string{token.Key}, token.Value).Result()
+    return err
+}
+```
+
+业务使用：
+
+```go
+token, ok, err := lock.TryLock(ctx, "lock:order:1001", 30*time.Second)
+if err != nil {
+    return err
+}
+
+if !ok {
+    return ErrConcurrentOperation
+}
+
+defer lock.Unlock(ctx, token)
+
+return processOrder(ctx, orderId)
+```
+
+---
+
+# 十八、重试策略怎么设计？
+
+抢锁失败后，不建议无脑死循环。
+
+错误写法：
+
+```go
+for {
+    ok := TryLock()
+    if ok {
+        break
+    }
+}
+```
+
+这会把 Redis 打爆。
+
+更合理的重试：
+
+```text
+有限次数
+指数退避
+随机 jitter
+整体超时控制
+可中断 context
+```
+
+伪代码：
+
+```go
+func TryLockWithRetry(ctx context.Context, key string, ttl time.Duration, maxRetry int) (LockToken, bool, error) {
+    for i := 0; i < maxRetry; i++ {
+        token, ok, err := TryLock(ctx, key, ttl)
+        if err != nil {
+            return LockToken{}, false, err
+        }
+
+        if ok {
+            return token, true, nil
+        }
+
+        sleep := time.Duration(20+i*20+rand.Intn(20)) * time.Millisecond
+
+        select {
+        case <-time.After(sleep):
+        case <-ctx.Done():
+            return LockToken{}, false, ctx.Err()
+        }
+    }
+
+    return LockToken{}, false, nil
+}
+```
+
+重试的原则是：
+
+```text
+锁是削峰工具，不应该因为抢锁失败制造更大的流量。
+```
+
+---
+
+# 十九、Redis 锁监控指标
+
+生产环境不能只封装锁，还要监控锁。
+
+建议监控：
+
+```text
+加锁成功次数
+加锁失败次数
+加锁耗时
+锁持有时间
+解锁失败次数
+锁续期次数
+锁续期失败次数
+锁竞争次数
+锁超时次数
+业务执行超时次数
+同一 lock key 的热点程度
+```
+
+特别要关注：
+
+```text
+锁持有时间是否接近 TTL；
+续期失败是否增多；
+某些 lock key 是否竞争特别激烈；
+解锁返回 0 的比例是否异常。
+```
+
+`解锁返回 0` 可能说明：
+
+```text
+锁已经过期；
+锁已经被其他客户端持有；
+业务执行时间超过 TTL；
+requestId 不匹配；
+重复解锁。
+```
+
+这些都应该进入日志和监控。
+
+---
+
+# 二十、常见错误用法总结
+
+## 错误一：SETNX 后再 EXPIRE
+
+```text
+SETNX lock key
+EXPIRE lock 30
+```
+
+问题：
+
+```text
+两个命令非原子，可能死锁。
+```
+
+正确：
+
+```text
+SET lock value NX EX 30
+```
+
+---
+
+## 错误二：value 固定写 1
+
+```text
+SET lock 1 NX EX 30
+```
+
+问题：
+
+```text
+无法判断锁是不是自己的。
+```
+
+正确：
+
+```text
+SET lock uniqueRequestId NX EX 30
+```
+
+---
+
+## 错误三：直接 DEL 解锁
+
+```text
+DEL lock
+```
+
+问题：
+
+```text
+可能删除别人的锁。
+```
+
+正确：
+
+```text
+Lua 校验 value 后 DEL。
+```
+
+---
+
+## 错误四：锁 TTL 太短
+
+问题：
+
+```text
+业务未执行完锁就过期，多个客户端同时进入临界区。
+```
+
+正确：
+
+```text
+TTL 大于业务 P99 + 抖动 + 冗余；
+必要时续期。
+```
+
+---
+
+## 错误五：无限重试抢锁
+
+问题：
+
+```text
+锁竞争越激烈，Redis 压力越大。
+```
+
+正确：
+
+```text
+有限重试 + 退避 + jitter + 超时控制。
+```
+
+---
+
+## 错误六：把 Redis 锁当强一致事务锁
+
+问题：
+
+```text
+主从切换、网络分区、客户端暂停都可能破坏锁语义。
+```
+
+正确：
+
+```text
+Redis 锁做削峰和互斥优化；
+数据库约束、状态机、幂等保证最终正确性。
+```
+
+---
+
+# 二十一、大厂实践：Redis 锁应该怎么落地？
+
+## 1. 锁粒度要合理
+
+锁粒度太粗：
+
+```text
+lock:order
+```
+
+会导致所有订单操作串行，吞吐低。
+
+锁粒度太细：
+
+```text
+lock:order:1001:field:status:subtask:xxx
+```
+
+会导致复杂度过高，容易漏锁。
+
+推荐：
+
+```text
+lock:order:{orderId}
+lock:sku:{skuId}
+lock:cache:product:{productId}
+lock:job:{jobName}
+```
+
+锁粒度应该和业务互斥资源一致。
+
+---
+
+## 2. 锁内代码要短
+
+锁保护的临界区越短越好。
+
+锁内避免：
+
+```text
+长 RPC
+慢 SQL
+大文件处理
+外部接口长等待
+复杂循环
+人工审核流程
+```
+
+如果锁内逻辑很长，应该考虑拆成：
+
+```text
+状态机
+任务队列
+异步处理
+数据库 CAS
+分阶段提交
+```
+
+---
+
+## 3. 必须有幂等兜底
+
+任何分布式锁都不能替代幂等。
+
+例如订单支付回调：
+
+```text
+Redis 锁防止并发处理；
+订单状态机防止重复流转；
+支付流水唯一索引防止重复入账；
+消息消费记录防止重复消费。
+```
+
+成熟架构通常是多层防线：
+
+```text
+第一层：Redis 锁减少并发
+第二层：数据库状态条件更新
+第三层：唯一索引保证幂等
+第四层：补偿任务修复异常
+```
+
+---
+
+## 4. 锁失败要有业务语义
+
+抢不到锁时，不要简单返回系统错误。
+
+要根据业务处理：
+
+```text
+重复提交：返回“处理中，请勿重复提交”
+缓存重建：返回旧值或稍后重试
+定时任务：跳过本轮
+订单操作：提示正在处理
+库存操作：进入排队或失败重试
+```
+
+锁失败不是技术异常，而是业务并发状态。
+
+---
+
+# 二十二、面试表达
+
+## 1. Redis 分布式锁怎么实现？
+
+可以这样回答：
+
+> Redis 分布式锁不能用简单的 SETNX 后再 EXPIRE，因为两个命令不是原子操作，可能导致死锁。正确方式是使用 `SET key value NX EX ttl`，其中 value 必须是唯一 requestId，用来标识锁持有者。释放锁时不能直接 DEL，需要用 Lua 脚本先判断 value 是否等于自己的 requestId，如果相等再删除，保证判断和删除的原子性。
+
+---
+
+## 2. 为什么释放锁要用 Lua？
+
+可以这样回答：
+
+> 因为如果先 GET 判断 value，再 DEL 删除，这是两个命令，中间锁可能过期并被其他客户端重新获取。此时原客户端继续 DEL，就会删除别人的锁。Lua 脚本可以把 GET 判断和 DEL 删除放在 Redis 里原子执行，避免这个竞态问题。
+
+---
+
+## 3. 锁过期时间怎么设置？
+
+可以这样回答：
+
+> 锁必须设置过期时间，防止客户端崩溃后死锁。过期时间应该大于业务执行 P99 时间，再加上网络抖动、GC 停顿和安全冗余。如果业务执行时间不确定，可以使用锁续期机制，比如 Redisson 的 Watchdog。但长时间任务不建议只依赖 Redis 锁，更适合用任务状态机、幂等和补偿机制。
+
+---
+
+## 4. Redis 主从切换会影响锁安全吗？
+
+可以这样回答：
+
+> 会。Redis 主从复制通常是异步的。如果客户端在 Master 上加锁成功，但锁还没同步到 Replica，Master 就宕机了，Replica 被提升为新 Master，那么新 Master 上可能没有这把锁，其他客户端就能再次加锁成功，导致两个客户端同时进入临界区。所以 Redis 单实例或主从锁不适合强一致正确性场景。
+
+---
+
+## 5. RedLock 是什么？能不能保证强一致？
+
+可以这样回答：
+
+> RedLock 是 Redis 官方提出的基于多个独立 Redis Master 的分布式锁算法。客户端需要在多数节点加锁成功，并且总耗时小于锁有效期，才认为获取锁成功。它比单实例锁能降低单点故障风险，但业界也有争议。Martin Kleppmann 认为，如果锁只是为了效率，单 Redis 锁通常够用；如果锁用于正确性，RedLock 仍不能替代共识系统或数据库事务。所以生产中不能把 RedLock 当作强一致事务锁。
+
+---
+
+# 二十三、总结
+
+Redis 分布式锁的正确实现可以总结为：
+
+```text
+加锁：
+SET lockKey uniqueValue NX EX ttl
+
+解锁：
+Lua 判断 value 是否等于 uniqueValue，相等才 DEL
+
+续期：
+Lua 判断 value 后 PEXPIRE
+
+重试：
+有限重试 + 退避 + jitter + 超时控制
+
+兜底：
+数据库唯一约束 / 状态机 / 幂等 / 补偿
+```
+
+Redis 锁适合：
+
+```text
+缓存重建互斥
+防重复提交
+短任务互斥
+定时任务抢占
+轻量资源竞争
+```
+
+Redis 锁不适合单独承担：
+
+```text
+账户资金
+支付状态
+订单最终一致性
+库存最终扣减
+不可重复执行的核心交易
+```
+
+最终结论是：
+
+```text
+Redis 分布式锁可以用，但必须知道它的边界。
+```
+
+成熟的架构不是假设锁永远正确，而是：
+
+```text
+锁减少并发；
+幂等保证重复执行不出错；
+数据库约束保证最终正确；
+补偿机制修复异常状态。
+```
+
+这才是 Redis 分布式锁在生产环境里的正确用法。

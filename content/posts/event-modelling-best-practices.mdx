@@ -1,0 +1,1583 @@
+# 事件建模方法论：领域事件、集成事件、命令、状态变更与 Schema 设计
+
+## 前言
+
+很多团队刚开始用 Kafka 时，消息通常是这样设计的：
+
+```text
+topic: order_topic
+message:
+{
+  "orderId": "O1001",
+  "status": "PAID"
+}
+```
+
+或者：
+
+```text
+topic: common_msg
+message:
+{
+  "type": "send_sms",
+  "data": {}
+}
+```
+
+短期看，能用。
+
+但系统变复杂后，问题会快速暴露：
+
+```text
+这个消息是事件，还是命令？
+status=PAID 是状态变更，还是支付成功事件？
+消费者应该根据这个消息做什么？
+消息字段能不能删？
+事件版本怎么演进？
+同一个业务事件要不要给多个系统发不同格式？
+Topic 是按业务域拆，还是按事件类型拆？
+历史事件能不能重放？
+消费者重复消费会不会产生副作用？
+```
+
+Kafka 的难点从来不只是“怎么发消息”。
+
+真正难的是：
+
+```text
+如何把业务变化建模成稳定、清晰、可演进、可治理的事件契约。
+```
+
+从开发角度看，事件建模决定了代码怎么写、消费者怎么幂等、Schema 怎么维护。
+
+从架构角度看，事件建模决定了微服务如何解耦、数据如何流转、历史能否回放、系统能否长期演进。
+
+从源码和中间件角度看，Kafka 只负责存储、分区、复制、消费位点、事务、压缩和传输；Kafka 不理解你的业务事件语义。事件语义必须由业务架构设计出来。
+
+本文重点拆解：
+
+```text
+1. 什么是事件建模？
+2. 领域事件、集成事件、命令、状态变更分别是什么？
+3. 为什么不能把所有 Kafka 消息都叫事件？
+4. 事件 Schema 应该如何设计？
+5. Topic 应该如何和事件模型配合？
+6. 事件版本如何演进？
+7. 如何用 Outbox Pattern 发布集成事件？
+8. 如何通过小型订单案例落地？
+9. 大厂实践中如何治理事件体系？
+10. 面试和架构评审中如何表达？
+```
+
+---
+
+# 一、事件建模到底是在建什么？
+
+事件建模不是简单定义一个 JSON。
+
+它建的是：
+
+```text
+业务事实如何被表达；
+系统之间如何理解这件事实；
+消费者如何基于这件事实做出反应；
+未来字段变化时如何不破坏消费者；
+历史事件如何被回放和解释。
+```
+
+一个事件模型至少包含：
+
+```text
+事件名称
+事件类型
+事件发生时间
+事件唯一 ID
+事件版本
+聚合根 ID
+业务上下文
+Schema
+Topic
+消息 Key
+幂等标识
+兼容性策略
+回放策略
+```
+
+例如：
+
+```json
+{
+  "eventId": "evt_20260603_000001",
+  "eventType": "OrderPaid",
+  "eventVersion": 1,
+  "eventTime": "2026-06-03T10:00:00+09:00",
+  "aggregateType": "Order",
+  "aggregateId": "O1001",
+  "traceId": "trace_abc",
+  "producer": "order-service",
+  "payload": {
+    "orderId": "O1001",
+    "userId": 1001,
+    "paidAmount": 19900,
+    "currency": "JPY",
+    "paymentId": "P9001",
+    "paidAt": "2026-06-03T10:00:00+09:00"
+  }
+}
+```
+
+这不是“随便发一条消息”。
+
+它是一份服务之间的契约。
+
+---
+
+# 二、不要把所有消息都叫事件
+
+在 Kafka 系统里，常见消息可以分成四类：
+
+```text
+领域事件
+集成事件
+命令
+状态变更
+```
+
+它们很容易混在一起，但语义完全不同。
+
+---
+
+# 三、领域事件：领域内已经发生的业务事实
+
+领域事件，Domain Event，表示业务领域内已经发生的一件重要事实。
+
+它通常由领域模型产生，用过去式命名。
+
+例如订单领域：
+
+```text
+OrderCreated
+OrderPaid
+OrderCancelled
+OrderShipped
+OrderCompleted
+```
+
+支付领域：
+
+```text
+PaymentSucceeded
+PaymentFailed
+RefundCreated
+RefundSucceeded
+```
+
+库存领域：
+
+```text
+StockReserved
+StockDeducted
+StockReleased
+```
+
+领域事件的特点：
+
+```text
+发生在领域内部
+表达业务事实
+通常由聚合根产生
+命名使用过去式
+不关心谁会消费
+可以驱动领域内或领域间流程
+```
+
+例如：
+
+```text
+OrderPaid 表示订单已经支付成功。
+```
+
+它不是：
+
+```text
+请积分服务发积分。
+```
+
+也不是：
+
+```text
+请通知服务发短信。
+```
+
+它只表达一个事实：
+
+```text
+订单支付已经发生。
+```
+
+---
+
+## 1. 领域事件通常不等于 Kafka 消息
+
+领域事件首先是领域模型的一部分。
+
+它可以存在于应用内部：
+
+```text
+Order 聚合根状态从 CREATED -> PAID；
+产生 OrderPaid 领域事件；
+应用服务捕获领域事件；
+转换为集成事件发布到 Kafka。
+```
+
+也就是说：
+
+```text
+领域事件是业务模型；
+Kafka 消息是集成载体。
+```
+
+两者可以一一对应，也可以不完全一样。
+
+例如，内部领域事件可能包含复杂对象：
+
+```text
+OrderPaidDomainEvent
+```
+
+对外发布的 Kafka 集成事件可能只暴露部分字段：
+
+```text
+OrderPaidIntegrationEvent
+```
+
+这样可以避免内部模型直接泄露给外部系统。
+
+---
+
+# 四、集成事件：跨服务传播的事件契约
+
+集成事件，Integration Event，是用于跨服务、跨系统传播的事件。
+
+它的消费者可能是：
+
+```text
+其他微服务
+实时数仓
+搜索索引服务
+风控系统
+通知系统
+数据湖
+第三方系统
+```
+
+集成事件的特点：
+
+```text
+面向系统集成
+Schema 更稳定
+字段需要兼容演进
+要考虑权限和敏感信息
+要有 eventId 和 version
+通常通过 Kafka 发布
+消费者可能很多且不可控
+```
+
+例如：
+
+```json
+{
+  "eventId": "evt_001",
+  "eventType": "OrderPaid",
+  "eventVersion": 1,
+  "eventTime": "2026-06-03T10:00:00+09:00",
+  "aggregateType": "Order",
+  "aggregateId": "O1001",
+  "payload": {
+    "orderId": "O1001",
+    "userId": 1001,
+    "paidAmount": 19900,
+    "currency": "JPY",
+    "paymentId": "P9001"
+  }
+}
+```
+
+这个事件可以被多个系统独立消费：
+
+```text
+积分服务：发积分
+通知服务：发支付成功通知
+数仓服务：统计 GMV
+风控服务：分析异常支付
+搜索服务：更新订单索引
+```
+
+生产者不需要知道这些消费者存在。
+
+---
+
+## 1. 领域事件和集成事件的区别
+
+| 维度       | 领域事件                 | 集成事件                      |
+| -------- | -------------------- | ------------------------- |
+| 位置       | 领域内部                 | 服务之间                      |
+| 目标       | 表达领域事实               | 跨系统传播事实                   |
+| 生命周期     | 可短暂存在于应用内            | 需要长期兼容                    |
+| Schema   | 可贴近领域模型              | 必须稳定、可治理                  |
+| 消费者      | 领域内逻辑或应用服务           | 其他服务、数仓、外部系统              |
+| 是否适合直接暴露 | 不一定                  | 是                         |
+| 示例       | OrderPaidDomainEvent | OrderPaidIntegrationEvent |
+
+实践建议：
+
+```text
+内部领域事件可以更贴近代码模型；
+对外集成事件必须稳定、清晰、少泄露内部实现。
+```
+
+---
+
+# 五、命令：要求某个系统做一件事
+
+命令，Command，表达的是：
+
+```text
+希望目标系统执行某个动作。
+```
+
+命令通常使用祈使式或动词短语：
+
+```text
+CreateOrder
+ReserveStock
+SendSms
+DeductBalance
+CancelOrder
+```
+
+它和事件的最大区别是：
+
+```text
+命令是“请你做”；
+事件是“已经发生”。
+```
+
+例如：
+
+```text
+ReserveStock：请库存服务预占库存。
+StockReserved：库存已经预占成功。
+```
+
+命令通常有明确目标系统。
+
+事件通常没有明确目标系统。
+
+---
+
+## 1. Kafka 能不能传命令？
+
+可以，但要谨慎。
+
+Kafka 更适合事件流，但某些异步命令也可以通过 Kafka 传递。
+
+例如：
+
+```text
+异步生成报表
+异步发送营销短信
+异步图片处理任务
+异步同步第三方接口
+```
+
+这些更像任务队列或命令队列。
+
+如果使用 Kafka 传命令，要明确：
+
+```text
+Topic 是 command topic；
+消费者是明确的 worker；
+消息不应该被多个业务系统随意订阅；
+失败重试、幂等和超时要按任务模型设计。
+```
+
+例如：
+
+```text
+Topic: report_generate_commands
+Command: GenerateReport
+Consumer Group: report-worker
+```
+
+不建议把命令和领域事件混在同一个 Topic。
+
+错误示例：
+
+```text
+order_events 里既有 OrderCreated，又有 SendSmsCommand。
+```
+
+这会污染事件流语义。
+
+---
+
+# 六、状态变更：数据变了，但不一定是业务事件
+
+状态变更，State Change，表示某个数据字段发生变化。
+
+例如：
+
+```json
+{
+  "table": "orders",
+  "before": {
+    "status": "CREATED"
+  },
+  "after": {
+    "status": "PAID"
+  }
+}
+```
+
+这类消息常见于 CDC：
+
+```text
+MySQL binlog -> Debezium / Canal -> Kafka
+```
+
+状态变更的特点：
+
+```text
+贴近数据库表结构
+表达数据变化
+不一定有清晰业务语义
+适合数据同步
+适合搜索索引和数仓
+不一定适合业务服务直接编排
+```
+
+例如：
+
+```text
+orders.status 从 CREATED 变为 PAID
+```
+
+可能表示：
+
+```text
+订单支付成功
+```
+
+但也可能是：
+
+```text
+人工修正
+系统补偿
+测试数据修复
+状态迁移脚本
+```
+
+如果只看状态变更，下游可能无法准确理解业务意图。
+
+---
+
+## 1. 状态变更和领域事件的区别
+
+| 维度  | 状态变更                  | 领域事件       |
+| --- | --------------------- | ---------- |
+| 来源  | 数据库变更日志               | 业务领域模型     |
+| 语义  | 字段变化                  | 业务事实       |
+| 示例  | orders.status changed | OrderPaid  |
+| 适合  | 数据同步、索引、数仓            | 微服务协作、业务流程 |
+| 风险  | 语义弱、耦合表结构             | 需要建模成本     |
+| 消费者 | 数据系统更适合               | 业务系统更适合    |
+
+架构建议：
+
+```text
+数据同步可以用状态变更；
+业务协作优先用领域事件或集成事件。
+```
+
+---
+
+# 七、四类消息如何选择？
+
+可以用下面的判断方式。
+
+## 1. 你想表达“已经发生的业务事实”？
+
+使用事件：
+
+```text
+OrderCreated
+OrderPaid
+PaymentSucceeded
+StockReserved
+```
+
+## 2. 你想让某个系统执行动作？
+
+使用命令：
+
+```text
+GenerateReport
+SendSms
+ReserveStock
+```
+
+## 3. 你只是想同步数据库变化？
+
+使用状态变更 / CDC：
+
+```text
+orders table update
+user table insert
+product table delete
+```
+
+## 4. 你要跨系统长期传播业务事实？
+
+使用集成事件：
+
+```text
+OrderPaidIntegrationEvent
+UserRegisteredIntegrationEvent
+```
+
+总结：
+
+```text
+业务流程解耦：集成事件
+领域内部建模：领域事件
+异步任务派发：命令
+数据同步分析：状态变更 / CDC
+```
+
+---
+
+# 八、Schema 设计：事件契约的核心
+
+事件一旦进入 Kafka，就可能被很多消费者依赖。
+
+所以 Schema 设计必须谨慎。
+
+一个生产级事件通常分为两层：
+
+```text
+Envelope：事件信封，统一元数据
+Payload：业务负载，按事件类型变化
+```
+
+---
+
+## 1. Envelope 设计
+
+推荐统一事件信封：
+
+```json
+{
+  "eventId": "evt_20260603_000001",
+  "eventType": "OrderPaid",
+  "eventVersion": 1,
+  "eventTime": "2026-06-03T10:00:00+09:00",
+  "producer": "order-service",
+  "aggregateType": "Order",
+  "aggregateId": "O1001",
+  "traceId": "trace_abc",
+  "schemaVersion": "order-paid.v1",
+  "payload": {}
+}
+```
+
+字段说明：
+
+```text
+eventId：全局唯一事件 ID，用于幂等和追踪
+eventType：事件类型
+eventVersion：事件版本
+eventTime：业务事件发生时间
+producer：生产者服务
+aggregateType：聚合根类型
+aggregateId：聚合根 ID
+traceId：链路追踪 ID
+schemaVersion：Schema 版本
+payload：业务数据
+```
+
+这些字段应该成为公司级事件规范。
+
+---
+
+## 2. Payload 设计
+
+以 `OrderPaid` 为例：
+
+```json
+{
+  "orderId": "O1001",
+  "userId": 1001,
+  "paymentId": "P9001",
+  "paidAmount": 19900,
+  "currency": "JPY",
+  "paidAt": "2026-06-03T10:00:00+09:00",
+  "paymentMethod": "CREDIT_CARD"
+}
+```
+
+注意字段语义：
+
+```text
+金额要明确单位，推荐用最小货币单位，例如分、日元整数；
+时间要明确时区；
+ID 要稳定；
+枚举要有兼容策略；
+可选字段要有默认值或 nullable；
+不要塞大对象；
+不要泄露敏感字段。
+```
+
+错误示例：
+
+```json
+{
+  "amount": 199,
+  "time": "10:00",
+  "status": 2
+}
+```
+
+问题：
+
+```text
+amount 单位不清楚；
+time 没日期和时区；
+status=2 语义不清楚；
+消费者容易误解。
+```
+
+---
+
+# 九、Schema 版本演进
+
+事件 Schema 最大的问题不是第一版怎么写，而是后续怎么改。
+
+常见变更：
+
+```text
+新增字段
+删除字段
+字段改名
+字段类型变化
+字段语义变化
+枚举值新增
+嵌套结构变化
+```
+
+其中最危险的是：
+
+```text
+删除字段；
+修改字段类型；
+修改字段语义；
+改变金额单位；
+改变事件触发时机。
+```
+
+---
+
+## 1. 兼容变更
+
+通常可以接受：
+
+```text
+新增可选字段；
+新增有默认值字段；
+新增枚举但消费者有 unknown 处理；
+payload 增加非必需信息。
+```
+
+例如：
+
+```json
+{
+  "couponId": "C1001"
+}
+```
+
+如果旧消费者忽略未知字段，就不会受影响。
+
+---
+
+## 2. 不兼容变更
+
+通常不允许直接改：
+
+```text
+删除 userId；
+paidAmount 从 int 改 string；
+currency 从 JPY 改成 392；
+paidAmount 从最小货币单位改成元；
+OrderPaid 触发时机从支付完成改成支付处理中。
+```
+
+这些会破坏消费者理解。
+
+不兼容变更应该：
+
+```text
+发布新版本事件；
+或者创建新 Topic；
+或者并行发布 v1 和 v2 一段时间；
+消费者迁移后下线旧版本。
+```
+
+---
+
+## 3. Schema Registry
+
+大规模团队通常会引入 Schema Registry。
+
+Schema Registry 支持 Avro、JSON Schema、Protobuf 等格式，并提供兼容性检查；Confluent 文档也说明，默认兼容模式是 BACKWARD，主要原因之一是便于消费者从 Topic 开头回放旧消息。
+
+常见兼容模式：
+
+```text
+BACKWARD：新消费者可以读旧消息
+FORWARD：旧消费者可以读新消息
+FULL：前后兼容
+BACKWARD_TRANSITIVE：新消费者能读所有历史版本
+FULL_TRANSITIVE：前后都兼容所有历史版本
+NONE：不做兼容检查
+```
+
+生产建议：
+
+```text
+核心事件至少使用 BACKWARD；
+需要长期回放的事件考虑 BACKWARD_TRANSITIVE；
+多团队共享事件不允许 NONE；
+破坏性变更必须评审。
+```
+
+---
+
+# 十、Topic 设计和事件模型的关系
+
+事件模型不是孤立的，它必须和 Topic 设计配合。
+
+常见 Topic 设计方式：
+
+```text
+按业务域：order_events、payment_events
+按事件类型：order_paid_events
+按数据层：orders_cdc
+按命令类型：send_sms_commands
+按数仓层：ods_order_events、dwd_order_paid
+```
+
+---
+
+## 1. 领域事件 Topic
+
+推荐：
+
+```text
+order_events
+payment_events
+inventory_events
+```
+
+特点：
+
+```text
+承载某个业务域的集成事件；
+事件类型通过 eventType 区分；
+message key 通常是 aggregateId；
+适合微服务解耦。
+```
+
+---
+
+## 2. 命令 Topic
+
+推荐：
+
+```text
+report_generate_commands
+sms_send_commands
+```
+
+特点：
+
+```text
+有明确目标消费者；
+通常是任务队列；
+不建议多个系统随意订阅；
+需要任务状态、重试、死信。
+```
+
+---
+
+## 3. CDC Topic
+
+推荐：
+
+```text
+mysql.orders
+mysql.users
+ods_orders_binlog
+```
+
+特点：
+
+```text
+承载数据库变更；
+适合数据同步；
+不建议作为业务编排的唯一事件来源。
+```
+
+---
+
+## 4. 数仓 Topic
+
+推荐：
+
+```text
+ods_order_events
+dwd_order_paid_detail
+dws_user_order_summary
+```
+
+特点：
+
+```text
+服务于数据处理分层；
+面向 Flink / Spark / ClickHouse / 数据湖；
+重视时间字段、维度字段、数据质量。
+```
+
+---
+
+# 十一、实战案例：订单创建和支付的事件建模
+
+下面用一个小型电商订单模块来演示。
+
+## 1. 业务流程
+
+```text
+用户提交订单
+订单创建成功
+用户支付订单
+支付成功
+订单状态变成 PAID
+积分服务发积分
+库存服务扣减库存
+通知服务发通知
+实时数仓统计 GMV
+```
+
+---
+
+## 2. 不推荐的消息设计
+
+错误消息 1：
+
+```json
+{
+  "type": "update_order",
+  "orderId": "O1001",
+  "status": "PAID"
+}
+```
+
+问题：
+
+```text
+这是命令还是事件不清楚；
+status=PAID 缺少业务语义；
+不知道是否支付成功、人工修正还是补偿更新；
+缺少 eventId；
+缺少版本；
+缺少发生时间；
+缺少金额和支付信息；
+难以幂等和回放。
+```
+
+错误消息 2：
+
+```json
+{
+  "type": "send_points",
+  "userId": 1001,
+  "points": 199
+}
+```
+
+问题：
+
+```text
+这是命令，不是订单事件；
+订单服务不应该直接指挥积分服务怎么做；
+积分规则变化后订单服务也要改；
+服务耦合。
+```
+
+---
+
+## 3. 推荐的领域事件
+
+订单领域内部可以产生：
+
+```text
+OrderCreated
+OrderPaid
+OrderCancelled
+```
+
+支付领域可以产生：
+
+```text
+PaymentSucceeded
+PaymentFailed
+```
+
+库存领域可以产生：
+
+```text
+StockReserved
+StockDeducted
+StockReleased
+```
+
+---
+
+## 4. 推荐的集成事件：OrderCreated
+
+Topic：
+
+```text
+order_events
+```
+
+Message key：
+
+```text
+orderId
+```
+
+Schema：
+
+```json
+{
+  "eventId": "evt_order_created_000001",
+  "eventType": "OrderCreated",
+  "eventVersion": 1,
+  "eventTime": "2026-06-03T10:00:00+09:00",
+  "producer": "order-service",
+  "aggregateType": "Order",
+  "aggregateId": "O1001",
+  "traceId": "trace_001",
+  "payload": {
+    "orderId": "O1001",
+    "userId": 1001,
+    "amount": 19900,
+    "currency": "JPY",
+    "items": [
+      {
+        "skuId": "S1001",
+        "quantity": 2,
+        "unitPrice": 9950
+      }
+    ],
+    "createdAt": "2026-06-03T10:00:00+09:00"
+  }
+}
+```
+
+消费者：
+
+```text
+库存服务：预占库存
+通知服务：订单创建通知
+风控服务：订单风险评估
+实时数仓：订单创建指标
+```
+
+订单服务不关心这些消费者。
+
+---
+
+## 5. 推荐的集成事件：OrderPaid
+
+Topic：
+
+```text
+order_events
+```
+
+Message key：
+
+```text
+orderId
+```
+
+Schema：
+
+```json
+{
+  "eventId": "evt_order_paid_000001",
+  "eventType": "OrderPaid",
+  "eventVersion": 1,
+  "eventTime": "2026-06-03T10:05:00+09:00",
+  "producer": "order-service",
+  "aggregateType": "Order",
+  "aggregateId": "O1001",
+  "traceId": "trace_002",
+  "payload": {
+    "orderId": "O1001",
+    "userId": 1001,
+    "paymentId": "P9001",
+    "paidAmount": 19900,
+    "currency": "JPY",
+    "paidAt": "2026-06-03T10:05:00+09:00",
+    "paymentMethod": "CREDIT_CARD"
+  }
+}
+```
+
+消费者：
+
+```text
+积分服务：根据 OrderPaid 发积分
+通知服务：发送支付成功通知
+数仓服务：统计 GMV
+搜索服务：更新订单索引
+风控服务：支付行为分析
+```
+
+积分服务不应该等订单服务发 `SendPointsCommand`。
+
+它应该订阅 `OrderPaid`，根据自己的积分规则决定是否发积分。
+
+这样积分规则变化不影响订单服务。
+
+---
+
+## 6. 消费端幂等设计
+
+积分服务消费 `OrderPaid`：
+
+```sql
+CREATE TABLE point_record (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    event_id VARCHAR(128) NOT NULL,
+    order_id VARCHAR(64) NOT NULL,
+    user_id BIGINT NOT NULL,
+    points INT NOT NULL,
+    source_type VARCHAR(32) NOT NULL,
+    create_time DATETIME NOT NULL,
+    UNIQUE KEY uk_event_id (event_id),
+    UNIQUE KEY uk_order_source (order_id, source_type)
+);
+```
+
+处理逻辑：
+
+```text
+1. 收到 OrderPaid
+2. 根据 eventId 查重
+3. 根据 orderId + sourceType 插入积分流水
+4. 唯一键冲突说明已处理
+5. 提交 offset
+```
+
+这样事件重复消费不会重复发积分。
+
+---
+
+# 十二、Outbox Pattern 与事件建模
+
+生产中不建议在数据库提交后直接发 Kafka。
+
+更推荐：
+
+```text
+业务表 + outbox_event 表同事务；
+Outbox 事件通过轮询或 CDC 发布到 Kafka。
+```
+
+Debezium 的 Outbox Event Router 支持从 outbox 表读取聚合 ID、事件类型、payload 等字段并路由到 Kafka 事件；Debezium Outbox 扩展也强调其目标是将 Outbox Pattern 与 Debezium CDC 管道结合，可靠、异步地向消费者共享数据。
+
+典型 outbox 表：
+
+```sql
+CREATE TABLE outbox_event (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    event_id VARCHAR(128) NOT NULL,
+    aggregate_type VARCHAR(64) NOT NULL,
+    aggregate_id VARCHAR(128) NOT NULL,
+    event_type VARCHAR(128) NOT NULL,
+    event_version INT NOT NULL,
+    topic VARCHAR(128) NOT NULL,
+    message_key VARCHAR(128) NOT NULL,
+    payload JSON NOT NULL,
+    status VARCHAR(32) NOT NULL,
+    create_time DATETIME NOT NULL,
+    update_time DATETIME NOT NULL,
+    UNIQUE KEY uk_event_id (event_id),
+    KEY idx_status_time (status, create_time)
+);
+```
+
+订单创建时：
+
+```text
+同一个 MySQL 事务：
+  INSERT orders
+  INSERT outbox_event(OrderCreated)
+```
+
+然后：
+
+```text
+Debezium / Canal 监听 outbox_event binlog；
+转换为 Kafka order_events；
+下游幂等消费。
+```
+
+这就是生产级事件发布闭环。
+
+---
+
+# 十三、源码视角：Kafka 不理解事件语义，但支撑事件契约
+
+Kafka Broker 不知道什么是 `OrderPaid`。
+
+它只知道：
+
+```text
+Topic
+Partition
+Offset
+Record key
+Record value
+Timestamp
+Headers
+ProducerId
+SequenceNumber
+Consumer Group offset
+```
+
+事件语义在业务层。
+
+但 Kafka 的底层机制支撑事件建模：
+
+```text
+Topic：事件流分类
+Partition：顺序和并行边界
+Key：同一聚合根路由到同一 Partition
+Offset：事件日志位置
+Retention：事件保留和回放
+Consumer Group：多消费者独立订阅
+Headers：携带 schemaId、traceId、tenant 等元信息
+Transactions：Kafka 内部多 Topic / offset 原子性
+Log Compaction：按 key 保留最新状态
+```
+
+---
+
+## 1. Producer 侧关注点
+
+源码方向：
+
+```text
+Partitioner
+RecordAccumulator
+ProducerBatch
+Sender
+TransactionManager
+```
+
+关注问题：
+
+```text
+message key 如何决定 Partition？
+事件如何被批量发送？
+headers 如何编码？
+幂等 Producer 如何避免重试重复？
+事务 Producer 如何提交多个 Topic 的消息？
+```
+
+---
+
+## 2. Broker 侧关注点
+
+源码方向：
+
+```text
+KafkaApis
+ReplicaManager
+Partition
+UnifiedLog
+GroupCoordinator
+```
+
+关注问题：
+
+```text
+事件如何追加到 Partition 日志？
+offset 如何分配？
+副本如何复制？
+Consumer Group offset 如何管理？
+```
+
+---
+
+## 3. Consumer 侧关注点
+
+源码方向：
+
+```text
+Fetcher
+ConsumerCoordinator
+SubscriptionState
+OffsetCommit
+```
+
+关注问题：
+
+```text
+消费者如何拉取事件？
+如何按 offset 顺序消费？
+如何提交进度？
+Rebalance 如何影响处理？
+```
+
+---
+
+## 4. Go Sarama 关注点
+
+Sarama 可以重点看：
+
+```text
+partitioner.go
+async_producer.go
+consumer_group.go
+consumer.go
+offset_manager.go
+produce_request.go
+fetch_request.go
+```
+
+建模落地时重点关注：
+
+```text
+ProducerMessage.Key 是否使用 aggregateId；
+ProducerMessage.Headers 是否携带 schemaVersion / traceId；
+AsyncProducer 是否处理 Errors；
+ConsumerGroup 是否处理幂等后再 MarkMessage；
+ConsumeClaim 是否避免同一 Partition 并发乱序；
+```
+
+---
+
+# 十四、大厂事件建模治理规范
+
+## 1. 事件命名规范
+
+推荐过去式：
+
+```text
+OrderCreated
+OrderPaid
+PaymentSucceeded
+StockReserved
+CouponIssued
+UserRegistered
+```
+
+不推荐：
+
+```text
+CreateOrder
+PayOrder
+DeductStock
+SendCoupon
+```
+
+---
+
+## 2. 事件分类规范
+
+每条 Kafka 消息要标识分类：
+
+```text
+DOMAIN_EVENT
+INTEGRATION_EVENT
+COMMAND
+STATE_CHANGE
+```
+
+至少在设计文档中明确。
+
+---
+
+## 3. 事件元数据规范
+
+必填字段：
+
+```text
+eventId
+eventType
+eventVersion
+eventTime
+producer
+aggregateType
+aggregateId
+traceId
+payload
+```
+
+---
+
+## 4. Schema 变更规范
+
+禁止直接：
+
+```text
+删除字段
+修改字段类型
+修改字段语义
+改变金额单位
+改变事件触发时机
+```
+
+允许：
+
+```text
+新增可选字段
+新增有默认值字段
+新增枚举并提供 unknown 处理
+```
+
+破坏性变更：
+
+```text
+新事件版本
+新 Topic
+双写灰度
+消费者迁移
+旧版本下线
+```
+
+---
+
+## 5. Topic 规范
+
+推荐：
+
+```text
+业务域_events
+业务域_commands
+数据库_cdc
+数仓层_业务域
+```
+
+例如：
+
+```text
+order_events
+payment_events
+report_generate_commands
+mysql.orders_cdc
+ods_order_events
+```
+
+---
+
+## 6. 回放规范
+
+事件是否允许回放必须明确。
+
+```text
+状态型消费者：允许回放
+副作用型消费者：谨慎回放
+```
+
+状态型：
+
+```text
+搜索索引
+实时数仓
+用户画像
+缓存重建
+```
+
+副作用型：
+
+```text
+发短信
+发优惠券
+扣款
+发货
+```
+
+---
+
+## 7. 消费者登记
+
+每个 Consumer Group 需要登记：
+
+```text
+消费 Topic
+消费事件类型
+消费目的
+是否有副作用
+幂等方式
+失败处理方式
+SLA
+负责人
+```
+
+否则事件体系会逐渐失控。
+
+---
+
+# 十五、常见错误总结
+
+## 错误一：把状态变更当领域事件
+
+```json
+{
+  "orderId": "O1001",
+  "status": "PAID"
+}
+```
+
+不如：
+
+```text
+OrderPaid
+```
+
+语义清晰。
+
+---
+
+## 错误二：把命令混进事件流
+
+```text
+order_events 里出现 SendSmsCommand
+```
+
+这会污染领域事件流。
+
+---
+
+## 错误三：事件缺少 eventId
+
+没有 eventId，下游很难做幂等、追踪和补偿。
+
+---
+
+## 错误四：事件字段过瘦
+
+只有 orderId，所有消费者都要回查订单服务。
+
+高峰时源服务被打爆，回放也不准确。
+
+---
+
+## 错误五：事件字段过胖
+
+把完整订单详情、图片、文件、用户隐私全塞进 Kafka。
+
+导致消息体过大、权限风险、Schema 难治理。
+
+---
+
+## 错误六：随意修改 Schema
+
+删除字段、改类型、改语义，会直接破坏消费者。
+
+---
+
+# 十六、面试表达
+
+## 1. 领域事件和集成事件有什么区别？
+
+可以这样回答：
+
+> 领域事件是领域模型内部产生的业务事实，比如 OrderPaid，它表达领域内已经发生的事情。集成事件是跨服务传播的事件契约，通常通过 Kafka 发布给其他系统消费。领域事件可以更贴近内部模型，而集成事件需要稳定、可版本化、可兼容演进，并且要控制暴露字段，不能把内部对象结构直接泄露给外部消费者。
+
+---
+
+## 2. 事件和命令有什么区别？
+
+可以这样回答：
+
+> 命令表达“请某个系统做某事”，通常是祈使式，比如 ReserveStock、SendSms；事件表达“某件事已经发生”，通常是过去式，比如 StockReserved、OrderPaid。命令一般有明确目标消费者，事件则是广播事实，生产者不关心谁消费。Kafka 更适合承载事件流，如果要承载命令，最好单独设计 command topic，避免和领域事件混在一起。
+
+---
+
+## 3. 状态变更和领域事件有什么区别？
+
+可以这样回答：
+
+> 状态变更是数据层语义，比如 orders.status 从 CREATED 变成 PAID，通常来自 CDC；领域事件是业务语义，比如 OrderPaid。状态变更适合做数据同步、搜索索引、数仓同步，但不一定适合业务编排，因为它依赖表结构且语义不完整。业务服务协作更推荐发布明确的领域事件或集成事件。
+
+---
+
+## 4. 事件 Schema 怎么设计？
+
+可以这样回答：
+
+> 生产级事件一般分为 envelope 和 payload。Envelope 里放 eventId、eventType、eventVersion、eventTime、producer、aggregateType、aggregateId、traceId、schemaVersion 等通用字段；payload 里放业务字段。字段要语义明确，比如金额要说明单位，时间要带时区，枚举要考虑 unknown，新增字段尽量可选，不能随便删除字段或修改字段语义。大规模团队通常用 Schema Registry 做兼容性校验。
+
+---
+
+## 5. 事件版本如何演进？
+
+可以这样回答：
+
+> 兼容变更可以新增可选字段或带默认值字段；不兼容变更，比如删除字段、改字段类型、改金额单位、改事件触发时机，应该发布新版本事件或新 Topic，并通过双写灰度让消费者迁移。核心事件应该使用 Schema Registry，并设置 BACKWARD 或 BACKWARD_TRANSITIVE 兼容策略，保证历史事件可回放。
+
+---
+
+# 十七、总结
+
+事件建模的核心不是“定义一个消息格式”，而是定义系统之间如何表达业务事实。
+
+四类消息要区分清楚：
+
+```text
+领域事件：领域内部已经发生的业务事实
+集成事件：跨服务传播的稳定事件契约
+命令：要求目标系统执行某个动作
+状态变更：数据库或状态字段发生变化
+```
+
+Kafka 可以承载这些消息，但不能替你区分它们。
+
+成熟的事件体系需要：
+
+```text
+清晰事件命名
+稳定 Schema
+统一 Envelope
+合理 Topic
+明确 message key
+版本兼容策略
+Outbox / CDC 可靠发布
+消费端幂等
+事件回放治理
+消费者登记和权限控制
+```
+
+一句话总结：
+
+```text
+事件建模决定了 Kafka 系统的上限；Kafka 只负责可靠流转，业务语义必须靠模型设计清楚。
+```

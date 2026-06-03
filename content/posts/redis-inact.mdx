@@ -1,0 +1,1510 @@
+# Redis 的典型业务场景与生产事故排查手册：慢命令、大 key、热 key、主从延迟与连接池耗尽
+
+## 前言
+
+Redis 在后端系统中经常被称为“缓存”，但在真实生产环境里，它承担的职责远不止缓存。
+
+它可能同时承担：
+
+```text id="3yrtua"
+缓存层
+计数器
+排行榜
+限流器
+分布式锁
+会话存储
+轻量消息流
+延迟队列
+实时统计
+热点数据层
+```
+
+也正因为 Redis 太好用，很多团队会把越来越多的业务数据和状态放进 Redis。早期看起来性能很好，但一旦业务量上来，问题就会集中爆发：
+
+```text id="s591xc"
+接口 P99 突然升高
+Redis CPU 飙高
+数据库被缓存 miss 打爆
+某个分片流量异常
+主从延迟越来越大
+客户端频繁 timeout
+连接池耗尽
+Redis 报 max number of clients reached
+缓存命中率突然下降
+```
+
+Redis 事故的难点在于：表面现象可能都是“接口慢”或“Redis timeout”，但底层原因可能完全不同。
+
+常见根因包括：
+
+```text id="ncmjhs"
+慢命令
+大 key
+热 key
+主从延迟
+连接池耗尽
+持久化抖动
+网络抖动
+客户端重试风暴
+缓存雪崩
+```
+
+本文分两部分：
+
+```text id="5spaxm"
+第一部分：Redis 的典型业务场景
+第二部分：Redis 生产事故排查手册
+```
+
+目标是建立一套从业务建模到线上排障的完整方法论。
+
+---
+
+# 一、Redis 在业务系统中的典型定位
+
+Redis 不是万能数据库，它最适合承担的是高频、低延迟、结构相对简单、生命周期可控的数据访问。
+
+常见定位可以概括为：
+
+```text id="8rersb"
+Redis = 高性能缓存层 + 实时状态层 + 原子数据结构工具箱 + 热点流量缓冲层
+```
+
+不适合 Redis 单独承担的职责：
+
+```text id="5px0eb"
+强一致交易数据
+复杂关系查询
+长事务
+大对象存储
+不可丢失的唯一事实数据源
+复杂离线分析
+```
+
+所以 Redis 用得好不好，第一步不是调参数，而是业务场景建模。
+
+---
+
+# 二、典型业务场景一：缓存
+
+缓存是 Redis 最常见的场景。
+
+典型链路：
+
+```text id="ypxz7k"
+请求进入服务
+  -> 查 Redis
+  -> 命中，直接返回
+  -> 未命中，查 DB
+  -> 回写 Redis
+  -> 返回结果
+```
+
+适合缓存的数据：
+
+```text id="0m8jq3"
+商品详情
+用户资料
+文章详情
+首页配置
+权限快照
+接口聚合结果
+搜索热词
+字典配置
+```
+
+缓存的核心价值：
+
+```text id="q3crur"
+降低数据库 QPS
+降低接口响应时间
+承接热点读流量
+```
+
+## 1. 缓存建模
+
+常见两种方式：
+
+```text id="13k7dl"
+String JSON：整对象缓存
+Hash：字段级缓存
+```
+
+例如商品详情：
+
+```text id="44zrfh"
+SET product:detail:1001 "{json}" EX 300
+```
+
+用户在线状态：
+
+```text id="u2ybji"
+HSET user:status:1001 online 1 lastActiveTime 1717392000
+```
+
+选择原则：
+
+```text id="pwjbw2"
+整对象读多：String JSON
+字段级读写多：Hash
+字段需要独立 TTL：拆成多个 String key
+对象过大：不要直接塞 Redis
+```
+
+## 2. 缓存事故风险
+
+缓存场景最常见事故：
+
+```text id="5vxu51"
+缓存穿透
+缓存击穿
+缓存雪崩
+大 key
+热 key
+缓存一致性问题
+```
+
+治理手段：
+
+```text id="ku8g9u"
+空值缓存
+布隆过滤器
+互斥锁重建
+逻辑过期
+TTL 随机化
+本地缓存
+限流降级
+缓存预热
+```
+
+---
+
+# 三、典型业务场景二：计数器
+
+Redis 的 `INCR` / `INCRBY` 适合做原子计数。
+
+示例：
+
+```text id="90dooi"
+INCR article:1001:view_count
+INCRBY user:1001:score 10
+DECR stock:sku:2001
+```
+
+适合场景：
+
+```text id="m4ebpi"
+阅读数
+播放数
+点赞数
+评论数
+接口调用次数
+短信发送次数
+限流计数
+积分临时变更
+```
+
+高频计数通常采用异步落库：
+
+```text id="qe5v8b"
+用户行为
+  -> Redis INCR
+  -> 定时任务聚合
+  -> 批量写入 MySQL / ClickHouse
+```
+
+注意：
+
+```text id="e266fb"
+Redis 计数适合统计类、高频类、可补偿类数据；
+不适合账户余额、财务金额、库存最终扣减等强一致数据。
+```
+
+---
+
+# 四、典型业务场景三：限流
+
+Redis 可以做分布式限流，因为多个服务实例可以共享同一个 Redis 计数状态。
+
+固定窗口限流示例：
+
+```text id="bkeez4"
+key = rate:user:1001:202606031030
+INCR key
+EXPIRE key 60
+```
+
+更严谨的实现应该用 Lua 保证 `INCR + EXPIRE` 的原子性：
+
+```lua id="82ju0q"
+local current = redis.call("INCR", KEYS[1])
+if current == 1 then
+    redis.call("EXPIRE", KEYS[1], ARGV[1])
+end
+return current
+```
+
+适合场景：
+
+```text id="9ga3aj"
+用户维度限流
+IP 维度限流
+接口维度限流
+租户维度限流
+短信验证码限流
+登录失败次数限制
+```
+
+限流设计要考虑：
+
+```text id="02cpqb"
+Redis 故障时默认放行还是拒绝
+限流 key 是否会形成热 key
+窗口粒度是否合理
+是否需要本地限流兜底
+是否需要网关限流提前拦截
+```
+
+---
+
+# 五、典型业务场景四：排行榜
+
+排行榜适合用 Sorted Set。
+
+模型：
+
+```text id="87d48s"
+member = 用户 / 商品 / 内容
+score = 分数 / 热度 / 时间权重
+```
+
+示例：
+
+```text id="tofjux"
+ZADD rank:game:1001 100 userA
+ZINCRBY rank:game:1001 50 userA
+ZREVRANGE rank:game:1001 0 9 WITHSCORES
+ZREVRANK rank:game:1001 userA
+```
+
+适合场景：
+
+```text id="14chup"
+游戏积分榜
+直播贡献榜
+商品销量榜
+文章热度榜
+用户活跃榜
+学习打卡榜
+```
+
+生产建议：
+
+```text id="1cksma"
+按天 / 周 / 月拆 key
+只保留 Top N
+历史榜单落库
+避免 ZRANGE 0 -1
+避免永久大榜无限膨胀
+```
+
+例如：
+
+```text id="l0r4ck"
+rank:game:1001:daily:20260603
+rank:game:1001:weekly:2026W23
+```
+
+---
+
+# 六、典型业务场景五：分布式锁
+
+Redis 锁适合短时间互斥。
+
+正确加锁：
+
+```text id="y5v79w"
+SET lock:order:1001 requestId NX EX 30
+```
+
+正确释放锁：
+
+```lua id="sssy2h"
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("DEL", KEYS[1])
+else
+    return 0
+end
+```
+
+适合：
+
+```text id="fnetrk"
+缓存重建互斥
+防重复提交
+短任务互斥
+定时任务抢占
+```
+
+不适合单独承担：
+
+```text id="8igr87"
+支付状态最终确认
+账户余额扣减
+订单核心状态流转
+库存最终扣减
+```
+
+生产原则：
+
+```text id="7ep07u"
+Redis 锁减少并发冲突；
+数据库唯一约束 / 状态机 / 幂等保证最终正确。
+```
+
+---
+
+# 七、典型业务场景六：消息流与延迟队列
+
+## 1. Stream 消息流
+
+Redis Stream 适合轻量消息流：
+
+```text id="phvh8m"
+XADD order:events * orderId 1001 status created
+XREADGROUP GROUP order_group consumer_1 COUNT 10 STREAMS order:events >
+XACK order:events order_group messageId
+```
+
+适合：
+
+```text id="22m073"
+业务内轻量异步
+事件通知
+操作日志流
+小规模任务队列
+```
+
+注意：
+
+```text id="9j720p"
+设置 MAXLEN
+监控 XPENDING
+消息体不要太大
+消费必须幂等
+核心链路不要直接替代 Kafka / RocketMQ
+```
+
+## 2. ZSet 延迟队列
+
+模型：
+
+```text id="xxj8q9"
+member = taskId
+score = 执行时间戳
+```
+
+示例：
+
+```text id="86wgx8"
+ZADD delay:order:cancel 1717392000 orderId:1001
+ZRANGEBYSCORE delay:order:cancel 0 now LIMIT 0 10
+```
+
+多消费者要用 Lua 保证“取任务 + 删除任务”原子性。
+
+---
+
+# 八、典型业务场景七：实时统计
+
+## 1. Bitmap
+
+适合二值状态：
+
+```text id="0xptu6"
+签到
+活跃
+是否完成任务
+是否在线
+```
+
+示例：
+
+```text id="c4kx5h"
+SETBIT active:daily:20260603 1001 1
+BITCOUNT active:daily:20260603
+```
+
+## 2. HyperLogLog
+
+适合 UV 估算：
+
+```text id="mgtpqs"
+PFADD site:uv:20260603 user1001
+PFCOUNT site:uv:20260603
+```
+
+适合：
+
+```text id="p2vsgl"
+站点 UV
+页面 UV
+独立 IP 数
+搜索词去重估算
+```
+
+不适合：
+
+```text id="oqys94"
+精确人数
+成员明细
+财务审计
+强一致统计
+```
+
+---
+
+# 九、Redis 生产事故排查总思路
+
+Redis 事故排查不要一上来就猜“是不是 Redis 挂了”。
+
+应该先看现象，再定位层级。
+
+一个通用排查路径：
+
+```text id="dvwk3p"
+1. 应用层：接口是否 timeout？哪个接口？哪个调用 Redis 的方法？
+2. 客户端：连接池是否耗尽？是否大量重试？是否有慢调用？
+3. Redis 层：CPU、内存、QPS、P99、慢命令、连接数
+4. 数据层：是否大 key、热 key、缓存 miss 增多
+5. 复制层：主从延迟、复制断开、全量同步
+6. 系统层：磁盘 IO、网络、fork、AOF/RDB、CPU steal
+7. 架构层：是否雪崩、热点活动、发布变更、流量突增
+```
+
+常用命令：
+
+```text id="9h1gbb"
+INFO
+SLOWLOG GET
+LATENCY DOCTOR
+CLIENT LIST
+MEMORY USAGE
+SCAN / HSCAN / SSCAN / ZSCAN
+redis-cli --bigkeys
+redis-cli --hotkeys
+redis-cli --latency
+```
+
+`INFO` 是最基础的入口，它能返回服务端统计信息；慢命令需要看 `SLOWLOG GET`，并且要记住 Slow Log 记录的是命令执行耗时，不包含网络传输时间。
+
+---
+
+# 十、事故一：慢命令导致 Redis 卡顿
+
+## 1. 典型现象
+
+```text id="k0x4vf"
+接口 P99 突然升高
+Redis CPU 飙高
+大量 Redis timeout
+所有业务都变慢
+SLOWLOG 中出现大范围命令
+```
+
+常见慢命令：
+
+```text id="ydmgoe"
+KEYS *
+HGETALL 大 Hash
+SMEMBERS 大 Set
+ZRANGE 0 -1 大 ZSet
+LRANGE 0 -1 大 List
+SUNION / SINTER 大集合运算
+复杂 Lua
+DEL 大 key
+```
+
+Redis 官方延迟诊断文档也建议通过 Slow Log 观察慢命令，并指出如果 Redis 主进程 CPU 高而流量不高，通常可能是慢命令导致。
+
+## 2. 定位命令
+
+```text id="8fzwl7"
+SLOWLOG GET 20
+SLOWLOG LEN
+INFO commandstats
+LATENCY DOCTOR
+```
+
+查看慢日志配置：
+
+```text id="dqgaqa"
+CONFIG GET slowlog-log-slower-than
+CONFIG GET slowlog-max-len
+```
+
+Redis 官方说明 Slow Log 默认阈值常见为 10,000 微秒，也就是 10ms，具体可以通过配置调整。
+
+## 3. 根因分析
+
+慢命令危险的原因是 Redis 核心命令执行是单线程顺序执行。
+
+一个慢命令执行期间，后面的普通 `GET` / `SET` 也要排队。
+
+例如：
+
+```text id="oykrss"
+SMEMBERS huge:set
+```
+
+如果这个 Set 有几百万成员，Redis 主线程会长时间处理这个命令，其他请求全部等待。
+
+## 4. 治理方案
+
+```text id="gd91ly"
+KEYS -> SCAN
+HGETALL -> HSCAN / 字段拆分
+SMEMBERS -> SSCAN / 分页
+ZRANGE 0 -1 -> 分页查询
+DEL 大 key -> UNLINK
+复杂 Lua -> 拆分逻辑或限制执行规模
+```
+
+生产规范：
+
+```text id="muv12w"
+线上禁用 KEYS *
+限制一次性全量读取集合
+慢命令进入告警
+业务上线前做命令审计
+大集合必须分页访问
+```
+
+源码关注：
+
+```text id="2eguj3"
+server.c：命令执行主流程
+slowlog.c：慢日志记录
+t_hash.c / t_set.c / t_zset.c：集合命令实现
+```
+
+---
+
+# 十一、事故二：大 key 导致阻塞和内存倾斜
+
+## 1. 什么是大 key？
+
+大 key 不是 key 名字长，而是 value 太大。
+
+典型大 key：
+
+```text id="zuo5to"
+一个 String 几 MB 到几十 MB
+一个 Hash 有几十万个 field
+一个 Set 有几百万 member
+一个 ZSet 有几百万 member
+一个 Stream 长期不裁剪
+一个 Bitmap offset 极大
+```
+
+Redis 官方反模式文章和观测文档都把 large keys 列为影响性能的重要模式。
+
+## 2. 典型现象
+
+```text id="t2x8l5"
+某些请求偶发超时
+Redis 内存分布不均
+Cluster 某个分片内存特别高
+主从同步变慢
+AOF/RDB 文件膨胀
+删除 key 时 Redis 卡顿
+网络出流量异常
+```
+
+## 3. 定位命令
+
+```text id="5txr26"
+redis-cli --bigkeys
+MEMORY USAGE key
+SCAN + TYPE + MEMORY USAGE
+```
+
+示例：
+
+```text id="6s8icx"
+MEMORY USAGE product:detail:1001
+HLEN user:all
+SCARD article:liked_users:1001
+ZCARD rank:game:1001
+XLEN order:events
+```
+
+如果是集合类型，先看元素数量：
+
+```text id="5kyqlq"
+HLEN
+SCARD
+ZCARD
+LLEN
+XLEN
+```
+
+## 4. 根因分析
+
+大 key 的问题主要有四类：
+
+```text id="coxqag"
+1. 读取大 key 会占用 Redis 主线程
+2. 返回大 value 会占用网络带宽
+3. 删除大 key 会释放大量内存，可能阻塞
+4. Cluster 中大 key 会导致分片内存和流量倾斜
+```
+
+例如：
+
+```text id="c794g4"
+HGETALL user:all
+```
+
+如果这个 Hash 存了所有用户，就是典型错误建模。
+
+## 5. 治理方案
+
+### String 大对象
+
+```text id="97tzqt"
+拆分冷热字段
+大字段放对象存储
+Redis 只存摘要
+限制单 value 大小
+必要时压缩
+```
+
+### Hash 大对象
+
+```text id="c5erxx"
+按实体拆 key
+限制 field 数量
+使用 HSCAN
+避免 HGETALL 大 Hash
+```
+
+错误：
+
+```text id="iw5qv4"
+HSET user:all user1001 "{json}"
+HSET user:all user1002 "{json}"
+```
+
+正确：
+
+```text id="fcw1qa"
+SET user:profile:1001 "{json}"
+SET user:profile:1002 "{json}"
+```
+
+### Set / ZSet 大集合
+
+```text id="nou7z4"
+按时间拆分
+按业务分桶
+只保留 Top N
+冷数据落库
+SSCAN / ZSCAN 分批处理
+```
+
+### 删除大 key
+
+不要直接：
+
+```text id="xf1nso"
+DEL huge:key
+```
+
+推荐：
+
+```text id="s2siuy"
+UNLINK huge:key
+```
+
+`UNLINK` 会把释放内存放到后台异步处理，降低主线程阻塞风险。
+
+---
+
+# 十二、事故三：热 key 打爆单分片
+
+## 1. 什么是热 key？
+
+热 key 指访问频率远高于其他 key 的 key。
+
+例如：
+
+```text id="rt8kqx"
+爆款商品详情
+首页配置
+秒杀库存
+直播间状态
+热门文章
+全局配置
+热门排行榜
+```
+
+热 key 不一定大。
+
+一个只有几 KB 的 key，如果每秒几十万请求，也可能打爆 Redis。
+
+Redis 官方反模式文章和观测文档都将 hot keys 作为典型性能风险。
+
+## 2. 典型现象
+
+```text id="hj5vm1"
+Cluster 某个分片 CPU 特别高
+某个分片网络出流量特别大
+整体 Redis 集群看似没满，但某节点超时
+应用侧某个缓存 key 请求量异常
+缓存命中率很高但 Redis 仍然很慢
+```
+
+这点很关键：
+
+```text id="kleeqj"
+热 key 场景下，缓存命中率可能很高，但 Redis 仍然会被打爆。
+```
+
+## 3. 定位方式
+
+```text id="ig0i9e"
+redis-cli --hotkeys
+客户端埋点统计 key 访问频率
+代理层统计 Top Key
+云 Redis 热 key 分析
+业务日志采样
+```
+
+生产中更推荐在客户端或代理层做 key 级采样，因为 Redis 本身记录所有 key 访问频率的成本较高。
+
+## 4. 根因分析
+
+Redis Cluster 解决的是 keyspace 分散，但不能自动解决单 key 过热。
+
+一个 key 只会落到一个 slot，一个 slot 由一个主节点负责。
+
+所以：
+
+```text id="qt5s4f"
+单个热 key = 单个分片压力
+```
+
+## 5. 治理方案
+
+### 本地缓存
+
+适合读多写少热点：
+
+```text id="1r5t7h"
+首页配置
+热门商品详情
+活动配置
+字典数据
+```
+
+架构：
+
+```text id="uv00bo"
+应用本地缓存
+  -> Redis
+  -> DB
+```
+
+### 多级缓存
+
+```text id="g6uv37"
+CDN
+  -> 网关缓存
+  -> 应用本地缓存
+  -> Redis
+  -> DB
+```
+
+### 热点副本 key
+
+```text id="nq14pv"
+product:detail:1001:copy:0
+product:detail:1001:copy:1
+product:detail:1001:copy:2
+product:detail:1001:copy:3
+```
+
+读时随机读副本，写时更新所有副本或异步同步。
+
+适合：
+
+```text id="h80ax4"
+读多写少
+短暂不一致可接受
+```
+
+### 请求合并
+
+同一个 key 同一时刻只允许一个请求回源或刷新，其他请求等待或返回旧值。
+
+### 限流降级
+
+秒杀、热点活动必须配合网关限流和业务限流。
+
+---
+
+# 十三、事故四：主从延迟导致读到旧数据
+
+## 1. 典型现象
+
+```text id="j4r289"
+写入成功后马上读取，读到旧值
+用户刚修改资料，页面仍显示旧资料
+订单状态刚更新，读副本还是旧状态
+Replica 延迟升高
+故障切换后数据不一致
+```
+
+Redis 官方复制文档说明，Redis 支持主从复制，副本会尝试保持为主节点的拷贝，但复制基础是 leader-follower 模型，主从同步和故障恢复需要考虑复制链路。
+
+## 2. 定位命令
+
+```text id="uv7ywp"
+INFO replication
+```
+
+重点看：
+
+```text id="bs9u47"
+role
+connected_slaves / connected_replicas
+master_repl_offset
+slave_repl_offset / replica offset
+master_link_status
+master_last_io_seconds_ago
+repl_backlog_active
+```
+
+如果主从 offset 差距越来越大，说明复制延迟在扩大。
+
+## 3. 根因分析
+
+主从延迟常见原因：
+
+```text id="ak9mcs"
+主节点写入太高
+网络抖动
+Replica 处理能力不足
+大 key 同步
+全量复制
+AOF/RDB 磁盘 IO 抖动
+Replica 被大量读请求压垮
+```
+
+读写分离场景下，如果读请求走 Replica，就可能读到旧数据。
+
+## 4. 治理方案
+
+### 强一致读走 Master
+
+对于写后立即读的场景：
+
+```text id="hsm3kg"
+订单状态
+支付状态
+权限状态
+用户刚修改的信息
+```
+
+应该读 Master 或走数据库确认。
+
+### 延迟敏感业务不读 Replica
+
+Replica 更适合：
+
+```text id="7kzdxj"
+统计展示
+排行榜展示
+弱一致缓存
+非核心资料
+```
+
+### 监控复制延迟
+
+将 offset 差值、link 状态、last_io_seconds 纳入告警。
+
+### 控制大 key 和写入峰值
+
+大 key 会放大复制压力，写入峰值会导致 Replica 追不上。
+
+---
+
+# 十四、事故五：连接池耗尽
+
+## 1. 典型现象
+
+```text id="ug3lw9"
+应用大量 Redis timeout
+报 connection pool exhausted
+Redis connected_clients 飙高
+Redis 报 max number of clients reached
+接口线程阻塞
+重启应用后短暂恢复
+```
+
+Redis 官方客户端处理文档说明，Redis 会管理客户端连接、超时和缓冲区；`CLIENT LIST` 可以查看客户端连接信息，`INFO clients` 可观察连接数量、阻塞客户端等指标。
+
+## 2. 定位命令
+
+```text id="452m9r"
+INFO clients
+CLIENT LIST
+CONFIG GET maxclients
+```
+
+重点看：
+
+```text id="pyyef7"
+connected_clients
+blocked_clients
+client_recent_max_input_buffer
+client_recent_max_output_buffer
+maxclients
+```
+
+客户端侧看：
+
+```text id="4h7cxk"
+连接池 active 数
+idle 数
+wait 数
+获取连接耗时
+Redis 命令耗时
+超时次数
+重试次数
+```
+
+## 3. 常见原因
+
+```text id="8vzu8f"
+连接泄漏
+连接池配置太小
+连接池配置太大导致 Redis 压力过高
+慢命令导致连接长时间不释放
+网络超时设置过长
+阻塞命令占用连接
+大量重试放大连接需求
+每次请求新建 Redis 连接
+没有复用客户端
+```
+
+## 4. 治理方案
+
+### 客户端连接池合理配置
+
+不要无限加大连接池。
+
+连接池太小：
+
+```text id="fvd32y"
+应用拿不到连接，排队超时。
+```
+
+连接池太大：
+
+```text id="xz04cu"
+Redis 连接数过多，上下文和内存压力上升。
+```
+
+### 设置合理超时
+
+```text id="ch5og6"
+连接超时
+读超时
+写超时
+命令超时
+连接获取超时
+```
+
+不要让请求无限等待 Redis。
+
+### 禁止无限重试
+
+错误做法：
+
+```text id="1gzo2s"
+Redis timeout 后立即重试 3 次
+```
+
+如果高峰期大量请求都重试，会形成重试风暴。
+
+推荐：
+
+```text id="kwrn7v"
+有限重试
+指数退避
+jitter
+熔断
+降级
+```
+
+### 阻塞命令使用独立连接池
+
+例如：
+
+```text id="3g528h"
+BLPOP
+BRPOP
+XREAD BLOCK
+SUBSCRIBE
+```
+
+这类命令会长期占用连接，不应该和普通 GET/SET 共用同一个小连接池。
+
+---
+
+# 十五、事故六：缓存 miss 激增导致数据库雪崩
+
+## 1. 典型现象
+
+```text id="8anx2b"
+Redis QPS 下降
+DB QPS 飙升
+缓存命中率下降
+大量 key 同时过期
+接口 P99 升高
+DB 连接池耗尽
+```
+
+## 2. 常见原因
+
+```text id="8xx7pl"
+大量 key 设置相同 TTL
+发布时清空缓存
+Redis 重启后缓存为空
+热点 key 过期
+缓存预热失败
+布隆过滤器失效
+```
+
+## 3. 治理方案
+
+```text id="m5f5qd"
+TTL 随机化
+缓存预热
+互斥锁重建
+逻辑过期
+本地缓存兜底
+DB 查询限流
+熔断降级
+空值缓存
+布隆过滤器
+```
+
+TTL 随机化：
+
+```go id="q43rqd"
+ttl := baseTTL + time.Duration(rand.Intn(120))*time.Second
+```
+
+本质：
+
+```text id="vgbtsm"
+把大量 key 的集中失效打散到一个时间窗口里。
+```
+
+---
+
+# 十六、事故七：持久化和 fork 引起延迟抖动
+
+## 1. 典型现象
+
+```text id="ack5ku"
+周期性 Redis 延迟尖刺
+BGSAVE 或 BGREWRITEAOF 时业务变慢
+latest_fork_usec 变大
+磁盘 IO 飙高
+used_memory_rss 上升
+```
+
+## 2. 定位命令
+
+```text id="uqiolj"
+INFO persistence
+INFO stats
+LATENCY DOCTOR
+```
+
+重点看：
+
+```text id="rp8ixl"
+rdb_bgsave_in_progress
+aof_rewrite_in_progress
+latest_fork_usec
+rdb_last_bgsave_status
+aof_last_bgrewrite_status
+aof_delayed_fsync
+```
+
+## 3. 根因分析
+
+RDB 和 AOF rewrite 都可能 fork 子进程。
+
+fork 会复制页表，写时复制会导致内存上涨，子进程写磁盘会带来 IO 压力。
+
+如果 Redis 实例很大、写入很多、磁盘慢，就容易出现延迟抖动。
+
+## 4. 治理方案
+
+```text id="n2ahkq"
+避免业务高峰触发 BGSAVE / AOF rewrite
+控制实例内存大小
+使用更快磁盘
+监控 latest_fork_usec
+分片降低单实例数据量
+纯缓存实例可考虑关闭 AOF
+```
+
+---
+
+# 十七、排查手册：按症状快速定位
+
+## 1. Redis CPU 高
+
+优先看：
+
+```text id="15u4rh"
+SLOWLOG GET
+INFO commandstats
+是否有大集合操作
+是否有复杂 Lua
+是否有热 key
+```
+
+## 2. Redis 内存高
+
+优先看：
+
+```text id="1rgst7"
+INFO memory
+redis-cli --bigkeys
+MEMORY USAGE
+是否缺少 TTL
+是否 Stream 没裁剪
+是否大 Hash / 大 ZSet
+```
+
+## 3. Redis timeout 多
+
+优先看：
+
+```text id="tvnx9a"
+SLOWLOG
+LATENCY DOCTOR
+CLIENT LIST
+连接池等待时间
+网络延迟
+Redis P99
+是否持久化抖动
+```
+
+## 4. 某个 Cluster 节点特别慢
+
+优先看：
+
+```text id="57o01a"
+是否有热 key
+是否有大 key
+该节点 slot 是否倾斜
+该节点内存是否高
+该节点网络是否打满
+```
+
+## 5. 写后读不一致
+
+优先看：
+
+```text id="rfe1yp"
+是否读了 Replica
+INFO replication
+主从 offset 差距
+业务是否要求强一致
+```
+
+## 6. 连接池耗尽
+
+优先看：
+
+```text id="cood1q"
+INFO clients
+CLIENT LIST
+应用连接池指标
+是否有阻塞命令
+是否有慢命令
+是否无限重试
+```
+
+---
+
+# 十八、大厂 Redis 事故治理规范
+
+## 1. 实例隔离
+
+不同用途拆实例：
+
+```text id="ac7dzv"
+缓存实例
+会话实例
+排行榜实例
+限流实例
+锁实例
+Stream 实例
+热点业务实例
+```
+
+避免一个业务的大 key 或热 key 拖垮所有业务。
+
+## 2. key 规范
+
+推荐：
+
+```text id="y5u1qb"
+业务:模块:实体:ID:维度
+```
+
+示例：
+
+```text id="olmx41"
+product:detail:1001
+user:profile:1001
+rank:game:1001:daily:20260603
+rate:user:1001:202606031030
+```
+
+## 3. 命令准入
+
+上线前审计：
+
+```text id="d4fbkv"
+是否使用 KEYS
+是否全量 HGETALL / SMEMBERS / ZRANGE
+是否可能产生大 key
+是否有复杂 Lua
+是否设置 TTL
+是否有热 key 风险
+```
+
+## 4. 监控告警
+
+必须监控：
+
+```text id="8zzbkp"
+Redis QPS
+命中率
+P99 / P999
+CPU
+内存
+连接数
+慢命令
+大 key
+热 key
+主从延迟
+AOF/RDB 状态
+客户端超时
+连接池等待
+缓存 miss 率
+DB 回源 QPS
+```
+
+## 5. 故障演练
+
+定期演练：
+
+```text id="8c70ww"
+Redis 不可用
+单分片故障
+主从切换
+缓存全部清空
+热点 key 过期
+连接池耗尽
+DB 慢查询
+```
+
+目标是验证：
+
+```text id="l05kzs"
+Redis 挂了，DB 会不会被打爆？
+缓存 miss 激增时是否限流？
+热点 key 失效时是否互斥重建？
+应用是否有本地缓存兜底？
+客户端是否无限重试？
+```
+
+---
+
+# 十九、源码视角：排查问题应该看哪些模块？
+
+## 1. 慢命令
+
+```text id="q0j8xc"
+server.c
+slowlog.c
+t_hash.c
+t_set.c
+t_zset.c
+eval.c
+```
+
+关注：
+
+```text id="e1f7jr"
+命令执行主流程
+慢日志记录
+集合命令时间复杂度
+Lua 脚本执行
+```
+
+## 2. 大 key 和内存
+
+```text id="hcro7g"
+object.c
+dict.c
+sds.c
+listpack.c
+quicklist.c
+t_stream.c
+```
+
+关注：
+
+```text id="s6mj0k"
+对象编码
+底层结构
+内存分配
+集合元素增长
+Stream listpack / rax
+```
+
+## 3. 主从延迟
+
+```text id="4ed163"
+replication.c
+```
+
+关注：
+
+```text id="3k4gg7"
+PSYNC
+复制积压缓冲区
+复制 offset
+全量同步
+部分重同步
+```
+
+## 4. 客户端连接
+
+```text id="s2i8nb"
+networking.c
+clients.c
+ae.c
+```
+
+关注：
+
+```text id="d0ply5"
+连接创建
+输入缓冲区
+输出缓冲区
+客户端阻塞
+事件循环
+```
+
+## 5. 持久化抖动
+
+```text id="rqnolp"
+rdb.c
+aof.c
+bio.c
+```
+
+关注：
+
+```text id="ndcmt8"
+BGSAVE
+BGREWRITEAOF
+fork
+fsync
+后台 IO
+```
+
+---
+
+# 二十、面试表达
+
+## 1. Redis 线上突然变慢怎么排查？
+
+可以这样回答：
+
+> 我会先从应用侧确认是所有 Redis 调用慢，还是某个接口、某个 key 慢。然后看 Redis 的 `INFO`、`SLOWLOG GET`、`LATENCY DOCTOR`，确认是否有慢命令、CPU 高、内存高、连接数异常。如果 Slow Log 里有 `HGETALL`、`SMEMBERS`、`ZRANGE 0 -1`、复杂 Lua 这类命令，就优先治理慢命令。如果某个分片特别慢，就重点查大 key 和热 key。如果应用报连接池耗尽，就看 `INFO clients`、`CLIENT LIST` 和客户端连接池指标。排查时还要看主从延迟、AOF/RDB 状态和数据库回源压力，避免只盯 Redis 本身。
+
+## 2. 大 key 和热 key 有什么区别？
+
+可以这样回答：
+
+> 大 key 是 value 过大，比如一个 Hash 有几十万个 field，或者一个 ZSet 有几百万成员，主要问题是读取、删除、同步和迁移成本高。热 key 是访问频率过高，比如秒杀商品详情或首页配置，主要问题是单个 key 打爆单分片。大 key 是容量问题，热 key 是流量问题。治理大 key 要拆分、分页、限制集合大小、用 UNLINK 删除；治理热 key 要本地缓存、多级缓存、热点副本、请求合并和限流降级。
+
+## 3. 主从延迟会导致什么问题？
+
+可以这样回答：
+
+> Redis 主从复制通常是异步的，如果应用写 Master 后马上读 Replica，可能读到旧数据。主从延迟常见原因包括主节点写入过高、网络抖动、大 key 同步、Replica 负载高或全量复制。排查时看 `INFO replication`，重点关注主从 offset 差距、master_link_status 和 last_io_seconds。强一致读应该走 Master 或数据库，Replica 更适合弱一致读和统计展示。
+
+## 4. 连接池耗尽怎么排查？
+
+可以这样回答：
+
+> 先看应用侧连接池 active、idle、wait、获取连接耗时和超时次数，再看 Redis 的 `INFO clients` 和 `CLIENT LIST`。常见原因有连接泄漏、连接池太小、慢命令导致连接长时间占用、阻塞命令和普通命令共用连接池、超时配置过长、无限重试放大流量。治理上要设置合理池大小和超时，阻塞命令独立连接池，限制重试，必要时熔断降级。
+
+---
+
+# 二十一、总结
+
+Redis 的典型业务场景可以概括为：
+
+```text id="po6xjr"
+缓存：降低数据库压力
+计数器：原子递增统计
+限流：分布式请求控制
+排行榜：ZSet 实时排序
+锁：短时间互斥
+Stream：轻量消息流
+延迟队列：ZSet 时间调度
+实时统计：Bitmap / HyperLogLog
+```
+
+Redis 的生产事故高频根因可以概括为：
+
+```text id="bvp8zz"
+慢命令：阻塞主线程
+大 key：容量和传输问题
+热 key：单分片流量问题
+主从延迟：异步复制一致性问题
+连接池耗尽：客户端资源和慢调用问题
+缓存雪崩：大量 miss 打爆 DB
+持久化抖动：fork / fsync / 磁盘 IO 问题
+```
+
+成熟的 Redis 使用方式，不是“所有热点都扔进 Redis”，而是：
+
+```text id="8jkxtg"
+建模前知道访问模式；
+上线前审计 key 和命令；
+运行中监控慢命令、大 key、热 key；
+故障时有降级、限流和回源保护；
+事故后能从源码和架构层面定位根因。
+```
+
+Redis 很快，但 Redis 事故也会很快。
+
+真正的工程能力，不是会写 `GET` 和 `SET`，而是能在高并发、高流量、故障和异常访问下，让 Redis 仍然可控。

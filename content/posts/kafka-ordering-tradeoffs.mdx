@@ -1,0 +1,1069 @@
+# Kafka 如何保证消息顺序：单 Partition 有序、Key 分区、订单事件顺序与全局有序的代价
+
+## 前言
+
+Kafka 面试里有一个非常高频的问题：
+
+```text
+Kafka 如何保证消息顺序？
+```
+
+很多人会直接回答：
+
+```text
+Kafka 保证单 Partition 内有序。
+```
+
+这个回答是对的，但还不够。
+
+面试官通常会继续追问：
+
+```text
+Topic 能不能保证全局有序？
+为什么单 Partition 有序？
+消息 key 如何决定分区？
+同一个订单的消息如何保证顺序？
+Consumer 多线程处理会不会打乱顺序？
+Producer 重试会不会导致乱序？
+全局有序为什么会牺牲吞吐？
+扩容 Partition 会不会影响顺序？
+```
+
+这些问题都不是单靠一句“单 Partition 有序”就能回答清楚的。
+
+从开发角度看，Kafka 顺序性关系到 Producer key 怎么选、Consumer 怎么处理、业务是否幂等。
+
+从架构角度看，Kafka 顺序性关系到 Topic 设计、Partition 规划、吞吐扩展和业务一致性边界。
+
+从源码角度看，Kafka 的顺序性来自 Partition 日志追加、offset 单调递增、Consumer Group 的 Partition 独占消费，以及客户端分区器的 key 路由规则。
+
+本文重点拆解：
+
+```text
+1. Kafka 到底保证哪一层的顺序？
+2. 为什么单 Partition 内有序？
+3. 为什么 Topic 不保证全局有序？
+4. 消息 key 如何决定分区？
+5. 同一个订单如何保证顺序？
+6. Producer 重试和幂等对顺序有什么影响？
+7. Consumer 多线程处理如何避免乱序？
+8. 全局有序为什么会牺牲吞吐？
+9. 扩容 Partition 对顺序有什么影响？
+10. 面试中如何回答 Kafka 顺序性问题？
+```
+
+---
+
+# 一、Kafka 的顺序性结论
+
+先给结论。
+
+Kafka 的顺序性可以概括为四句话：
+
+```text
+1. Kafka 只保证单个 Partition 内消息有序。
+2. Kafka 不保证 Topic 级别全局有序。
+3. 相同 key 的消息通常会进入同一个 Partition，因此可以保证 key 维度有序。
+4. Consumer 端如果并发处理不当，仍然可能破坏业务处理顺序。
+```
+
+也就是说，Kafka 的顺序性不是自动覆盖所有场景的。
+
+它依赖：
+
+```text
+Producer 是否把相关消息写入同一个 Partition；
+Broker 是否按 Partition 日志顺序追加；
+Consumer Group 是否按 Partition 独占消费；
+Consumer 业务处理是否保持顺序；
+offset 是否在处理成功后正确提交。
+```
+
+如果其中任何一层设计不当，业务上看到的顺序都可能乱。
+
+---
+
+# 二、为什么单 Partition 内有序？
+
+Partition 是 Kafka 并行和顺序的基本单位。
+
+每个 Partition 本质上是一条追加日志。
+
+```text
+Partition 0:
+offset 0 -> msgA
+offset 1 -> msgB
+offset 2 -> msgC
+offset 3 -> msgD
+```
+
+消息写入 Partition 后，会被分配递增的 offset。
+
+对于同一个 Partition：
+
+```text
+后写入的消息 offset 更大；
+Consumer 按 offset 从小到大读取；
+因此 Partition 内天然有序。
+```
+
+可以把 Partition 理解为一个有序日志文件。
+
+Producer 写入是 append。
+
+Consumer 读取是按 offset 顺序 fetch。
+
+所以 Kafka 的基础顺序保证来自：
+
+```text
+Partition 日志追加写 + offset 单调递增 + Consumer 顺序读取。
+```
+
+从源码角度看，Kafka Broker 对 Partition 的消息追加会进入日志模块，例如 Log / UnifiedLog 相关逻辑。消息被追加到对应 Partition 的日志段中，并形成 offset。Consumer 拉取时通过 FetchRequest 指定 TopicPartition 和 offset，从日志中顺序读取。
+
+---
+
+# 三、为什么 Topic 不保证全局有序？
+
+Topic 可以有多个 Partition。
+
+例如：
+
+```text
+Topic: order_events
+
+Partition 0:
+offset 0 -> OrderCreated(orderId=1)
+offset 1 -> OrderPaid(orderId=3)
+
+Partition 1:
+offset 0 -> OrderCreated(orderId=2)
+offset 1 -> OrderPaid(orderId=4)
+```
+
+每个 Partition 内部有序。
+
+但是不同 Partition 之间没有一个统一的全局 offset。
+
+也就是说：
+
+```text
+Partition 0 的 offset 10
+和
+Partition 1 的 offset 10
+没有全局先后关系。
+```
+
+Producer 可以并行写多个 Partition。
+
+Consumer Group 也可以并行消费多个 Partition。
+
+这就决定了 Kafka 不能天然保证 Topic 全局顺序。
+
+例如：
+
+```text
+msgA 写入 Partition 0
+msgB 写入 Partition 1
+```
+
+即使 msgA 先写入，Consumer 也可能先处理 msgB。
+
+原因包括：
+
+```text
+Partition 分布在不同 Broker；
+Consumer 拉取速度不同；
+不同 Consumer 处理速度不同；
+网络延迟不同；
+下游处理耗时不同。
+```
+
+所以 Kafka 设计上选择的是：
+
+```text
+牺牲 Topic 全局顺序，换取 Partition 并行吞吐。
+```
+
+这正是 Kafka 高吞吐的核心取舍。
+
+---
+
+# 四、消息 key 如何决定分区？
+
+Producer 发送消息时，可以指定 key。
+
+例如：
+
+```text
+key = orderId
+value = OrderPaid event
+```
+
+Kafka Producer 会根据 key 选择 Partition。
+
+一般逻辑可以理解为：
+
+```text
+partition = hash(key) % partitionCount
+```
+
+实际不同客户端和版本的分区器可能有细节差异，例如 sticky partitioner、murmur2 hash、自定义 partitioner 等，但核心思想是：
+
+```text
+相同 key 通常会被路由到相同 Partition。
+```
+
+Kafka 官方文档也用图说明：相同 key 的事件会写入同一个 Partition。
+
+这带来的重要能力是：
+
+```text
+同一个业务实体的消息可以保持顺序。
+```
+
+例如：
+
+```text
+orderId = 1001 的所有事件都进入 Partition 3
+orderId = 1002 的所有事件都进入 Partition 7
+```
+
+这样就可以保证：
+
+```text
+同一个订单维度内有序；
+不同订单之间并行处理。
+```
+
+这就是 Kafka 顺序性在业务建模里的核心方法：
+
+```text
+用消息 key 定义顺序边界。
+```
+
+---
+
+# 五、同一个订单如何保证顺序？
+
+假设订单系统有这些事件：
+
+```text
+OrderCreated
+OrderPaid
+OrderShipped
+OrderCompleted
+```
+
+对于同一个订单，顺序必须是：
+
+```text
+创建 -> 支付 -> 发货 -> 完成
+```
+
+如果顺序错了，可能出现：
+
+```text
+先发货后支付
+先完成后发货
+库存状态异常
+订单状态机异常
+```
+
+正确做法是：
+
+```text
+Topic: order_events
+Message Key: orderId
+```
+
+例如：
+
+```text
+Producer.send(
+  topic = "order_events",
+  key = "orderId:1001",
+  value = "OrderCreated"
+)
+
+Producer.send(
+  topic = "order_events",
+  key = "orderId:1001",
+  value = "OrderPaid"
+)
+
+Producer.send(
+  topic = "order_events",
+  key = "orderId:1001",
+  value = "OrderShipped"
+)
+```
+
+由于 key 相同，这些消息会进入同一个 Partition。
+
+在 Partition 内，它们会按写入顺序获得 offset：
+
+```text
+Partition 5:
+offset 100 -> OrderCreated(orderId=1001)
+offset 101 -> OrderPaid(orderId=1001)
+offset 102 -> OrderShipped(orderId=1001)
+```
+
+Consumer 顺序拉取这个 Partition，就能按 offset 顺序处理订单事件。
+
+架构上可以总结为：
+
+```text
+Kafka 不保证所有订单全局有序；
+但可以通过 orderId 作为 key，保证同一个订单内有序。
+```
+
+这通常就是业务真正需要的顺序。
+
+大多数系统不需要“所有订单全局有序”。
+
+它们需要的是：
+
+```text
+同一个订单内有序；
+同一个用户内有序；
+同一个账户内有序；
+同一个设备内有序；
+同一个业务实体内有序。
+```
+
+这叫局部有序。
+
+---
+
+# 六、Topic 全局有序怎么实现？
+
+如果业务真的要求整个 Topic 全局有序，最简单的方法是：
+
+```text
+Topic 只设置 1 个 Partition。
+```
+
+这样所有消息都进入同一个 Partition。
+
+```text
+Topic: global_events
+
+Partition 0:
+offset 0 -> msgA
+offset 1 -> msgB
+offset 2 -> msgC
+offset 3 -> msgD
+```
+
+由于只有一个 Partition，所有消息共享一条日志，天然全局有序。
+
+但是代价非常大：
+
+```text
+Producer 写入无法通过多个 Partition 并行扩展；
+Consumer Group 内同一时刻只有一个 Consumer 能消费；
+Broker 侧也只有一个 Partition Leader 承担主写压力；
+吞吐和扩展性都会受限。
+```
+
+所以全局有序的代价是：
+
+```text
+牺牲吞吐和并行度。
+```
+
+这也是为什么 Kafka 默认更推荐局部有序，而不是全局有序。
+
+系统设计时要反问业务方：
+
+```text
+你真的需要全局有序吗？
+还是只需要某个业务实体内有序？
+```
+
+大多数情况下，答案是后者。
+
+例如：
+
+```text
+订单系统：同一订单有序即可
+账户系统：同一账户有序即可
+设备系统：同一设备有序即可
+用户行为：同一用户会话内有序即可
+```
+
+这时就应该用业务 key 做局部有序，而不是牺牲整个系统吞吐去追求全局有序。
+
+---
+
+# 七、Producer 重试会不会导致乱序？
+
+会，取决于 Producer 配置和 Kafka 版本能力。
+
+Producer 发送消息时，如果发生网络错误或 Broker 临时异常，可能触发重试。
+
+假设同一个 Producer 向同一个 Partition 连续发送两条消息：
+
+```text
+msg1
+msg2
+```
+
+如果 msg1 发送失败并重试，而 msg2 先成功写入，就可能导致顺序错乱。
+
+经典问题出现在：
+
+```text
+开启 retries；
+同时允许多个 in-flight request；
+未启用幂等 Producer。
+```
+
+`max.in.flight.requests.per.connection` 表示单个连接上允许多少个未确认请求。如果该值较大，多个请求可以同时在网络中飞行。一旦前面的请求失败重试，后面的请求可能先写入，从而导致乱序。
+
+Kafka Producer 配置文档对幂等 Producer 和 in-flight 请求有相关限制说明：启用幂等要求 `acks=all`，并对 `max.in.flight.requests.per.connection` 等配置有约束。
+
+生产建议：
+
+```text
+1. 对顺序敏感的消息，必须启用幂等 Producer。
+2. 配置 acks=all。
+3. 控制 max.in.flight.requests.per.connection。
+4. 同一业务实体使用相同 key。
+5. Producer 侧不要跨多个 Producer 实例乱序发送同一个实体事件，除非业务能保证顺序。
+```
+
+早期 Kafka 版本里，如果没有幂等能力，常见建议是把 `max.in.flight.requests.per.connection` 设置为 1 来严格避免重试乱序，但这会降低吞吐。
+
+启用幂等 Producer 后，Kafka 可以通过 Producer ID、Sequence Number 等机制识别重复和乱序写入，从而在可靠性和吞吐之间取得更好平衡。
+
+---
+
+# 八、多个 Producer 会不会导致乱序？
+
+如果多个 Producer 同时发送同一个 key 的消息，仍然可能出现业务顺序问题。
+
+例如：
+
+```text
+Producer A 发送 OrderPaid(orderId=1001)
+Producer B 发送 OrderCreated(orderId=1001)
+```
+
+即使它们最终都进入同一个 Partition，Kafka 只能保证它们在 Partition 中的写入顺序。
+
+但 Kafka 不知道业务上哪个事件应该先发生。
+
+如果 Producer B 因为网络延迟晚到，Partition 里可能是：
+
+```text
+offset 100 -> OrderPaid
+offset 101 -> OrderCreated
+```
+
+Kafka 没有办法替业务判断这是错的。
+
+所以 Kafka 的顺序保证前提是：
+
+```text
+生产端写入顺序本身是正确的。
+```
+
+如果业务事件来自多个服务，需要额外设计：
+
+```text
+统一事件出口
+Outbox Pattern
+状态机约束
+事件版本号
+业务时间戳
+数据库 binlog / CDC
+幂等和乱序处理
+```
+
+例如订单事件最好由订单服务统一发布，而不是让支付服务、库存服务、物流服务分别直接发布同一个订单主状态事件。
+
+更稳的设计是：
+
+```text
+订单状态以订单数据库为准；
+订单服务更新状态后写 outbox；
+Kafka 事件从 outbox 或 binlog 中统一发布；
+Consumer 根据 orderId 顺序消费。
+```
+
+这样可以减少多 Producer 乱序。
+
+---
+
+# 九、Consumer 多线程处理会不会导致乱序？
+
+会。
+
+即使 Kafka 按 offset 顺序把消息交给 Consumer，如果 Consumer 内部并发处理不当，也可能打乱业务顺序。
+
+例如一个 Consumer 拉到同一 Partition 的三条消息：
+
+```text
+offset 100 -> OrderCreated
+offset 101 -> OrderPaid
+offset 102 -> OrderShipped
+```
+
+如果 Consumer 把它们丢进线程池并发处理：
+
+```text
+线程 1 处理 offset 100
+线程 2 处理 offset 101
+线程 3 处理 offset 102
+```
+
+由于处理耗时不同，可能出现：
+
+```text
+OrderShipped 先处理完成
+OrderPaid 后处理完成
+OrderCreated 最后完成
+```
+
+这样业务顺序就乱了。
+
+所以要记住：
+
+```text
+Kafka 保证的是拉取顺序，不保证你的业务处理顺序。
+```
+
+如果要保证 Partition 内处理顺序，Consumer 端应当：
+
+```text
+1. 单线程处理同一个 Partition；
+2. 或者按 key 分发到固定 worker；
+3. 或者用业务状态机容忍乱序；
+4. offset 提交必须在前序消息处理成功后推进。
+```
+
+---
+
+# 十、Consumer 如何既并发又保证同 key 有序？
+
+这是生产里非常常见的问题。
+
+一个简单做法是：
+
+```text
+不同 Partition 并发；
+同一 Partition 串行。
+```
+
+Kafka Consumer Group 天然支持这种模型。
+
+每个 Consumer 可以同时处理多个 Partition，但每个 Partition 内部顺序处理。
+
+如果单个 Partition 处理能力不足，可以进一步在 Consumer 内部按 key 分发到固定 worker：
+
+```text
+workerIndex = hash(message.key) % workerCount
+```
+
+保证同一个 key 总是进入同一个 worker。
+
+例如：
+
+```text
+orderId=1001 -> worker 3
+orderId=1002 -> worker 7
+orderId=1003 -> worker 1
+```
+
+这样可以实现：
+
+```text
+不同 key 并行；
+相同 key 串行。
+```
+
+但这会增加 offset 提交复杂度。
+
+因为 Kafka offset 是 Partition 级别的，而不是 key 级别的。
+
+如果 offset 100、101、102 被并发处理：
+
+```text
+offset 100 -> key=A
+offset 101 -> key=B
+offset 102 -> key=A
+```
+
+即使 offset 101 先处理完，也不能贸然提交到 102，除非 offset 100 也成功了。
+
+否则 Consumer 宕机后可能跳过 offset 100。
+
+所以高并发有序消费要处理：
+
+```text
+乱序完成
+offset 连续提交
+失败重试
+同 key 队列阻塞
+内存积压
+```
+
+大厂实践里，如果顺序要求强，通常更倾向于：
+
+```text
+Partition 级串行消费 + 增加 Partition 扩展并行度。
+```
+
+而不是在单个 Partition 内做复杂多线程乱序处理。
+
+---
+
+# 十一、同一个订单有序的完整架构设计
+
+以订单事件为例，设计目标：
+
+```text
+同一个订单事件有序；
+不同订单可以并行；
+消费失败可以重试；
+重复消费不影响最终状态。
+```
+
+## 1. Topic 设计
+
+```text
+Topic: order_events
+Partition: 根据吞吐规划，比如 32 或 64
+Key: orderId
+```
+
+## 2. Producer 设计
+
+```text
+订单服务统一发布订单事件；
+同一个 orderId 使用相同 key；
+开启幂等 Producer；
+acks=all；
+避免多个服务同时发布同一订单主状态事件；
+必要时使用 Outbox Pattern。
+```
+
+## 3. Broker 顺序保证
+
+```text
+同一个 orderId 进入同一个 Partition；
+Partition 内按 offset 追加；
+Consumer 按 offset 读取。
+```
+
+## 4. Consumer 设计
+
+```text
+同一个 Consumer Group 内，一个 Partition 只分给一个 Consumer；
+Consumer 对单个 Partition 顺序处理；
+处理成功后提交 offset；
+业务端做幂等和状态机校验。
+```
+
+## 5. 数据库状态机兜底
+
+即使 Kafka 有序，消费者仍要做状态判断。
+
+例如订单状态更新：
+
+```sql
+UPDATE orders
+SET status = 'PAID'
+WHERE order_id = ? AND status = 'CREATED';
+```
+
+如果当前状态不是 `CREATED`，说明事件重复、乱序或状态已处理，需要进入异常处理或忽略。
+
+这样设计后，即使极端情况下发生重复消费或部分乱序，数据库状态机仍能兜底。
+
+成熟系统不会只依赖 Kafka 顺序性保证最终正确性。
+
+更完整的原则是：
+
+```text
+Kafka 保证同 key 事件尽量按写入顺序投递；
+业务状态机保证最终状态不会被错误推进；
+幂等设计保证重复消费不出错；
+补偿任务修复异常状态。
+```
+
+---
+
+# 十二、扩容 Partition 会不会影响顺序？
+
+会，尤其是使用 key 分区时。
+
+常见分区逻辑可以简化理解为：
+
+```text
+partition = hash(key) % partitionCount
+```
+
+假设原来 Topic 有 8 个 Partition：
+
+```text
+hash(orderId=1001) % 8 = 3
+```
+
+扩容到 16 个 Partition 后：
+
+```text
+hash(orderId=1001) % 16 = 11
+```
+
+同一个 orderId 的新消息可能进入新的 Partition。
+
+结果是：
+
+```text
+旧消息在 Partition 3
+新消息在 Partition 11
+```
+
+这样同一个订单的历史和新事件分散到不同 Partition，就无法保证跨 Partition 顺序。
+
+这就是为什么顺序敏感业务扩容 Partition 要非常谨慎。
+
+生产建议：
+
+```text
+1. 初始 Partition 数要预留未来容量。
+2. 强顺序 Topic 不要随意扩 Partition。
+3. 如必须扩容，考虑新建 Topic 迁移。
+4. 迁移时停写旧 Topic，确保顺序边界清晰。
+5. 使用版本化 Topic，例如 order_events_v2。
+6. Consumer 同时兼容旧 Topic 和新 Topic 时，要特别处理顺序边界。
+```
+
+对于不依赖 key 顺序的日志类 Topic，扩 Partition 风险较小。
+
+对于订单、账户、交易流水类强顺序 Topic，扩 Partition 必须走变更评审。
+
+---
+
+# 十三、全局有序为什么牺牲吞吐？
+
+Kafka 高吞吐来自 Partition 并行。
+
+如果要全局有序，就只能让所有消息进入同一条有序日志。
+
+也就是：
+
+```text
+一个 Topic 只有一个 Partition。
+```
+
+这样做的代价是：
+
+```text
+1. Producer 写入只能集中到一个 Partition Leader。
+2. Broker 侧无法用多个 Partition 分摊写入。
+3. Consumer Group 内只有一个 Consumer 能消费。
+4. 单 Partition 成为吞吐瓶颈。
+5. 故障恢复和积压处理都更慢。
+```
+
+举个例子：
+
+如果每个 Partition 能稳定处理 10 MB/s：
+
+```text
+1 个 Partition：约 10 MB/s
+10 个 Partition：理论上可扩展到约 100 MB/s
+100 个 Partition：理论上可进一步扩展
+```
+
+当然实际吞吐还受 Broker、网络、磁盘、Consumer、压缩等因素影响，但 Partition 数是基础扩展单位。
+
+全局有序等于放弃 Partition 并行。
+
+所以架构设计时要尽量把需求从：
+
+```text
+所有消息全局有序
+```
+
+转化为：
+
+```text
+某个业务实体内有序
+```
+
+这才是 Kafka 适合的模型。
+
+---
+
+# 十四、大厂实践：如何定义顺序边界？
+
+顺序边界应该由业务实体决定。
+
+常见选择：
+
+```text
+订单事件：orderId
+账户流水：accountId
+用户行为：userId 或 sessionId
+设备消息：deviceId
+商户事件：merchantId
+库存变更：skuId
+交易事件：transactionId
+```
+
+选择 key 时要考虑两个问题：
+
+```text
+1. 这个 key 是否代表业务顺序边界？
+2. 这个 key 的分布是否足够均匀？
+```
+
+例如：
+
+```text
+key = tenantId
+```
+
+如果一个大租户占 80% 流量，那么这个 tenantId 会导致热点 Partition。
+
+可以改成：
+
+```text
+key = tenantId + ":" + hash(entityId) % bucketCount
+```
+
+但这样会牺牲 tenant 级全局顺序，只保留更细粒度实体顺序。
+
+这就是架构取舍：
+
+```text
+顺序粒度越大，并行度越差；
+顺序粒度越小，并行度越好，但业务排序能力越弱。
+```
+
+---
+
+# 十五、Kafka 顺序性常见错误
+
+## 错误一：以为 Topic 全局有序
+
+错误理解：
+
+```text
+Topic 内所有消息都有全局顺序。
+```
+
+正确理解：
+
+```text
+Kafka 只保证单 Partition 内有序。
+```
+
+---
+
+## 错误二：发送消息不设置 key
+
+如果不设置 key，Producer 可能轮询、粘性分区或随机分发。
+
+同一个订单的多条消息可能进入不同 Partition。
+
+结果：
+
+```text
+OrderCreated -> Partition 1
+OrderPaid -> Partition 5
+OrderShipped -> Partition 2
+```
+
+这样无法保证订单维度顺序。
+
+---
+
+## 错误三：Consumer 内部并发处理同一 Partition
+
+Kafka 拉取顺序是对的，但 Consumer 用线程池并发处理，业务完成顺序乱了。
+
+---
+
+## 错误四：处理失败后跳过 offset
+
+如果 offset 100 处理失败，但提交了 offset 101 或更大，消息就可能丢失，业务顺序也会被破坏。
+
+---
+
+## 错误五：扩容 Partition 后忽略 key 路由变化
+
+强顺序业务随意扩 Partition，导致同一个 key 后续消息进入不同 Partition。
+
+---
+
+# 十六、源码视角：顺序性看哪些模块？
+
+## 1. Broker 侧
+
+重点看：
+
+```text
+Log / UnifiedLog：Partition 日志追加
+Partition：Leader 处理读写
+ReplicaManager：Produce / Fetch 请求处理
+Fetch API：按 offset 拉取消息
+```
+
+关注问题：
+
+```text
+消息如何追加到 Partition？
+offset 如何分配？
+Consumer 如何按 offset 读取？
+Follower 如何复制 Leader 日志？
+```
+
+## 2. Producer 客户端
+
+重点看：
+
+```text
+Partitioner：key 到 Partition 的映射
+RecordAccumulator：消息批次聚合
+Sender：发送 ProduceRequest
+Idempotent Producer：sequence number / producer id
+```
+
+关注问题：
+
+```text
+相同 key 是否进入相同 Partition？
+重试时如何避免乱序？
+幂等 Producer 如何处理重复写入？
+```
+
+## 3. Go Sarama 客户端
+
+Sarama 源码可重点看：
+
+```text
+partitioner.go
+async_producer.go
+sync_producer.go
+produce_request.go
+consumer_group.go
+consumer.go
+offset_manager.go
+```
+
+关注问题：
+
+```text
+Sarama 如何根据 key 选择 Partition？
+AsyncProducer 如何按 Topic / Partition 路由消息？
+ConsumerGroup 如何分配 Partition？
+ConsumeClaim 是否对应一个 Partition 的消息流？
+MarkMessage 和 offset 提交如何工作？
+```
+
+Go Sarama 中，如果你使用 `sarama.StringEncoder(orderId)` 作为 Key，Producer 会通过配置的 Partitioner 根据 key 选择 Partition。
+
+消费端通常在 `ConsumeClaim` 中顺序读取 `claim.Messages()`。
+
+但如果你在 `ConsumeClaim` 中把消息扔进 goroutine 池并发处理，就可能破坏 Partition 内业务处理顺序。
+
+---
+
+# 十七、面试表达
+
+## 1. Kafka 如何保证消息顺序？
+
+可以这样回答：
+
+> Kafka 保证的是单 Partition 内有序，不保证 Topic 全局有序。每个 Partition 是一条追加日志，消息写入后会获得递增 offset，Consumer 按 offset 顺序读取，所以 Partition 内有序。如果业务需要同一个订单、用户或账户的消息有序，需要使用对应业务 ID 作为消息 key，让相同 key 的消息进入同一个 Partition。
+
+---
+
+## 2. Kafka 为什么不保证 Topic 全局有序？
+
+可以这样回答：
+
+> 因为 Topic 通常会拆成多个 Partition，不同 Partition 可以分布在不同 Broker 上并行写入和读取。不同 Partition 之间没有统一全局 offset，也不能保证 Consumer 处理速度一致。如果要 Topic 全局有序，只能使用一个 Partition，但这会牺牲 Producer 写入并行度和 Consumer 消费并行度，吞吐会大幅下降。
+
+---
+
+## 3. 同一个订单如何保证顺序？
+
+可以这样回答：
+
+> 订单事件 Topic 中使用 orderId 作为消息 key，这样同一个 orderId 的 OrderCreated、OrderPaid、OrderShipped 等事件会进入同一个 Partition。Kafka 保证 Partition 内 offset 顺序，Consumer Group 内同一个 Partition 同时只会被一个 Consumer 消费，所以可以保证订单维度内有序。消费端还要避免同一 Partition 内并发乱序处理，并通过订单状态机和幂等兜底。
+
+---
+
+## 4. Producer 重试会不会导致乱序？
+
+可以这样回答：
+
+> 可能会。如果开启 retries，同时允许多个 in-flight request，前一个请求失败重试、后一个请求先成功，就可能导致同一 Partition 内写入顺序变化。生产中对顺序敏感的场景应启用幂等 Producer，配置 acks=all，并合理控制 max.in.flight.requests.per.connection。早期没有幂等时，严格顺序通常需要把 max.in.flight 设置为 1，但会牺牲吞吐。
+
+---
+
+## 5. Consumer 多线程会不会破坏顺序？
+
+可以这样回答：
+
+> 会。Kafka 只能保证 Consumer 按 Partition offset 顺序拉取消息，但如果应用在 Consumer 内部把同一 Partition 的消息丢到线程池并发处理，业务完成顺序可能乱掉。顺序敏感场景应保证同一 Partition 串行处理，或者按 key 分发到固定 worker，并处理好 offset 连续提交问题。
+
+---
+
+## 6. 全局有序为什么会牺牲吞吐？
+
+可以这样回答：
+
+> Kafka 的吞吐扩展依赖 Partition 并行。如果要求全局有序，通常只能让 Topic 只有一个 Partition，这样所有消息都进入一条日志。Producer 写入只能打到一个 Partition Leader，Consumer Group 内也只有一个 Consumer 能消费，无法利用多个 Partition 和多个 Consumer 并行，因此吞吐会明显下降。实际系统中通常更推荐按业务实体做局部有序，比如 orderId、userId、accountId。
+
+---
+
+# 十八、总结
+
+Kafka 的顺序性可以总结为：
+
+```text
+Kafka 保证单 Partition 内有序；
+Kafka 不保证 Topic 全局有序；
+相同 key 的消息通常进入同一个 Partition；
+同一个业务实体要有序，就用业务实体 ID 作为 key；
+Consumer 端必须避免并发处理破坏顺序；
+全局有序需要单 Partition，代价是吞吐和扩展性下降。
+```
+
+成熟的 Kafka 顺序性设计，不是简单追求“所有消息有序”，而是先定义业务顺序边界：
+
+```text
+订单维度有序？
+用户维度有序？
+账户维度有序？
+设备维度有序？
+租户维度有序？
+还是全局有序？
+```
+
+然后再选择：
+
+```text
+Topic 如何设计；
+Partition 数量如何规划；
+消息 key 如何选择；
+Producer 是否启用幂等；
+Consumer 是否串行处理；
+业务状态机如何兜底；
+扩容 Partition 是否会影响顺序。
+```
+
+一句话总结：
+
+```text
+Kafka 的正确用法不是追求全局有序，而是用 Partition 和 key 建模业务需要的局部有序。
+```

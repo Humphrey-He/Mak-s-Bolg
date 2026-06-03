@@ -1,0 +1,1625 @@
+# Kafka 在事件驱动架构中的应用：从事件建模到实时数仓、数据湖与微服务解耦
+
+## 前言
+
+很多后端开发第一次使用 Kafka，是从“异步发消息”开始的。
+
+例如：
+
+```text
+用户下单后发一条消息；
+支付成功后发一条消息；
+用户注册后发一条消息；
+订单取消后发一条消息。
+```
+
+这个阶段，Kafka 通常被当作消息队列使用。
+
+但在更复杂的系统里，Kafka 的定位会升级：
+
+```text
+Kafka 不只是 MQ；
+Kafka 是企业级事件流基础设施。
+```
+
+它承载的不只是“任务通知”，而是整个业务系统中发生过的事实：
+
+```text
+OrderCreated
+OrderPaid
+InventoryReserved
+PaymentFailed
+UserRegistered
+CouponIssued
+ShipmentCreated
+```
+
+这些事件会被多个系统订阅：
+
+```text
+订单服务
+库存服务
+支付服务
+营销服务
+风控服务
+通知服务
+搜索系统
+实时数仓
+离线数据湖
+监控审计系统
+```
+
+从架构视角看，Kafka 的核心价值是：
+
+```text
+把系统之间的同步调用，改造成可持久化、可回放、可扩展、可治理的事件流。
+```
+
+这篇文章重点讨论：
+
+```text
+1. 什么是事件驱动架构？
+2. Kafka 在事件驱动架构中扮演什么角色？
+3. 事件应该如何建模？
+4. Topic 应该如何设计？
+5. 事件版本如何演进？
+6. 事件回放怎么用？
+7. 事件溯源和普通事件流有什么区别？
+8. Kafka 如何解耦微服务？
+9. Kafka 如何支撑实时数仓和数据湖？
+10. 大厂实践中如何治理 Kafka 事件体系？
+```
+
+---
+
+# 一、什么是事件驱动架构？
+
+事件驱动架构，Event-Driven Architecture，简称 EDA。
+
+它的核心思想是：
+
+```text
+系统之间不直接依赖彼此的接口调用；
+而是通过事件表达“某件事情已经发生”。
+```
+
+例如，订单创建后，订单服务不直接调用库存、通知、积分、风控，而是发布一个事件：
+
+```text
+OrderCreated
+```
+
+然后不同系统自己订阅：
+
+```text
+库存服务消费 OrderCreated，预占库存；
+通知服务消费 OrderCreated，发送通知；
+积分服务消费 OrderPaid，发放积分；
+风控服务消费 OrderCreated，进行风险检查；
+实时数仓消费所有订单事件，计算 GMV。
+```
+
+这种方式的关键变化是：
+
+```text
+生产者不关心消费者是谁；
+消费者可以独立增加、下线、扩容、重放；
+系统之间通过事件契约协作。
+```
+
+传统同步调用是：
+
+```text
+A 服务调用 B 服务。
+```
+
+事件驱动是：
+
+```text
+A 服务发布事件，B 服务自己订阅事件。
+```
+
+这就是系统耦合方式的变化。
+
+---
+
+# 二、Kafka 在事件驱动架构中的角色
+
+Kafka 在事件驱动架构中，通常承担三层角色。
+
+## 1. 事件总线
+
+Kafka Topic 可以作为业务事件流。
+
+例如：
+
+```text
+order_events
+payment_events
+inventory_events
+user_events
+```
+
+每个服务把自己的领域事件写入 Kafka。
+
+其他服务通过 Consumer Group 独立订阅。
+
+```text
+订单服务 -> order_events
+
+库存服务     <- order_events
+通知服务     <- order_events
+风控服务     <- order_events
+实时数仓     <- order_events
+```
+
+这就是 Kafka 作为事件总线的能力。
+
+---
+
+## 2. 事件日志
+
+Kafka 的消息不是被消费后立即消失，而是按照保留策略保留一段时间。
+
+这让 Kafka 具备事件日志能力：
+
+```text
+事件可以被多个消费者组独立消费；
+新系统可以从历史位置开始消费；
+旧系统可以重放历史事件修复数据；
+实时计算任务可以从 checkpoint 重新追赶。
+```
+
+这和传统队列不同。
+
+Kafka 更像：
+
+```text
+可持久化的分布式事件日志。
+```
+
+---
+
+## 3. 数据管道
+
+Kafka 还能连接业务系统和数据系统：
+
+```text
+业务服务
+  -> Kafka
+  -> Flink / Spark Streaming
+  -> ClickHouse / Druid / Elasticsearch
+  -> 数据湖 / Hive / Iceberg / Hudi
+```
+
+这种模式常用于：
+
+```text
+实时数仓
+实时指标
+实时风控
+搜索索引同步
+用户画像
+数据湖增量摄入
+```
+
+也就是说，Kafka 是业务事件进入数据平台的主干道。
+
+---
+
+# 三、事件建模：事件不是命令
+
+事件建模是事件驱动架构中最容易被低估的一步。
+
+很多系统一开始会把 Kafka 消息写成命令：
+
+```text
+CreateOrder
+SendSms
+DeductStock
+UpdateUserScore
+```
+
+但严格来说，这些更像“让某个系统去做什么”的命令。
+
+事件应该表达的是：
+
+```text
+某件事情已经发生。
+```
+
+例如：
+
+```text
+OrderCreated
+PaymentSucceeded
+StockReserved
+UserRegistered
+CouponIssued
+```
+
+命令和事件的区别：
+
+| 类型 | 含义      | 示例                            |
+| -- | ------- | ----------------------------- |
+| 命令 | 希望别人做某事 | DeductStock、SendSms           |
+| 事件 | 某件事已经发生 | OrderCreated、PaymentSucceeded |
+| 状态 | 当前是什么样  | Order.status=PAID             |
+
+事件是事实。
+
+一旦发布，事件不应该被修改。
+
+---
+
+## 1. 好事件的特征
+
+一个好的事件应该具备几个特征：
+
+```text
+1. 使用过去式命名
+2. 表达业务事实
+3. 包含必要业务上下文
+4. 有全局唯一 eventId
+5. 有 eventTime
+6. 有版本号
+7. 有聚合根 ID
+8. 能支持幂等和追踪
+```
+
+例如：
+
+```json
+{
+  "eventId": "evt_20260603_000001",
+  "eventType": "OrderCreated",
+  "eventVersion": 1,
+  "eventTime": "2026-06-03T10:00:00+09:00",
+  "aggregateType": "Order",
+  "aggregateId": "O1001",
+  "traceId": "trace_abc",
+  "payload": {
+    "orderId": "O1001",
+    "userId": 1001,
+    "amount": 19900,
+    "currency": "JPY",
+    "items": [
+      {
+        "skuId": "S1001",
+        "quantity": 2,
+        "price": 9950
+      }
+    ]
+  }
+}
+```
+
+这个事件表达的是：
+
+```text
+订单 O1001 已经创建。
+```
+
+而不是：
+
+```text
+请库存服务扣库存。
+```
+
+这点非常重要。
+
+---
+
+## 2. 事件应该包含多少字段？
+
+事件字段设计有两种风格。
+
+### 第一种：轻事件
+
+只包含 ID 和少量元数据：
+
+```json
+{
+  "eventId": "evt_001",
+  "eventType": "OrderCreated",
+  "orderId": "O1001"
+}
+```
+
+优点：
+
+```text
+消息小；
+Producer 简单；
+字段变更少。
+```
+
+缺点：
+
+```text
+消费者需要回查订单服务或数据库；
+下游耦合源服务；
+回放时依赖当前状态，可能不是事件发生时的状态；
+高峰期容易造成回查压力。
+```
+
+### 第二种：胖事件
+
+包含消费者需要的大部分上下文：
+
+```json
+{
+  "eventId": "evt_001",
+  "eventType": "OrderCreated",
+  "orderId": "O1001",
+  "userId": 1001,
+  "amount": 19900,
+  "items": [
+    {"skuId": "S1", "quantity": 2}
+  ]
+}
+```
+
+优点：
+
+```text
+消费者独立性更强；
+减少回查；
+更适合事件回放；
+更适合数据平台消费。
+```
+
+缺点：
+
+```text
+消息体更大；
+字段演进更复杂；
+可能包含敏感字段；
+需要治理 schema。
+```
+
+大厂实践里通常会折中：
+
+```text
+核心业务事件应该包含足够上下文；
+但不要把大对象、图片、文件、超大 JSON 放进 Kafka；
+大对象放对象存储，Kafka 放引用 ID。
+```
+
+---
+
+# 四、Topic 设计：按业务域还是按事件类型？
+
+Topic 设计是 Kafka 事件架构的核心。
+
+常见两种方式：
+
+```text
+按业务域设计 Topic；
+按事件类型设计 Topic。
+```
+
+---
+
+## 1. 按业务域设计 Topic
+
+例如：
+
+```text
+order_events
+payment_events
+inventory_events
+user_events
+```
+
+`order_events` 里可以包含：
+
+```text
+OrderCreated
+OrderPaid
+OrderCancelled
+OrderShipped
+OrderCompleted
+```
+
+优点：
+
+```text
+业务边界清晰；
+消费者可以订阅一个业务域的完整事件流；
+同一聚合根事件容易保证顺序；
+Topic 数量不会爆炸。
+```
+
+缺点：
+
+```text
+消费者可能需要过滤不关心的事件类型；
+单 Topic 内事件 schema 可能多样；
+权限粒度较粗。
+```
+
+适合大多数业务系统。
+
+---
+
+## 2. 按事件类型设计 Topic
+
+例如：
+
+```text
+order_created_events
+order_paid_events
+order_cancelled_events
+```
+
+优点：
+
+```text
+消费者订阅更精准；
+事件 schema 单一；
+权限和保留策略更细。
+```
+
+缺点：
+
+```text
+Topic 数量膨胀；
+运维复杂；
+同一订单的完整事件流被拆散；
+消费者需要订阅多个 Topic。
+```
+
+适合：
+
+```text
+事件吞吐差异极大；
+保留策略差异极大；
+权限差异明显；
+消费者只关心非常单一事件类型。
+```
+
+---
+
+## 3. 实用原则
+
+可以按这个原则判断：
+
+```text
+同一业务域、相似保留策略、相似权限、相似消费者群体：放一个 Topic；
+吞吐、权限、保留时间、数据敏感级别差异很大：拆 Topic；
+强顺序相关的事件：尽量放同一 Topic，并使用相同 key；
+数据平台使用的宽事件流：可以按域聚合；
+敏感事件：单独 Topic，单独权限和审计。
+```
+
+例如订单领域：
+
+```text
+order_events
+```
+
+消息 key：
+
+```text
+orderId
+```
+
+这样同一个订单的事件进入同一个 Partition，保证订单维度有序。
+
+---
+
+# 五、事件 Key 设计：顺序边界和负载均衡
+
+Kafka 只保证单 Partition 内有序。
+
+因此事件 key 决定了顺序边界。
+
+常见 key 设计：
+
+```text
+订单事件：orderId
+支付事件：paymentId 或 orderId
+用户事件：userId
+设备事件：deviceId
+库存事件：skuId
+商户事件：merchantId
+```
+
+选择 key 时要回答两个问题：
+
+```text
+1. 哪个业务维度需要有序？
+2. 这个 key 的分布是否均匀？
+```
+
+例如订单事件：
+
+```text
+key = orderId
+```
+
+可以保证同一个订单的事件有序。
+
+但如果：
+
+```text
+key = tenantId
+```
+
+而某个大租户产生了 80% 的流量，就会形成热点 Partition。
+
+这时可以考虑：
+
+```text
+key = tenantId + ":" + hash(orderId) % bucketCount
+```
+
+但代价是：
+
+```text
+不再保证 tenant 级全局顺序；
+只保证 bucket 级或订单级顺序。
+```
+
+架构上要记住：
+
+```text
+顺序粒度越大，并行度越低；
+顺序粒度越小，并行度越高。
+```
+
+---
+
+# 六、事件版本管理：事件一旦发布就要兼容
+
+事件是服务之间的契约。
+
+一旦发布，就可能有很多消费者依赖它。
+
+所以事件 schema 不能随便改。
+
+常见错误：
+
+```text
+删除字段；
+修改字段含义；
+修改字段类型；
+把必填改成可选但消费者不兼容；
+把金额单位从分改成元但字段名不变；
+改变枚举值语义。
+```
+
+这些都会导致消费者异常。
+
+---
+
+## 1. 事件版本字段
+
+建议每个事件都有：
+
+```json
+{
+  "eventType": "OrderCreated",
+  "eventVersion": 1
+}
+```
+
+当事件结构发生不兼容变化时，可以升级版本。
+
+例如：
+
+```text
+OrderCreated v1
+OrderCreated v2
+```
+
+兼容变更可以不升级大版本，例如新增可选字段：
+
+```json
+{
+  "couponId": "C1001"
+}
+```
+
+消费者不认识这个字段，也不影响旧逻辑。
+
+---
+
+## 2. Schema Registry
+
+大规模团队一般会引入 Schema Registry 管理事件 schema。
+
+常见序列化方式：
+
+```text
+Avro
+Protobuf
+JSON Schema
+```
+
+Schema Registry 的价值：
+
+```text
+集中管理事件结构；
+做兼容性校验；
+防止破坏性 schema 发布；
+让 Producer 和 Consumer 按契约演进。
+```
+
+兼容性策略包括：
+
+```text
+Backward Compatibility
+Forward Compatibility
+Full Compatibility
+Transitive Compatibility
+```
+
+简单理解：
+
+```text
+Backward：新消费者能读旧数据；
+Forward：旧消费者能读新数据；
+Full：前后都兼容；
+Transitive：和所有历史版本兼容。
+```
+
+---
+
+## 3. 事件演进原则
+
+推荐规则：
+
+```text
+新增字段要可选；
+不要删除字段；
+不要改变字段类型；
+不要改变字段语义；
+枚举新增要考虑旧消费者；
+金额、时间、单位要明确；
+敏感字段要谨慎加入；
+破坏性变更用新版本事件或新 Topic。
+```
+
+例如：
+
+```json
+{
+  "amount": 19900,
+  "currency": "JPY",
+  "amountUnit": "minor"
+}
+```
+
+比只写：
+
+```json
+{
+  "amount": 19900
+}
+```
+
+更清晰。
+
+---
+
+# 七、事件回放：Kafka 的架构级能力
+
+事件回放是 Kafka 非常重要的能力。
+
+因为 Kafka 会保留事件一段时间，消费者可以重置 offset，从历史位置重新消费。
+
+典型场景：
+
+```text
+修复消费者 bug 后重新处理历史事件；
+新系统上线后从历史事件构建状态；
+实时数仓任务失败后从 checkpoint 追赶；
+搜索索引错乱后重新构建索引；
+用户画像规则变更后重新计算画像。
+```
+
+例如搜索服务索引丢失，可以：
+
+```text
+重置 search-indexer-group 的 offset；
+从 order_events 历史事件重新消费；
+重新构建 Elasticsearch 索引。
+```
+
+这就是 Kafka 相比传统消息队列的重要优势。
+
+---
+
+## 1. 事件回放的前提
+
+事件回放不是随便重放就能安全。
+
+必须满足：
+
+```text
+事件保留时间足够；
+事件 schema 可兼容；
+消费者逻辑幂等；
+下游写入可重复执行；
+事件包含足够上下文；
+历史事件没有被错误清理；
+重放不会触发不该重复的副作用。
+```
+
+例如通知服务不能简单重放历史 `OrderCreated`，否则可能给用户重复发短信。
+
+所以需要区分：
+
+```text
+状态型消费者可以重放；
+副作用型消费者要谨慎重放。
+```
+
+状态型消费者：
+
+```text
+搜索索引
+实时数仓
+用户画像
+缓存构建
+报表聚合
+```
+
+副作用型消费者：
+
+```text
+发短信
+发邮件
+发优惠券
+扣库存
+转账
+```
+
+副作用型消费者必须依赖幂等表和业务状态机。
+
+---
+
+## 2. 重放隔离
+
+生产中不要直接用原 Consumer Group 随便重置 offset。
+
+建议：
+
+```text
+新建 replay consumer group；
+重放到临时表或临时索引；
+验证数据正确后切换；
+控制重放速率；
+避免打爆下游；
+记录重放任务审计。
+```
+
+例如：
+
+```text
+order-search-replay-20260603
+```
+
+这种 Group 专门用于一次性重建索引。
+
+---
+
+# 八、事件溯源：Event Sourcing
+
+事件溯源和普通事件流很像，但不是一回事。
+
+普通事件流中，事件通常用于系统间通知和异步处理。
+
+事件溯源中，事件是事实数据源。
+
+也就是说，不是只存当前状态：
+
+```text
+orders.status = PAID
+```
+
+而是把状态变化都作为事件保存：
+
+```text
+OrderCreated
+OrderPaid
+OrderShipped
+OrderCompleted
+```
+
+当前状态是通过事件回放计算出来的。
+
+---
+
+## 1. 事件溯源的优点
+
+```text
+完整审计历史；
+可以回放重建状态；
+可以追踪状态变化原因；
+可以支持多种投影视图；
+适合强审计、复杂状态流转场景。
+```
+
+例如订单当前状态：
+
+```text
+PAID
+```
+
+可以由事件流推导：
+
+```text
+OrderCreated -> OrderPaid
+```
+
+---
+
+## 2. 事件溯源的挑战
+
+事件溯源不是银弹。
+
+它会带来很多复杂度：
+
+```text
+事件模型设计难；
+事件版本演进复杂；
+回放成本高；
+查询当前状态需要投影；
+数据隐私和删除难；
+开发心智成本高；
+调试和补偿复杂。
+```
+
+所以大多数业务系统不会全面采用事件溯源。
+
+更常见的方式是：
+
+```text
+核心业务仍然用数据库保存当前状态；
+Kafka 保存领域事件用于异步解耦、回放和数据同步；
+对少数审计要求高的场景使用事件溯源思想。
+```
+
+例如：
+
+```text
+订单表保存当前状态；
+order_events 保存状态变化事件；
+审计系统和数仓消费事件。
+```
+
+这是更实用的折中。
+
+---
+
+# 九、微服务解耦：从同步调用到事件协作
+
+在微服务架构中，同步调用的问题非常明显。
+
+例如下单接口同步调用：
+
+```text
+订单服务
+  -> 库存服务
+  -> 优惠券服务
+  -> 积分服务
+  -> 通知服务
+  -> 风控服务
+```
+
+风险：
+
+```text
+链路长；
+任意下游慢都会拖慢主流程；
+下游故障会影响下单；
+新增消费者要改订单服务；
+系统耦合越来越强。
+```
+
+事件驱动改造后：
+
+```text
+订单服务只做核心订单创建；
+发布 OrderCreated；
+库存、通知、风控、数仓独立消费。
+```
+
+主流程变短：
+
+```text
+用户请求 -> 订单服务 -> MySQL -> Kafka
+```
+
+非核心动作异步化：
+
+```text
+发短信
+加积分
+同步数仓
+搜索索引
+推荐特征
+```
+
+这就是微服务解耦。
+
+---
+
+## 1. 事件驱动不是所有流程都异步
+
+注意，事件驱动不代表所有东西都异步。
+
+核心强一致流程仍然可能需要同步。
+
+例如：
+
+```text
+支付扣款
+库存强校验
+账户余额变更
+风控实时拦截
+```
+
+如果业务必须立即知道结果，仍然需要同步调用或本地事务。
+
+事件驱动更适合：
+
+```text
+非核心副作用；
+跨系统通知；
+数据同步；
+最终一致；
+实时分析；
+异步补偿。
+```
+
+架构原则：
+
+```text
+核心链路同步保证正确性；
+非核心链路事件化提升扩展性；
+跨域数据通过事件最终一致。
+```
+
+---
+
+# 十、实时数仓：Kafka 作为实时数据入口
+
+实时数仓通常需要把业务事件实时汇聚到分析系统。
+
+典型架构：
+
+```text
+业务服务
+  -> Kafka
+  -> Flink
+  -> Kafka DWD / DWS Topic
+  -> ClickHouse / Doris / Druid
+  -> BI / 报表 / 大屏
+```
+
+例如订单实时 GMV：
+
+```text
+OrderPaid 事件
+  -> Kafka payment_events
+  -> Flink 按分钟聚合
+  -> 写入 ClickHouse
+  -> 实时大屏展示 GMV
+```
+
+Kafka 在这里扮演：
+
+```text
+实时数据缓冲层；
+跨系统数据交换层；
+流处理输入源；
+数据湖增量入口。
+```
+
+---
+
+## 1. ODS / DWD / DWS Topic 分层
+
+实时数仓里也可以对 Kafka Topic 分层。
+
+例如：
+
+```text
+ODS：原始事件 Topic
+DWD：清洗后的明细 Topic
+DWS：聚合后的宽表或指标 Topic
+ADS：面向应用的结果数据
+```
+
+示例：
+
+```text
+ods_order_events
+dwd_order_paid_detail
+dws_user_order_summary
+```
+
+好处：
+
+```text
+数据链路清晰；
+原始数据可回放；
+清洗逻辑可复用；
+多个下游可订阅中间层结果。
+```
+
+---
+
+## 2. 实时数仓事件要求
+
+用于数仓的事件要注意：
+
+```text
+字段语义稳定；
+时间字段明确；
+金额单位明确；
+维度字段完整；
+事件类型清晰；
+schema 可演进；
+支持迟到数据处理；
+支持重放。
+```
+
+如果业务事件设计混乱，实时数仓会非常痛苦。
+
+---
+
+# 十一、数据湖：Kafka 到湖仓
+
+Kafka 也常作为数据湖的增量入口。
+
+典型链路：
+
+```text
+Kafka
+  -> Flink / Kafka Connect / Spark Streaming
+  -> S3 / HDFS / OSS
+  -> Iceberg / Hudi / Delta Lake
+  -> 查询引擎
+```
+
+适合：
+
+```text
+行为日志
+交易事件
+业务变更
+设备数据
+埋点数据
+CDC 变更流
+```
+
+数据湖强调：
+
+```text
+低成本存储；
+可回放历史；
+批流一体；
+多计算引擎共享。
+```
+
+Kafka 负责短中期事件流，数据湖负责长期存储和分析。
+
+架构上可以理解为：
+
+```text
+Kafka 是实时事件高速路；
+数据湖是长期事实仓库。
+```
+
+---
+
+# 十二、小型实战案例：订单事件驱动架构
+
+假设一个电商系统，订单创建后需要：
+
+```text
+预占库存；
+发送通知；
+做风控；
+同步搜索；
+进入实时数仓。
+```
+
+## 1. 同步调用版
+
+最初架构：
+
+```text
+订单服务 CreateOrder
+  -> 写订单表
+  -> 调库存服务
+  -> 调通知服务
+  -> 调风控服务
+  -> 调搜索服务
+  -> 写数仓接口
+```
+
+问题：
+
+```text
+接口慢；
+下游故障影响下单；
+新增下游要改订单服务；
+调用链复杂；
+重试和补偿混乱。
+```
+
+---
+
+## 2. 事件驱动版
+
+改造后：
+
+```text
+订单服务
+  -> 写 orders 表
+  -> 写 outbox_event 表
+  -> Debezium / Canal 发布 OrderCreated 到 Kafka
+```
+
+Kafka Topic：
+
+```text
+order_events
+```
+
+Message key：
+
+```text
+orderId
+```
+
+事件：
+
+```json
+{
+  "eventId": "evt_001",
+  "eventType": "OrderCreated",
+  "eventVersion": 1,
+  "eventTime": "2026-06-03T10:00:00+09:00",
+  "aggregateType": "Order",
+  "aggregateId": "O1001",
+  "payload": {
+    "orderId": "O1001",
+    "userId": 1001,
+    "amount": 19900,
+    "items": [
+      {"skuId": "S1", "quantity": 2}
+    ]
+  }
+}
+```
+
+消费者：
+
+```text
+inventory-service-group：预占库存
+notification-service-group：发送通知
+risk-service-group：风控检查
+search-indexer-group：更新搜索索引
+realtime-warehouse-group：写实时数仓
+```
+
+---
+
+## 3. 这个架构的收益
+
+```text
+订单服务不再同步依赖多个下游；
+新增消费者不需要改订单服务；
+Kafka 保留事件，可供新系统回放；
+每个消费者独立扩容；
+实时数仓可以直接订阅业务事件；
+失败消费者可以重试，不影响主流程；
+事件流成为业务事实变化的统一通道。
+```
+
+---
+
+## 4. 这个架构的风险
+
+```text
+事件模型设计不好会污染所有下游；
+消费者必须幂等；
+事件版本必须治理；
+Topic 权限和数据敏感性要管理；
+Kafka lag 会造成最终一致延迟；
+Outbox / CDC 链路要监控；
+事件回放可能重复触发副作用。
+```
+
+所以事件驱动架构不是简单“发消息”，而是一整套治理体系。
+
+---
+
+# 十三、源码视角：事件驱动架构看哪些模块？
+
+## 1. Kafka Broker
+
+关注：
+
+```text
+Topic / Partition 元数据
+Log / UnifiedLog
+ReplicaManager
+GroupCoordinator
+Offset 存储
+Log Retention
+Log Compaction
+```
+
+这些决定了：
+
+```text
+事件如何存储；
+事件如何复制；
+消费者如何独立消费；
+事件能保留多久；
+是否支持按 key 压缩保留最新状态。
+```
+
+---
+
+## 2. Producer 客户端
+
+关注：
+
+```text
+Partitioner
+RecordAccumulator
+Sender
+ProducerBatch
+Idempotent Producer
+TransactionManager
+```
+
+这些决定了：
+
+```text
+事件如何按 key 路由；
+如何批量发送；
+如何保证重试不重复；
+如何做 Kafka 内事务。
+```
+
+---
+
+## 3. Consumer 客户端
+
+关注：
+
+```text
+Fetcher
+ConsumerCoordinator
+OffsetCommit
+Rebalance
+SubscriptionState
+```
+
+这些决定了：
+
+```text
+消费者如何拉取事件；
+如何提交消费进度；
+如何在多个实例间分配 Partition；
+如何处理 Rebalance。
+```
+
+---
+
+## 4. Kafka Streams / Flink
+
+如果做实时处理，可以关注：
+
+```text
+拓扑 DAG
+状态存储
+窗口计算
+Checkpoint
+Exactly-once
+状态恢复
+```
+
+Kafka Streams 文档中把 Stream 描述为无界、持续更新的数据集，流处理应用可以基于 Kafka 的 Producer/Consumer API 构建状态处理、并行处理和容错能力。
+
+---
+
+# 十四、大厂实践：事件驱动架构治理规范
+
+## 1. 事件命名规范
+
+推荐：
+
+```text
+OrderCreated
+OrderPaid
+PaymentSucceeded
+InventoryReserved
+UserRegistered
+CouponIssued
+```
+
+不推荐：
+
+```text
+CreateOrder
+DoPayment
+UpdateStatus
+SendMessage
+```
+
+因为前者是事件，后者更像命令。
+
+---
+
+## 2. 事件元数据规范
+
+每个事件必须包含：
+
+```text
+eventId
+eventType
+eventVersion
+eventTime
+aggregateType
+aggregateId
+traceId
+producer
+schemaVersion
+```
+
+---
+
+## 3. Topic 命名规范
+
+推荐：
+
+```text
+order_events
+payment_events
+inventory_events
+user_events
+```
+
+或按环境：
+
+```text
+prod.order.events
+staging.order.events
+```
+
+保持一致命名风格。
+
+---
+
+## 4. Schema 治理
+
+必须有：
+
+```text
+Schema Registry
+兼容性校验
+字段变更审批
+破坏性变更评审
+消费者影响分析
+```
+
+---
+
+## 5. 消费者治理
+
+每个 Consumer Group 要登记：
+
+```text
+所属团队
+消费 Topic
+消费目的
+消费 SLA
+失败处理方式
+是否允许重放
+是否有副作用
+联系人
+```
+
+否则 Topic 越来越多，消费者越来越多，系统会失控。
+
+---
+
+## 6. 权限治理
+
+事件中可能包含敏感信息。
+
+需要：
+
+```text
+Topic ACL
+字段脱敏
+敏感 Topic 隔离
+审计日志
+数据保留策略
+最小权限原则
+```
+
+---
+
+## 7. 回放治理
+
+事件回放必须有流程：
+
+```text
+申请重放
+指定 Consumer Group
+指定 offset / 时间范围
+限速
+下游容量评估
+重放结果校验
+审计记录
+```
+
+不能随便在生产上重置 offset。
+
+---
+
+# 十五、常见错误
+
+## 错误一：把 Kafka 当 RPC 用
+
+例如：
+
+```text
+发送 DeductStock 命令，然后等待库存服务返回。
+```
+
+Kafka 更适合异步事件，不适合请求响应式强同步 RPC。
+
+---
+
+## 错误二：事件字段随意改
+
+事件是契约。
+
+随意改字段会导致消费者崩溃。
+
+---
+
+## 错误三：所有事件塞一个 Topic
+
+```text
+all_events
+```
+
+会导致：
+
+```text
+权限混乱；
+schema 混乱；
+消费者过滤成本高；
+保留策略不一致；
+故障影响面大。
+```
+
+---
+
+## 错误四：每个事件类型都建一个 Topic
+
+Topic 过度碎片化会导致：
+
+```text
+Topic 数爆炸；
+运维复杂；
+消费者订阅复杂；
+元数据膨胀。
+```
+
+---
+
+## 错误五：事件不可回放
+
+如果事件缺少上下文，消费者必须查当前数据库状态。
+
+这会导致历史回放不准确。
+
+---
+
+## 错误六：副作用消费者随意重放
+
+发短信、发券、扣款类消费者必须防止回放重复触发副作用。
+
+---
+
+# 十六、面试表达
+
+## 1. Kafka 在事件驱动架构中解决什么问题？
+
+可以这样回答：
+
+> Kafka 在事件驱动架构中主要解决服务解耦、异步削峰、事件持久化、事件回放和多消费者独立订阅的问题。生产者只发布业务事件，不需要知道有哪些消费者；消费者通过不同 Consumer Group 独立消费同一份事件流。Kafka 的 Topic 和 Partition 提供事件存储和并行消费能力，因此很适合作为微服务事件总线、实时数仓入口和数据同步通道。
+
+---
+
+## 2. 事件建模要注意什么？
+
+可以这样回答：
+
+> 事件应该表达已经发生的业务事实，而不是命令。命名上通常使用过去式，比如 OrderCreated、PaymentSucceeded，而不是 CreateOrder、DeductStock。事件应该包含 eventId、eventType、eventVersion、eventTime、aggregateId、traceId 和必要 payload。事件字段要稳定，并支持版本演进。核心事件应该包含足够上下文，避免消费者大量回查源服务。
+
+---
+
+## 3. Topic 怎么设计？
+
+可以这样回答：
+
+> Topic 可以按业务域设计，比如 order_events、payment_events，也可以按事件类型拆分。一般建议按业务域聚合，避免 Topic 爆炸，同时用 eventType 区分事件类型。如果不同事件在吞吐、权限、保留时间、消费者群体上差异很大，可以拆分 Topic。强顺序相关的事件最好放在同一 Topic，并使用相同业务 key，比如 orderId。
+
+---
+
+## 4. 事件版本怎么管理？
+
+可以这样回答：
+
+> 事件是服务之间的契约，不能随意破坏兼容性。每个事件应该有 eventVersion 或 schemaVersion。新增字段尽量使用可选字段，避免删除字段、修改字段类型或改变字段语义。大规模系统一般使用 Schema Registry 管理 Avro、Protobuf 或 JSON Schema，并设置兼容性策略，防止破坏性 schema 发布影响消费者。
+
+---
+
+## 5. 事件回放有什么价值和风险？
+
+可以这样回答：
+
+> 事件回放可以用于修复消费者 bug、重建搜索索引、重新计算实时指标、构建新系统状态等。Kafka 保留事件后，新的 Consumer Group 可以从历史 offset 开始消费。但回放要求消费者幂等，事件 schema 兼容，事件包含足够上下文，并且不能重复触发短信、发券、扣款这类副作用。生产回放要限速、隔离 Consumer Group，并做好审计。
+
+---
+
+## 6. 事件溯源和普通事件流有什么区别？
+
+可以这样回答：
+
+> 普通事件流通常用于系统解耦和数据同步，数据库仍然保存当前状态。事件溯源则把事件作为事实数据源，当前状态是由事件回放计算出来的。事件溯源有完整审计和状态重建能力，但会带来事件建模、版本演进、投影查询、隐私删除和回放成本等复杂度。实际系统中更常见的是数据库保存当前状态，Kafka 保存领域事件，用于异步解耦和分析。
+
+---
+
+# 十七、总结
+
+Kafka 在事件驱动架构中的价值，不只是“异步发消息”。
+
+它提供的是一套事件流基础设施：
+
+```text
+事件建模：用业务事实表达系统变化
+Topic 设计：按业务域组织事件流
+Partition key：定义顺序边界和并行能力
+事件版本：保证事件契约可演进
+事件回放：支持修复、重建和新系统接入
+事件溯源：用事件作为事实来源
+微服务解耦：降低同步调用依赖
+实时数仓：把业务事件变成实时指标
+数据湖：把事件流沉淀为长期数据资产
+```
+
+真正成熟的 Kafka 架构，不是把所有系统都接到一个 MQ 上，而是建立一套可治理的事件体系：
+
+```text
+事件有清晰语义；
+Topic 有明确边界；
+Schema 有版本管理；
+消费者有幂等；
+失败有补偿；
+回放有流程；
+权限有控制；
+数据有归档。
+```
+
+一句话总结：
+
+```text
+Kafka 让业务系统从“接口调用网络”演进为“事件流网络”，这是普通后端开发走向架构视角的重要一步。
+```
