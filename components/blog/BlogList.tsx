@@ -152,6 +152,32 @@ function ArticleListItem({ post, index }: { post: BlogPostSummary; index: number
   );
 }
 
+type PaginationItem = number | "ellipsis-start" | "ellipsis-end";
+
+function getPaginationItems(page: number, totalPages: number): PaginationItem[] {
+  if (totalPages <= 7) {
+    return Array.from({ length: totalPages }, (_, index) => index + 1);
+  }
+
+  const nearby = [page - 1, page, page + 1].filter((item) => item > 1 && item < totalPages);
+  const items: PaginationItem[] = [1];
+
+  if (nearby[0] && nearby[0] > 2) {
+    items.push("ellipsis-start");
+  }
+
+  for (const item of nearby) {
+    items.push(item);
+  }
+
+  if (nearby[nearby.length - 1] && nearby[nearby.length - 1] < totalPages - 1) {
+    items.push("ellipsis-end");
+  }
+
+  items.push(totalPages);
+  return items;
+}
+
 function PaginationControls({
   page,
   totalPages,
@@ -162,10 +188,11 @@ function PaginationControls({
   setPage: (page: number) => void;
 }) {
   const progress = totalPages <= 1 ? 100 : Math.round((page / totalPages) * 100);
+  const pageItems = getPaginationItems(page, totalPages);
 
   return (
     <div className="mt-7 overflow-hidden rounded-3xl border border-white/10 bg-white/[0.035] p-3 backdrop-blur-xl">
-      <div className="grid gap-3 md:grid-cols-[minmax(112px,auto)_minmax(0,1fr)_minmax(112px,auto)] md:items-center">
+      <div className="grid gap-3 lg:grid-cols-[minmax(112px,auto)_minmax(0,1fr)_minmax(112px,auto)] lg:items-center">
         <button
           onClick={() => setPage(Math.max(1, page - 1))}
           disabled={page === 1}
@@ -176,7 +203,7 @@ function PaginationControls({
         </button>
 
         <div className="min-w-0 rounded-2xl border border-white/10 bg-black/20 px-4 py-3">
-          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
             <div className="min-w-0">
               <p className="text-xs uppercase tracking-[0.24em] text-slate-500">PAGE</p>
               <p className="mt-1 text-sm font-semibold text-white">
@@ -184,24 +211,50 @@ function PaginationControls({
               </p>
             </div>
 
-            <label className="flex shrink-0 items-center gap-2 text-xs text-slate-400">
-              <span className="whitespace-nowrap">跳转</span>
-              <select
-                value={page}
-                onChange={(event) => setPage(Number(event.target.value))}
-                aria-label="选择页码"
-                className="h-9 rounded-xl border border-white/10 bg-slate-950 px-3 font-mono text-sm text-cyan-100 outline-none transition focus:border-cyan-200/45"
-              >
-                {Array.from({ length: totalPages }).map((_, index) => {
-                  const pageNumber = index + 1;
-                  return (
-                    <option key={pageNumber} value={pageNumber}>
-                      {pageNumber}
-                    </option>
-                  );
-                })}
-              </select>
-            </label>
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center xl:justify-end">
+              <div className="flex items-center gap-1.5 overflow-x-auto pb-1 sm:overflow-visible sm:pb-0">
+                {pageItems.map((item) =>
+                  typeof item === "number" ? (
+                    <button
+                      key={item}
+                      type="button"
+                      onClick={() => setPage(item)}
+                      aria-current={page === item ? "page" : undefined}
+                      className={`grid h-9 min-w-9 place-items-center rounded-xl border px-3 font-mono text-sm font-bold transition ${
+                        page === item
+                          ? "border-cyan-200/50 bg-cyan-300/15 text-cyan-100 shadow-[0_0_22px_rgba(34,211,238,.12)]"
+                          : "border-white/10 bg-white/[0.035] text-slate-400 hover:border-cyan-200/25 hover:text-cyan-100"
+                      }`}
+                    >
+                      {item}
+                    </button>
+                  ) : (
+                    <span key={item} className="grid h-9 min-w-7 place-items-center text-sm text-slate-600">
+                      ...
+                    </span>
+                  )
+                )}
+              </div>
+
+              <label className="flex shrink-0 items-center gap-2 text-xs text-slate-400">
+                <span className="whitespace-nowrap">跳转</span>
+                <select
+                  value={page}
+                  onChange={(event) => setPage(Number(event.target.value))}
+                  aria-label="选择页码"
+                  className="h-9 rounded-xl border border-white/10 bg-slate-950 px-3 font-mono text-sm text-cyan-100 outline-none transition focus:border-cyan-200/45"
+                >
+                  {Array.from({ length: totalPages }).map((_, index) => {
+                    const pageNumber = index + 1;
+                    return (
+                      <option key={pageNumber} value={pageNumber}>
+                        {pageNumber}
+                      </option>
+                    );
+                  })}
+                </select>
+              </label>
+            </div>
           </div>
 
           <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-white/8">
