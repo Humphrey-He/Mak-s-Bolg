@@ -96,6 +96,9 @@ type Post implements Node & Document {
   date: String!
   description: String
   tag: String
+  series: String
+  seriesSlug: String
+  seriesOrder: Float
   readTime: String
   top: Boolean
   featured: Boolean
@@ -120,6 +123,16 @@ input DatetimeFilter {
   in: [String]
 }
 
+input NumberFilter {
+  lt: Float
+  lte: Float
+  gte: Float
+  gt: Float
+  eq: Float
+  exists: Boolean
+  in: [Float]
+}
+
 input BooleanFilter {
   eq: Boolean
   exists: Boolean
@@ -137,6 +150,9 @@ input PostFilter {
   date: DatetimeFilter
   description: StringFilter
   tag: StringFilter
+  series: StringFilter
+  seriesSlug: StringFilter
+  seriesOrder: NumberFilter
   readTime: StringFilter
   top: BooleanFilter
   featured: BooleanFilter
@@ -219,6 +235,9 @@ input PostMutation {
   date: String
   description: String
   tag: String
+  series: String
+  seriesSlug: String
+  seriesOrder: Float
   readTime: String
   top: Boolean
   featured: Boolean

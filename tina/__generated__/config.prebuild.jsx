@@ -63,6 +63,23 @@ var config_default = defineConfig({
           },
           {
             type: "string",
+            name: "series",
+            label: "\u7CFB\u5217\u680F\u76EE",
+            description: "\u4F8B\u5982 Redis \u6838\u5FC3\u539F\u7406\u4E0E\u5B9E\u6218\u3001Kubernetes\u3001Go Modules"
+          },
+          {
+            type: "string",
+            name: "seriesSlug",
+            label: "\u7CFB\u5217 Slug",
+            description: "\u7A33\u5B9A\u82F1\u6587\u6807\u8BC6\uFF0C\u4F8B\u5982 redis-core\u3001kubernetes\u3001go-modules"
+          },
+          {
+            type: "number",
+            name: "seriesOrder",
+            label: "\u7CFB\u5217\u5185\u6392\u5E8F"
+          },
+          {
+            type: "string",
             name: "readTime",
             label: "\u9605\u8BFB\u65F6\u95F4"
           },

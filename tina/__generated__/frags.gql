@@ -5,6 +5,9 @@ fragment PostParts on Post {
   date
   description
   tag
+  series
+  seriesSlug
+  seriesOrder
   readTime
   top
   featured
