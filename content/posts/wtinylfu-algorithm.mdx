@@ -22,7 +22,7 @@ featured: false
 布隆过滤器用于快速判断一个 key 是否曾经被访问过。其假阳性率（False Positive Rate）为：
 
 $$
-p = (1 - e^{-kn/m})^k
+p = (1 - e^\bgroup -kn/m\egroup)^k
 $$
 
 其中：
@@ -33,7 +33,7 @@ $$
 最优哈希函数数量为：
 
 $$
-k_{opt} = \frac{m}{n} \ln 2
+k_\bgroup opt\egroup = \frac\bgroup m\egroup\bgroup n\egroup \ln 2
 $$
 
 ### 2. 频率计数（Frequency Counter）
@@ -41,7 +41,7 @@ $$
 TinyLFU 使用 **Count-Min Sketch** 来估计访问频率：
 
 $$
-f_{ij} = f_{ij} + 1 \quad \text{for all } j \in h_i(x)
+f_\bgroup ij\egroup = f_\bgroup ij\egroup + 1 \quad \text\bgroup for all \egroup j \in h_i(x)
 $$
 
 其中 $h_i(x)$ 是 key $x$ 的第 $i$ 个哈希值对应的计数器位置。
@@ -53,11 +53,11 @@ W-TinyLFU 将缓存分为两个区域：
 - **Main Cache**：剩余 $99\%$
 
 $$
-C_{total} = C_{window} + C_{main}
+C_\bgroup total\egroup = C_\bgroup window\egroup + C_\bgroup main\egroup
 $$
 
 $$
-C_{window} = 0.01 \times C_{total}
+C_\bgroup window\egroup = 0.01 \times C_\bgroup total\egroup
 $$
 
 ### 4. 准入评分（Admission Score）
@@ -65,10 +65,10 @@ $$
 当一个新 entry 需要进入 Main Cache 时，计算其准入评分：
 
 $$
-S_{new} = \frac{f_{new}}{\max_{old \in victim}}
+S_\bgroup new\egroup = \frac\bgroup f_\bgroup new\egroup \egroup\bgroup \max_\bgroup old \in victim\egroup \egroup
 $$
 
-如果 $S_{new} > S_{old}$，则新 entry 准入，得分最低的 entry 被淘汰。
+如果 $S_\bgroup new\egroup > S_\bgroup old\egroup$，则新 entry 准入，得分最低的 entry 被淘汰。
 
 ## 算法流程
 
@@ -104,5 +104,5 @@ W-TinyLFU 在 **Stack Exchange** 的 benchmark 中表现优异：
 W-TinyLFU 通过布隆过滤器 + Count-Min Sketch 的组合，实现了 $O(1)$ 时间复杂度的频率估计，同时通过滑动窗口机制保护了短期热点数据。
 
 $$
-\boxed{\text{Hit Rate} \approx 1 - \frac{1}{1 + \alpha \cdot \text{Zipf}_{\lambda}}}
+\boxed\bgroup \text\bgroup Hit Rate\egroup \approx 1 - \frac\bgroup 1\egroup\bgroup 1 + \alpha \cdot \text\bgroup Zipf\egroup_\bgroup \lambda\egroup \egroup \egroup
 $$
