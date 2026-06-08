@@ -11,6 +11,7 @@
     "build:local": "set NEXT_TURBOPACK=0 && next build",
     "start": "next start",
     "lint": "next lint",
+    "verify:agent-links": "node scripts/verify-agent-links.mjs",
     "verify:static-mdx": "node scripts/verify-static-mdx.mjs",
     "verify:tina-admin": "node scripts/verify-tina-admin.mjs",
     "preview:static": "serve out -l 3010"

@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import type { BlogPostSummary, BlogSeriesSummary } from "@/lib/posts";
 import { copy } from "@/data/copy";
@@ -11,6 +11,7 @@ type BlogListProps = {
   posts: BlogPostSummary[];
   tags: string[];
   series: BlogSeriesSummary[];
+  initialSeries?: string;
 };
 
 function FilterBar({
@@ -178,7 +179,7 @@ function getPaginationItems(page: number, totalPages: number): PaginationItem[] 
   return items;
 }
 
-function PaginationControls({
+function ArticlePager({
   page,
   totalPages,
   setPage,
@@ -191,58 +192,67 @@ function PaginationControls({
   const pageItems = getPaginationItems(page, totalPages);
 
   return (
-    <div className="mt-7 overflow-hidden rounded-3xl border border-white/10 bg-white/[0.035] p-3 backdrop-blur-xl">
-      <div className="grid gap-3 lg:grid-cols-[minmax(112px,auto)_minmax(0,1fr)_minmax(112px,auto)] lg:items-center">
-        <button
-          onClick={() => setPage(Math.max(1, page - 1))}
-          disabled={page === 1}
-          className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-2xl border border-white/10 bg-black/20 px-4 text-sm font-semibold text-slate-300 transition hover:border-cyan-200/30 hover:text-cyan-100 disabled:cursor-not-allowed disabled:opacity-35"
-        >
-          <span aria-hidden="true">←</span>
-          <span>上一页</span>
-        </button>
+    <nav aria-label="Article pagination" className="mt-7">
+      <div className="overflow-hidden rounded-[1.75rem] border border-cyan-200/15 bg-slate-950/55 p-3 shadow-[0_18px_70px_rgba(0,0,0,.28)] backdrop-blur-xl">
+        <div className="flex flex-col gap-3 xl:flex-row xl:items-stretch">
+          <button
+            type="button"
+            onClick={() => setPage(Math.max(1, page - 1))}
+            disabled={page === 1}
+            className="group inline-flex h-12 shrink-0 items-center justify-center gap-2 rounded-2xl border border-white/10 bg-white/[0.045] px-4 text-sm font-semibold text-slate-300 transition hover:border-cyan-200/35 hover:bg-cyan-300/10 hover:text-cyan-100 disabled:cursor-not-allowed disabled:opacity-35 xl:w-32"
+          >
+            <Icon name="chevron" className="h-4 w-4 rotate-180 transition group-hover:-translate-x-0.5" />
+            <span className="whitespace-nowrap">Prev</span>
+          </button>
 
-        <div className="min-w-0 rounded-2xl border border-white/10 bg-black/20 px-4 py-3">
-          <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
-            <div className="min-w-0">
-              <p className="text-xs uppercase tracking-[0.24em] text-slate-500">PAGE</p>
-              <p className="mt-1 text-sm font-semibold text-white">
-                第 <span className="font-mono text-cyan-100">{page}</span> / <span className="font-mono text-slate-300">{totalPages}</span> 页
-              </p>
-            </div>
-
-            <div className="flex flex-col gap-3 sm:flex-row sm:items-center xl:justify-end">
-              <div className="flex items-center gap-1.5 overflow-x-auto pb-1 sm:overflow-visible sm:pb-0">
-                {pageItems.map((item) =>
-                  typeof item === "number" ? (
-                    <button
-                      key={item}
-                      type="button"
-                      onClick={() => setPage(item)}
-                      aria-current={page === item ? "page" : undefined}
-                      className={`grid h-9 min-w-9 place-items-center rounded-xl border px-3 font-mono text-sm font-bold transition ${
-                        page === item
-                          ? "border-cyan-200/50 bg-cyan-300/15 text-cyan-100 shadow-[0_0_22px_rgba(34,211,238,.12)]"
-                          : "border-white/10 bg-white/[0.035] text-slate-400 hover:border-cyan-200/25 hover:text-cyan-100"
-                      }`}
-                    >
-                      {item}
-                    </button>
-                  ) : (
-                    <span key={item} className="grid h-9 min-w-7 place-items-center text-sm text-slate-600">
-                      ...
-                    </span>
-                  )
-                )}
+          <div className="min-w-0 flex-1 rounded-2xl border border-white/10 bg-black/25 px-3 py-3 sm:px-4">
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+              <div className="flex shrink-0 items-center gap-3">
+                <div className="grid h-12 w-12 place-items-center rounded-2xl border border-cyan-200/25 bg-cyan-300/12 font-mono text-lg font-black text-cyan-100 shadow-[0_0_28px_rgba(34,211,238,.13)]">
+                  {page}
+                </div>
+                <div>
+                  <p className="text-[11px] uppercase tracking-[0.24em] text-slate-500">PAGE</p>
+                  <p className="mt-1 whitespace-nowrap text-sm font-semibold text-white">
+                    Page <span className="font-mono text-cyan-100">{page}</span> / <span className="font-mono text-slate-300">{totalPages}</span>
+                  </p>
+                </div>
               </div>
 
-              <label className="flex shrink-0 items-center gap-2 text-xs text-slate-400">
-                <span className="whitespace-nowrap">跳转</span>
+              <div className="min-w-0 flex-1 lg:max-w-[540px]">
+                <div className="flex items-center gap-1.5 overflow-x-auto pb-1 sm:justify-center sm:overflow-visible sm:pb-0">
+                  {pageItems.map((item) =>
+                    typeof item === "number" ? (
+                      <button
+                        key={item}
+                        type="button"
+                        onClick={() => setPage(item)}
+                        aria-label={`Go to page ${item}`}
+                        aria-current={page === item ? "page" : undefined}
+                        className={`grid h-10 min-w-10 place-items-center rounded-2xl border px-3 font-mono text-sm font-bold transition ${
+                          page === item
+                            ? "border-cyan-200/60 bg-cyan-300/18 text-cyan-50 shadow-[0_0_24px_rgba(34,211,238,.18)]"
+                            : "border-white/10 bg-white/[0.035] text-slate-400 hover:border-cyan-200/30 hover:bg-white/[0.07] hover:text-cyan-100"
+                        }`}
+                      >
+                        {item}
+                      </button>
+                    ) : (
+                      <span key={item} className="grid h-10 min-w-8 place-items-center font-mono text-sm text-slate-600">
+                        ...
+                      </span>
+                    )
+                  )}
+                </div>
+              </div>
+
+              <label className="flex shrink-0 items-center justify-between gap-2 rounded-2xl border border-white/10 bg-white/[0.035] px-3 py-2 text-xs text-slate-400 sm:justify-center">
+                <span className="whitespace-nowrap">Jump</span>
                 <select
                   value={page}
                   onChange={(event) => setPage(Number(event.target.value))}
-                  aria-label="选择页码"
-                  className="h-9 rounded-xl border border-white/10 bg-slate-950 px-3 font-mono text-sm text-cyan-100 outline-none transition focus:border-cyan-200/45"
+                  aria-label="Choose page"
+                  className="h-8 rounded-xl border border-white/10 bg-slate-950 px-2 font-mono text-sm text-cyan-100 outline-none transition focus:border-cyan-200/45"
                 >
                   {Array.from({ length: totalPages }).map((_, index) => {
                     const pageNumber = index + 1;
@@ -255,36 +265,45 @@ function PaginationControls({
                 </select>
               </label>
             </div>
+
+            <div className="mt-3 flex items-center gap-3">
+              <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-white/8">
+                <div className="h-full rounded-full bg-cyan-200/75 transition-[width] duration-300" style={{ width: `${progress}%` }} />
+              </div>
+              <span className="w-10 text-right font-mono text-xs text-slate-500">{progress}%</span>
+            </div>
           </div>
 
-          <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-white/8">
-            <div className="h-full rounded-full bg-cyan-200/70 transition-[width] duration-300" style={{ width: `${progress}%` }} />
-          </div>
+          <button
+            type="button"
+            onClick={() => setPage(Math.min(totalPages, page + 1))}
+            disabled={page === totalPages}
+            className="group inline-flex h-12 shrink-0 items-center justify-center gap-2 rounded-2xl border border-white/10 bg-white/[0.045] px-4 text-sm font-semibold text-slate-300 transition hover:border-cyan-200/35 hover:bg-cyan-300/10 hover:text-cyan-100 disabled:cursor-not-allowed disabled:opacity-35 xl:w-32"
+          >
+            <span className="whitespace-nowrap">Next</span>
+            <Icon name="chevron" className="h-4 w-4 transition group-hover:translate-x-0.5" />
+          </button>
         </div>
-
-        <button
-          onClick={() => setPage(Math.min(totalPages, page + 1))}
-          disabled={page === totalPages}
-          className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-2xl border border-white/10 bg-black/20 px-4 text-sm font-semibold text-slate-300 transition hover:border-cyan-200/30 hover:text-cyan-100 disabled:cursor-not-allowed disabled:opacity-35"
-        >
-          <span>下一页</span>
-          <span aria-hidden="true">→</span>
-        </button>
       </div>
-    </div>
+    </nav>
   );
 }
 
-export function BlogList({ posts, tags, series }: BlogListProps) {
+export function BlogList({ posts, tags, series, initialSeries = "All" }: BlogListProps) {
   const t = copy.zh;
   const [keyword, setKeyword] = useState("");
   const [activeTag, setActiveTag] = useState("All");
-  const [activeSeries, setActiveSeries] = useState("All");
+  const [activeSeries, setActiveSeries] = useState(initialSeries);
   const [activeIndex, setActiveIndex] = useState(0);
   const [page, setPage] = useState(1);
   const wheelLock = useRef(false);
   const touchStartX = useRef<number | null>(null);
   const pageSize = 8;
+
+  useEffect(() => {
+    setActiveSeries(initialSeries);
+    setPage(1);
+  }, [initialSeries]);
 
   const topPosts = posts.filter((post) => post.top).slice(0, 5);
 
@@ -412,7 +431,7 @@ export function BlogList({ posts, tags, series }: BlogListProps) {
             ))}
           </motion.div>
 
-          <PaginationControls page={page} totalPages={totalPages} setPage={setPage} />
+          <ArticlePager page={page} totalPages={totalPages} setPage={setPage} />
         </div>
       </div>
     </section>

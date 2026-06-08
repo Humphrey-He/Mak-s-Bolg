@@ -1,8 +1,19 @@
 import { SiteShell } from "@/components/layout/SiteShell";
 import { ReadingTimeline } from "@/components/readings/ReadingTimeline";
 import { Icon } from "@/components/shared/Icon";
+import { recentReadings } from "@/data/readings";
+import { normalizeReadingFilters } from "@/lib/contentFilters";
 
-export default function ReadingsPage() {
+export default async function ReadingsPage({
+  searchParams,
+}: {
+  searchParams?: Promise<{ topic?: string | string[]; type?: string | string[] }>;
+}) {
+  const params = await searchParams;
+  const filters = normalizeReadingFilters(params ?? {});
+  const isAgentPapers = filters.topic === "agent" && filters.type === "paper";
+  const isAgentReadings = filters.topic === "agent";
+
   return (
     <SiteShell>
       <section className="mx-auto max-w-4xl px-5 py-16">
@@ -11,14 +22,18 @@ export default function ReadingsPage() {
             <Icon name="book" /> Knowledge Flow
           </div>
           <h1 className="font-serif text-4xl font-black tracking-[-0.04em] text-white md:text-5xl">
-            最近阅读
+            {isAgentPapers ? "Agent 论文精读" : isAgentReadings ? "Agent 阅读索引" : "最近阅读"}
           </h1>
           <p className="mt-4 max-w-2xl text-sm leading-7 text-slate-400">
-            技术书籍、论文、开源项目的阅读沉淀。每项记录都会关联到影响到的站内文章。
+            {isAgentPapers
+              ? "聚合 Agent、模型基础、工具调用、RAG 和运行时相关论文，关联到站内技术文章。"
+              : isAgentReadings
+                ? "聚合 Agent 方向论文、源码项目和阅读笔记，作为技术文章之外的延伸入口。"
+                : "技术书籍、论文、开源项目的阅读沉淀。每项记录都会关联到影响到的站内文章。"}
           </p>
         </div>
 
-        <ReadingTimeline />
+        <ReadingTimeline items={recentReadings} initialFilters={filters} />
       </section>
     </SiteShell>
   );

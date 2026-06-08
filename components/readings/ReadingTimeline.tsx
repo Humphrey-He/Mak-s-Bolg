@@ -1,64 +1,11 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { motion } from "framer-motion";
+import Link from "next/link";
 import { Icon } from "@/components/shared/Icon";
-
-interface ReadingItem {
-  id: string;
-  type: "book" | "paper" | "project";
-  title: string;
-  meta: string;
-  progress: number;
-  notes?: string;
-  relatedPosts?: string[];
-}
-
-const mockReadings: ReadingItem[] = [
-  {
-    id: "1",
-    type: "book",
-    title: "Designing Data-Intensive Applications",
-    meta: "系统设计 · 数据密集型应用",
-    progress: 68,
-    notes: "第三章提到的复制策略对理解分布式系统很有帮助，特别是 Paxos 和 Raft 的对比。",
-    relatedPosts: ["high-concurrency-go-cache", "object-storage-gateway"],
-  },
-  {
-    id: "2",
-    type: "paper",
-    title: "Attention Is All You Need",
-    meta: "Transformer · 模型基础论文",
-    progress: 42,
-    notes: "Self-Attention 的计算复杂度分析值得深入研究。",
-    relatedPosts: ["agent-source-code-analysis"],
-  },
-  {
-    id: "3",
-    type: "project",
-    title: "NousResearch / hermes-agent",
-    meta: "Agent Runtime · 源码拆解",
-    progress: 55,
-    notes: "Tool Calling 的错误处理和重试机制设计得很优雅。",
-    relatedPosts: ["agent-source-code-analysis", "keycloak-apisix-rbac"],
-  },
-  {
-    id: "4",
-    type: "book",
-    title: "Go Web Programming",
-    meta: "Go · Web 开发",
-    progress: 30,
-    relatedPosts: ["go-pprof-performance"],
-  },
-  {
-    id: "5",
-    type: "paper",
-    title: "Raft Consensus Paper",
-    meta: "分布式一致性 · 协议",
-    progress: 15,
-    relatedPosts: ["kubernetes-canary-upgrade"],
-  },
-];
+import type { ReadingItem } from "@/data/readings";
+import { filterReadings, type ReadingFilters, type ReadingTypeFilter } from "@/lib/contentFilters";
 
 const typeConfig = {
   book: { label: "书籍", icon: "book", color: "text-cyan-100", bg: "bg-cyan-400/20" },
@@ -66,18 +13,27 @@ const typeConfig = {
   project: { label: "项目", icon: "github", color: "text-emerald-100", bg: "bg-emerald-400/20" },
 };
 
-export function ReadingTimeline() {
-  const [selectedType, setSelectedType] = useState<ReadingItem["type"] | "all">("all");
+export function ReadingTimeline({
+  items,
+  initialFilters,
+}: {
+  items: ReadingItem[];
+  initialFilters: ReadingFilters;
+}) {
+  const [selectedType, setSelectedType] = useState<ReadingTypeFilter>(initialFilters.type);
   const [expandedId, setExpandedId] = useState<string | null>(null);
 
-  const filtered = selectedType === "all"
-    ? mockReadings
-    : mockReadings.filter((r) => r.type === selectedType);
+  useEffect(() => {
+    setSelectedType(initialFilters.type);
+    setExpandedId(null);
+  }, [initialFilters.type, initialFilters.topic]);
+
+  const filtered = filterReadings(items, { ...initialFilters, type: selectedType });
 
   return (
     <div className="space-y-4">
       <div className="mb-6 flex gap-2">
-        {(["all", "book", "paper", "project"] as const).map((type) => (
+        {(["All", "book", "paper", "project"] as const).map((type) => (
           <button
             key={type}
             onClick={() => setSelectedType(type)}
@@ -87,7 +43,7 @@ export function ReadingTimeline() {
                 : "bg-white/5 text-slate-400 hover:bg-white/10 hover:text-slate-200"
             }`}
           >
-            {type === "all" ? "全部" : typeConfig[type].label}
+            {type === "All" ? "全部" : typeConfig[type].label}
           </button>
         ))}
       </div>
@@ -158,13 +114,13 @@ export function ReadingTimeline() {
                     <p className="mb-2 text-xs font-bold uppercase tracking-widest text-slate-500">关联文章</p>
                     <div className="flex flex-wrap gap-2">
                       {item.relatedPosts.map((slug) => (
-                        <a
+                        <Link
                           key={slug}
                           href={`/blog/${slug}`}
                           className="rounded-lg border border-cyan-300/20 bg-cyan-300/10 px-3 py-1.5 text-xs text-cyan-100 transition hover:bg-cyan-300/20"
                         >
                           {slug.replace(/-/g, " ")}
-                        </a>
+                        </Link>
                       ))}
                     </div>
                   </div>
