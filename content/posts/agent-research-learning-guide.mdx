@@ -1,0 +1,479 @@
+---
+slug: agent-research-learning-guide
+title: 我如何学习 Agent：从前沿论文追踪到工程化落地
+description: 我把 Anthropic、OpenAI Agents SDK、ReAct、MemGPT、RAG Survey、AgentBench 等资料串成一条学习路线，目标不是多读论文，而是把前沿研究转成工程判断。
+date: '2026-06-08'
+tag: AI Agent
+readTime: 22 min
+top: false
+featured: true
+series: AI Agent
+seriesSlug: ai-agent
+seriesOrder: 999
+---
+
+我学 Agent 的过程里，最明显的感受不是“资料太少”，而是“资料太多，而且更新太快”。
+
+一段时间里，我很容易在两种状态之间来回切换。第一种状态是只追论文和新框架，越看越兴奋，感觉每天都有新范式、新 benchmark、新 runtime，但看完之后脑子里留下的往往只是名词。第二种状态是只做工程，忙着接模型、接工具、写 workflow，系统能跑起来，可一旦回头问自己为什么要这么设计、有没有更好的演进方向，判断就会开始发虚。
+
+后来我慢慢意识到，对我来说，真正有效的学习方式不是在“论文”和“工程”之间选边站，而是主动把它们绑在一起。我白天做项目，晚上追前沿，不是想把自己训练成论文搬运工，也不是想把系统做成一个只会堆框架的 demo，而是想建立一个更稳定的闭环：**我读到的新东西，最后都要落回到工程判断；我在工程里遇到的问题，也要反过来决定我接下来追哪些研究。**
+
+这篇文章就是我这条学习路径的整理。我想写清楚三件事：
+
+1. 我现在主要追哪些 Agent 资料；
+2. 我是怎么读这些论文和工程文档的；
+3. 我怎样把“看过”变成“能设计、能判断、能落地”。
+
+---
+
+## 一、我为什么坚持同时追论文和工程文档
+
+我原来学很多后端技术时，并没有这么强的“必须同步追前沿”的焦虑。数据库、缓存、RPC、消息队列这些方向，核心范式相对稳定。只要经典书、成熟系统和业务实践吃得够扎实，很多结论几年都不会轻易过时。
+
+但 Agent 不一样。这个领域到现在还处在明显的快速演进期：
+
+- 模型能力在变；
+- tool use 的抽象在变；
+- memory 的设计在变；
+- orchestration 的方式在变；
+- evaluation 的标准也一直在变。
+
+这直接影响了我的学习策略。只跟框架，不跟论文和官方工程文章，我很容易被某个阶段的“最佳实践”困住；只跟论文，不往工程上做映射，我又会长期停留在概念层。前者的问题是过时，后者的问题是悬空。
+
+所以我现在会刻意把自己的学习拆成两条并行主线：
+
+1. **前沿科研线**：我用它来理解新问题、新范式、新评测和新结论；
+2. **工程落地线**：我用它来判断哪些思想值得接入系统，哪些更适合先放在研究层面观察。
+
+我这么做之后，最大的收获不是“读得更多”，而是心里那张地图开始稳定了。新概念出来时，我不会急着追风口，而是先判断它属于哪一层，解决的是不是我当前真实存在的问题。
+
+---
+
+## 二、我现在用四层结构来学 Agent
+
+我后来发现，如果我把 Agent 相关知识平铺着学，会很快乱掉。对我最有帮助的方法，是先强行把问题空间切成四层。这样我读每篇资料时，先不是问“这篇火不火”，而是问“它落在哪一层”。
+
+### 2.1 第一层：Agent 到底是什么
+
+我会把这一层当成总开关。
+
+这一层我主要想解决三个问题：
+
+- Agent 和 workflow 的本质区别是什么；
+- 什么场景真的需要 Agent；
+- 一个最小可用的 Agent 系统，到底应该由哪些部分组成。
+
+在这一层，我最重视的反而不是论文，而是工程文章和官方文档。对我帮助最大的两类资料是：
+
+- `Anthropic: Building Effective Agents`
+- `OpenAI Agents SDK` 官方文档
+
+我很喜欢 Anthropic 那篇文章，不是因为它给了很多模式图，而是因为它帮我把 Agent 从一个很容易被神化的概念，重新拉回到了工程边界里。它反复提醒我几件事：
+
+- 不要为了 Agent 而 Agent；
+- 很多场景 workflow 更稳；
+- prompt chaining、routing、parallelization、orchestrator-workers 这些模式，经常比“全自治 Agent”更适合生产。
+
+这对我影响很大。因为它让我从一开始就少走了一条很诱人的弯路：把“自由度高”误判成“系统高级”。后来我再看很多新框架和新论文时，这层判断就变成了一个稳定的过滤器。我不再首先问“它有多智能”，而是先问“它把控制权放在哪里，它的边界清不清楚”。
+
+### 2.2 第二层：Agent 如何行动
+
+这一层我重点看 reasoning、acting、tool use 和多 Agent 协作。
+
+我会持续追这些材料：
+
+- `ReAct`
+- `Toolformer`
+- `Gorilla`
+- `Writing Effective Tools for Agents`
+- `OpenAI Agents SDK Handoffs / Orchestration`
+
+刚开始读这些内容时，我以为它们主要是在讨论“模型怎么更会调工具”。后来我越读越觉得，真正打动我的不是某一种具体调用技巧，而是它们共同指向了一件更底层的事：
+
+> 很多 Agent 的问题，根本不是模型不够聪明，而是动作系统设计得不够好。
+
+这件事我在工程里感受特别强。模型看不到代码，也看不到我脑子里的默认假设。它实际看到的，是工具名称、工具描述、输入 schema、危险标记、失败反馈和返回结果格式。换句话说，**tool description 在很多时候就是 prompt，tool schema 在很多时候就是约束，tool governance 在很多时候就是系统可靠性的下限。**
+
+我追这一层内容的动机很直接：我不想把 Agent 项目做成一堆“看起来会调工具”的胶水脚本。我更想知道，为什么同样一个模型、同样一组工具，换一种 description 或 schema，效果会差那么多。等我把这层看明白之后，最大的收获是：我对 tool registry、function calling、dangerous action confirm、tool ranking 这些东西的重视程度明显提高了。
+
+### 2.3 第三层：Agent 如何记住、检索和规划
+
+这一层我早期学得最乱，因为 memory、RAG、planning 经常被分开讲，但我后来越来越不愿意把它们拆开看。
+
+我现在会把这三件事看成一个整体问题：
+
+> 在有限上下文窗口里，系统如何持续利用历史经验和外部知识，完成多步任务。
+
+我重点追的材料包括：
+
+- `MemGPT`
+- `Generative Agents`
+- `Reflexion`
+- `Voyager`
+- `RAG Survey`
+- `RAG and Beyond`
+- `Tree of Thoughts`
+- `Self-Refine`
+- `LangGraph`
+
+这些资料在我脑子里并不是一堆并列名词，而是分别回答不同问题的锚点。
+
+我看 `MemGPT`，主要是为了理解上下文窗口有限时，为什么必须做 memory tiering；我看 `Generative Agents`，是想理解 observation、memory、reflection、planning 这条链路怎么连起来；我看 `Reflexion`，是想知道失败怎么变成可复用经验，而不是只留下一条错误日志；我看 `Voyager`，更多是在想技能库和长期能力积累到底长什么样；我看 `RAG Survey`，是在建立 retrieval 这块的结构化地图；我看 `Tree of Thoughts` 和 `Self-Refine`，是想理解模型在复杂任务里如何探索多条解路径并迭代修正。
+
+我这样追这一层，有一个特别明确的动机：我不想把 Agent 理解成“一次更长的回答系统”。我更想把它看成一个长期运行的任务系统。这个视角一变，我在工程上得到的收获也很大。比如我对 memory 的理解不再是“多存聊天记录”，而变成“什么应该保留、什么必须丢掉”；我对 RAG 的理解不再是“检索几段文本塞进 prompt”，而变成“系统如何在时间维度上保持有效知识访问”；我对 planning 的理解也不再是“让模型想得更久”，而是“何时需要显式规划、何时应该收回控制权”。
+
+### 2.4 第四层：Agent 如何被评测、观测和治理
+
+这是我最晚才真正重视起来的一层，但也是我现在最不愿意忽略的一层。
+
+我重点会追这些材料：
+
+- `OAgents`
+- `AgentBench`
+- `WebArena`
+- `SWE-bench`
+- `GAIA`
+- `OpenTelemetry`
+- `OpenLLMetry`
+
+我之所以会花时间在这一层，是因为我吃过“只凭感觉看效果”的亏。系统刚起步时，大家很容易觉得能跑通、能回答、看起来还不错，就已经说明方向对了。但链路一长、工具一多、用户一上来，这种感觉很快就会失效。没有评测闭环和可观测性，很多优化其实都只是自我安慰。
+
+我后来再看 `OAgents` 这类材料，感触特别深。它最吸引我的不是“又提出了一个新模式”，而是它对很多直觉化信念做了反证：很多 Agent 设计并没有想象中有用，Agent loop 也不是越长越好，tool 设计的重要性常常高于 prompt 微调。这种结论会逼着我回到系统层去问自己：
+
+- 现在的成功率到底怎么定义；
+- 是检索错了，还是生成错了；
+- 是工具调用多了，还是多调用其实没伤害最终结果；
+- 如果工具被多调用但最终结果不受影响，评测指标应该怎么表达这种“过程冗余”。
+
+我追这一层之后，最大的收获不是“知道了更多 benchmark 名字”，而是我越来越不相信只看最终答案的评判方式了。我会自然地去拆结果层、过程层、系统层和风险层指标，这种拆法也会直接反过来影响我怎么设计 Agent 链路。
+
+---
+
+## 三、我长期追哪些资料
+
+我不会试图把所有论文都细读一遍。对我来说，更现实的方法是建立一个“核心必读 + 持续跟踪”的资料层次。
+
+### 3.1 我会完整读一遍的核心资料
+
+下面这些材料，我一般会尽量完整读完，因为它们能组成一套骨架：
+
+1. `Anthropic: Building Effective Agents`
+2. `Anthropic: Writing Effective Tools for Agents`
+3. `OpenAI Agents SDK` 官方文档
+4. `ReAct`
+5. `MemGPT`
+6. `Generative Agents`
+7. `Reflexion`
+8. `RAG Survey`
+9. `Tree of Thoughts`
+10. `AgentBench`
+
+我为什么把它们放进“必读”而不是“选读”？因为它们分别钉住了几个我最在乎的判断支点：
+
+- Agent 是什么；
+- Agent 怎么行动；
+- Agent 怎么记忆；
+- Agent 怎么检索；
+- Agent 怎么规划；
+- Agent 怎么评测。
+
+只要这几个支点稳住了，我后面再看更新的框架、博客和 benchmark，就不容易被表面热点带跑。
+
+### 3.2 我会持续跟踪的资料
+
+另外一类资料，我不要求每篇深读，但会持续跟：
+
+- OpenAI / Anthropic / LangChain / Hugging Face 的官方工程文章；
+- 新的 Agent / RAG / evaluation benchmark；
+- 新的多 Agent runtime 和 orchestration 框架；
+- 新的 memory / retrieval / rerank 实证结果。
+
+我会这样做，动机其实很现实。Agent 领域很多真正有价值的一手信息，往往先出现在：
+
+- 官方工程博客；
+- benchmark 发布页；
+- 实证型 arXiv 论文；
+- 框架文档和 release note。
+
+如果我只看别人整理好的总结文章，认知通常会慢半拍。持续跟踪这些一手材料，对我的直接收获是：我更早知道哪些东西只是市场语言，哪些东西是真的在推动工程边界往前走。
+
+---
+
+## 四、我是怎么读这些论文和资料的
+
+我后来不太喜欢“从第一页读到最后一页”的论文阅读方式。对我来说，这种方式很容易耗时很长，但留下来的判断不多。
+
+现在我更常用的是带问题阅读，而且会强迫自己做三轮处理。
+
+### 4.1 第一轮：先抓核心问题
+
+我读一篇论文或工程文章时，第一反应不是去记公式、实验表格或者实现细节，而是先问自己：
+
+> 这篇东西到底在回答什么问题？
+
+比如：
+
+- `ReAct` 在回答：推理和行动如何形成闭环；
+- `MemGPT` 在回答：上下文窗口有限时，怎么做分层记忆；
+- `Reflexion` 在回答：失败如何变成经验；
+- `RAG Survey` 在回答：检索增强系统有哪些典型演进方向；
+- `AgentBench` 在回答：Agent 应该如何被评估。
+
+我这样读的动机，是防止自己掉进“看懂了局部细节，但没抓住主命题”的陷阱。这个习惯帮我省了很多时间。因为只要主问题抓准了，后面的内容就容易归位；如果主问题没抓住，细节记得再多也很散。
+
+### 4.2 第二轮：把论文映射到工程模块
+
+我现在很少把论文当成一个孤立对象看。我会强行问自己，它在系统里对应哪一层。
+
+我常做的映射大致是：
+
+- `ReAct` -> tool loop / task loop
+- `Writing Effective Tools` -> tool schema / tool description / tool governance
+- `MemGPT` -> context management / memory tiering
+- `Generative Agents` -> observation-memory-reflection-planning pipeline
+- `Reflexion` -> failure feedback / episodic memory
+- `Voyager` -> skill accumulation / long-term capability growth
+- `RAG Survey` -> retrieval architecture choices
+- `Tree of Thoughts` -> multi-path planning
+- `AgentBench / SWE-bench / WebArena` -> evaluation strategy
+- `OpenTelemetry / OpenLLMetry` -> observability
+
+我这样做最大的收获，是论文不会停留在“读过”，而会进入我的系统设计脑图。后面我要写方案、做项目复盘或者答面试题时，这些资料就不需要重新回忆“它大概讲了什么”，而是能直接落到某个模块上。
+
+### 4.3 第三轮：只留下可迁移的结论
+
+我不会默认一篇论文里的所有结论都适合往工程里迁。对我更重要的，是筛出那些跨框架、跨模型、跨场景仍然成立的判断。
+
+例如：
+
+- workflow 和 Agent 不该混淆；
+- 工具设计会显著影响 Agent 质量；
+- 长链路不等于高质量；
+- 长期记忆必须分层；
+- 检索质量和上下文组织同样重要；
+- 评测必须拆过程层，而不是只看最终答案。
+
+我保留这些结论的动机很清楚：我需要的是能在不同项目里反复使用的判断，不是某篇论文里的局部技巧。这个习惯给我的回报也很直接。后来我在看新论文时，不太容易被“新名词”本身打动，而更容易判断它是不是在重复旧问题、是不是只是换了一种表达，或者它到底有没有带来新的工程启发。
+
+---
+
+## 五、我怎么把科研追踪变成工程判断
+
+这一步对我来说最重要。
+
+我以前也会读完论文，然后在表达里停留在：
+
+- 这篇论文提出了什么；
+- 这个框架支持什么；
+- 这个 benchmark 可以测什么。
+
+但后来我越来越觉得，这种表达方式其实还停留在信息转述层。真正更有价值的，是我能不能进一步说出：
+
+- 这个思路更适合研究，不一定适合生产；
+- 这个模式复杂度太高，只有某些场景值得用；
+- 这个设计最大的收益不是效果，而是可观测性；
+- 这个结论最适合接进我当前系统的哪一层。
+
+也就是说，我现在更把读论文后的动作理解成“做判断”，而不是“做摘要”。
+
+### 5.1 我常用“三问法”强迫自己做映射
+
+我现在看完一篇资料，通常都会逼自己回答三个问题：
+
+1. **它解决的到底是哪一个工程问题？**
+2. **它如果进入真实系统，成本是什么？**
+3. **它最适合接到我当前架构的哪一层？**
+
+比如我看 `MemGPT`，不会只满足于记住“它像操作系统内存”。我会继续往下问：
+
+- 它解决的是长上下文管理问题；
+- 它带来的成本是 memory orchestration 复杂度上升；
+- 它更适合落在 memory / context builder 层，而不是直接塞进业务流。
+
+再比如我看 `Writing Effective Tools for Agents`，我也不会只记“tool description 很重要”。我更关心的是：
+
+- 它解决的是动作系统可理解性问题；
+- 它带来的成本是工具设计和治理成本上升；
+- 它最适合映射到 function calling / tool registry / schema 这一层。
+
+我这样做之后，一个很明显的收获是：我不太会被“这个方法听起来很厉害”这种感觉带着走了。我更容易判断“这个方法现在该不该进系统”。
+
+### 5.2 我也在练习克制
+
+追前沿最容易犯的错误，对我来说，不是学得慢，而是学得太冲动。
+
+看了多 Agent 论文，就想把所有链路都拆成多 Agent；看了 Graph RAG，就想给所有知识库加图；看了 Reflexion，就想给每条失败轨迹都写长期记忆；看了某个新 runtime，就想把现有编排全换掉。
+
+我后来慢慢学会提醒自己，学术追踪真正的价值不是“给系统不停加层”，而是让我更早知道：
+
+- 什么时候该加；
+- 什么时候不该加；
+- 当前真正的瓶颈到底在哪里。
+
+所以我现在看新东西时，会反复问自己：
+
+- 它解决的是我当前系统真实存在的问题吗？
+- 它带来的收益，足以覆盖复杂度增加吗？
+- 如果不上它，系统当前最痛的地方到底在哪里？
+
+这种克制对我的收获，其实比“知道更多名词”还大。因为它直接决定了我做项目时，复杂度会不会失控。
+
+---
+
+## 六、我现在给自己的 Agent 学习路线
+
+我如果一边做项目、一边补研究，通常会按下面这个顺序来推进。这个顺序不是唯一标准，但它对我很有效，因为它能让我先把骨架立起来，再逐层加深。
+
+### 第一步：先建立总览
+
+我不会一上来就钻 memory、benchmark 或多 Agent runtime。我会先把最基础的大地图搭起来。
+
+我通常先看：
+
+1. `Building Effective Agents`
+2. `OpenAI Agents SDK`
+3. `ReAct`
+4. `RAG Survey`
+
+我这样排顺序的动机，是先把下面这几个问题打通：
+
+- Agent 是什么；
+- workflow 和 Agent 的区别是什么；
+- tool use 的基本闭环长什么样；
+- RAG 在 Agent 里处于什么位置。
+
+这一步做完之后，我最大的收获通常是“不再乱”。新框架和新论文再出来时，我至少知道它是在补哪一层，而不是所有信息都挤在一个平面里。
+
+### 第二步：补 memory 和 planning
+
+我接下来会看：
+
+1. `MemGPT`
+2. `Generative Agents`
+3. `Reflexion`
+4. `Tree of Thoughts`
+5. `Self-Refine`
+
+我这么排，是因为我想先理解系统如何保留经验，再理解系统如何做复杂决策。这样学下来，我会更容易把 Agent 看成一个长期运行的任务系统，而不是一个“上下文更长、提示词更复杂”的聊天系统。
+
+这一步带给我的一个明显收获，是我看很多工程问题时，会自然想到：
+
+- 这是 memory 问题还是 retrieval 问题；
+- 这是 planning 缺失还是 execution 不稳；
+- 这条链路要不要真的让模型自由决定下一步。
+
+### 第三步：补评测和观测
+
+这一步我会看：
+
+1. `AgentBench`
+2. `WebArena`
+3. `SWE-bench`
+4. `OpenTelemetry / OpenLLMetry`
+5. `OAgents`
+
+我把这一步放在后面，不是因为它不重要，而是因为如果前面的系统结构都没建立起来，直接看评测材料很容易只记住 benchmark 名字。
+
+但一旦前面三层打底了，再补这一层，我的收益会非常明显：我开始真正从“会做 Demo”往“会看系统质量”转。
+
+### 第四步：回到自己的项目做映射
+
+这一步对我来说永远是最关键的。
+
+我通常会逼自己把当前项目拆成几个模块：
+
+- model access
+- tool calling
+- memory
+- retrieval
+- planner / orchestrator
+- evaluation
+- observability
+
+然后逐个问自己：
+
+- 哪一块已经够好；
+- 哪一块只是能跑；
+- 哪一块才是当前真正瓶颈；
+- 哪一篇论文最值得接进来。
+
+我之所以坚持做这一步，是因为如果没有它，前面的阅读很容易慢慢散掉。只有当我把研究材料映射回自己手上的系统，它们才会真正沉淀成能力。
+
+---
+
+## 七、我为什么想把这条路线写进自己的 Agent 项目叙事里
+
+这其实也是我写这篇“学术专版”的直接动机。
+
+很多项目介绍都会写：
+
+- 用了什么框架；
+- 接了什么模型；
+- 做了哪些功能。
+
+这些当然重要，但我越来越觉得，它们还不够表达一个人做 Agent 项目时真正的思考深度。
+
+我更想在自己的项目叙事里补上一层：
+
+- 为什么我觉得 workflow 比全自治更适合当前业务；
+- 为什么我会把 memory 拆层；
+- 为什么我会优先重视 tool design，而不是先迷信 prompt；
+- 为什么我把 RAG 看成持续演进体系，而不是单点功能；
+- 为什么评测和观测必须尽早进入设计。
+
+我之所以这样做，不只是为了文章更完整，也是因为这会直接改变别人理解我项目的方式。项目就不再只是“做出来了”，而会更像“想明白了再做出来的”。
+
+对我来说，这种表达背后真正想传达的是：
+
+> 我不是只会接框架的开发者。我会在开发之余持续追踪 Agent 前沿科研，也会把这些研究判断谨慎地映射回工程系统，而不是把论文结论机械照搬进生产。
+
+这句话对我很重要。因为它不只是一个姿态，也是我现在做 Agent 项目时很在意的一条方法论。
+
+---
+
+## 八、结语：我真正想积累的不是论文数量，而是判断力
+
+Agent 领域接下来几年还会继续变化。新的模型会出来，新的框架会出来，新的 benchmark 会出来，新的“最佳实践”也会不断刷新。如果我只是不断追名单、追热点、追术语，我很容易一直停留在表面忙碌里。
+
+所以我现在越来越明确，自己真正想长期积累的，不是“我读过多少篇论文”，而是三种更实在的能力：
+
+- 我能不能说清一篇论文到底在回答什么问题；
+- 我能不能把这个问题映射回系统设计；
+- 我能不能在复杂度、收益、风险之间做工程判断。
+
+如果我能把这三件事慢慢练出来，那么学术追踪对我来说就不会是一条和开发分离的副线。它会变成我做 Agent 架构判断时，一个非常稳定的增量来源。
+
+这也是我现在最认同的一件事：
+
+> **我在开发之余继续追前沿，不是为了让自己显得懂研究，而是为了在真正做系统时，比别人更早看见下一步该往哪走。**
+
+---
+
+## 参考资料
+
+### 工程与官方文档
+
+1. Anthropic, *Building Effective Agents*
+2. Anthropic, *Writing Effective Tools for Agents*
+3. OpenAI, *Agents SDK Documentation*
+4. OpenAI Agents SDK, *Agents / Handoffs / Guardrails / Tracing Guides*
+5. OpenTelemetry Documentation
+6. OpenLLMetry
+
+### 核心论文
+
+1. *ReAct: Synergizing Reasoning and Acting in Language Models*
+2. *Toolformer: Language Models Can Teach Themselves to Use Tools*
+3. *Gorilla: Large Language Model Connected with Massive APIs*
+4. *MemGPT: Towards LLMs as Operating Systems*
+5. *Generative Agents: Interactive Simulacra of Human Behavior*
+6. *Reflexion: Language Agents with Verbal Reinforcement Learning*
+7. *Voyager: An Open-Ended Embodied Agent with Large Language Models*
+8. *Retrieval-Augmented Generation for Large Language Models: A Survey*
+9. *Tree of Thoughts: Deliberate Problem Solving with Large Language Models*
+10. *Self-Refine: Iterative Refinement with Self-Feedback*
+11. *AgentBench*
+12. *WebArena*
+13. *SWE-bench*
+14. *GAIA*
+15. *OAgents*
