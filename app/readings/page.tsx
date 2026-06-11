@@ -1,40 +1,30 @@
+import { Suspense } from "react";
 import { SiteShell } from "@/components/layout/SiteShell";
-import { ReadingTimeline } from "@/components/readings/ReadingTimeline";
-import { Icon } from "@/components/shared/Icon";
-import { recentReadings } from "@/data/readings";
-import { normalizeReadingFilters } from "@/lib/contentFilters";
+import { ReadingsContent } from "@/components/readings/ReadingsContent";
 
-export default async function ReadingsPage({
-  searchParams,
-}: {
-  searchParams?: Promise<{ topic?: string | string[]; type?: string | string[] }>;
-}) {
-  const params = await searchParams;
-  const filters = normalizeReadingFilters(params ?? {});
-  const isAgentPapers = filters.topic === "agent" && filters.type === "paper";
-  const isAgentReadings = filters.topic === "agent";
-
+export default function ReadingsPage() {
   return (
     <SiteShell>
-      <section className="mx-auto max-w-4xl px-5 py-16">
-        <div className="mb-10">
-          <div className="mb-4 inline-flex items-center gap-2 rounded-full border border-fuchsia-300/20 bg-fuchsia-400/10 px-4 py-2 text-sm text-fuchsia-100">
-            <Icon name="book" /> Knowledge Flow
-          </div>
-          <h1 className="font-serif text-4xl font-black tracking-[-0.04em] text-white md:text-5xl">
-            {isAgentPapers ? "Agent 论文精读" : isAgentReadings ? "Agent 阅读索引" : "最近阅读"}
-          </h1>
-          <p className="mt-4 max-w-2xl text-sm leading-7 text-slate-400">
-            {isAgentPapers
-              ? "聚合 Agent、模型基础、工具调用、RAG 和运行时相关论文，关联到站内技术文章。"
-              : isAgentReadings
-                ? "聚合 Agent 方向论文、源码项目和阅读笔记，作为技术文章之外的延伸入口。"
-                : "技术书籍、论文、开源项目的阅读沉淀。每项记录都会关联到影响到的站内文章。"}
-          </p>
-        </div>
-
-        <ReadingTimeline items={recentReadings} initialFilters={filters} />
-      </section>
+      <Suspense fallback={<ReadingsLoadingSkeleton />}>
+        <ReadingsContent />
+      </Suspense>
     </SiteShell>
+  );
+}
+
+function ReadingsLoadingSkeleton() {
+  return (
+    <section className="mx-auto max-w-4xl px-5 py-16">
+      <div className="mb-10">
+        <div className="mb-4 h-8 w-48 animate-pulse rounded-full bg-white/10" />
+        <div className="h-12 w-64 animate-pulse rounded bg-white/10" />
+        <div className="mt-4 h-20 w-full max-w-2xl animate-pulse rounded bg-white/5" />
+      </div>
+      <div className="space-y-4">
+        {[1, 2, 3].map((i) => (
+          <div key={i} className="h-32 animate-pulse rounded-2xl bg-white/[0.04]" />
+        ))}
+      </div>
+    </section>
   );
 }
