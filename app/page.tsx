@@ -19,7 +19,6 @@ export default function HomePage() {
       <AgentFeatureCard />
       <PersonaLab />
       <BlogList posts={posts} tags={tags} series={series} />
-      <BackendSection />
     </SiteShell>
   );
 }
