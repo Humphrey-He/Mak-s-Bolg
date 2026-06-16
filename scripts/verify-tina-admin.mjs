@@ -9,6 +9,7 @@ const required = [
 ];
 
 const missing = required.filter((key) => !process.env[key]?.trim());
+const skippedReason = process.env.TINA_BUILD_SKIPPED_REASON?.trim() || "";
 const outAdminPath = resolve("out", "admin", "index.html");
 
 if (!existsSync(outAdminPath)) {
@@ -20,6 +21,22 @@ const html = readFileSync(outAdminPath, "utf8");
 const isFallback = html.includes('data-admin-mode="fallback"');
 
 if (missing.length === 0) {
+  if (skippedReason === "branch-not-on-tinacloud" || skippedReason === "remote-schema-not-ready") {
+    if (!isFallback) {
+      console.error("FAIL: Tina build was skipped for a TinaCloud synchronization issue, but fallback admin marker is missing.");
+      process.exit(1);
+    }
+
+    if (skippedReason === "remote-schema-not-ready") {
+      console.warn("WARN: Tina production variables are present, but TinaCloud has not indexed the latest GraphQL schema yet.");
+      console.warn("/admin will keep showing the fallback setup page until TinaCloud finishes indexing the current branch.");
+    } else {
+      console.warn("WARN: Tina production variables are present, but TinaCloud does not recognize the configured branch yet.");
+      console.warn("/admin will keep showing the fallback setup page until the branch is available in TinaCloud.");
+    }
+    process.exit(0);
+  }
+
   if (isFallback) {
     console.error("FAIL: Tina environment variables are complete, but /admin is still the fallback page.");
     console.error("Check whether `tinacms build` actually wrote the admin bundle before `next build`.");
