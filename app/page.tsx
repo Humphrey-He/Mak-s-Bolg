@@ -1,3 +1,4 @@
+import { Suspense } from "react";
 import { SiteShell } from "@/components/layout/SiteShell";
 import { Hero } from "@/components/home/Hero";
 import { StartHere } from "@/components/home/StartHere";
@@ -18,7 +19,10 @@ export default function HomePage() {
       <StartHere />
       <AgentFeatureCard />
       <PersonaLab />
-      <BlogList posts={posts} tags={tags} series={series} />
+      <Suspense fallback={null}>
+        <BlogList posts={posts} tags={tags} series={series} />
+      </Suspense>
+      <BackendSection />
     </SiteShell>
   );
 }
