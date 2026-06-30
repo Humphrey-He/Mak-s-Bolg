@@ -1,6 +1,6 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "mak-blog",
+  "name": "makbolg",
   "compatibility_date": "2026-05-08",
   "assets": {
     "directory": "./out",
